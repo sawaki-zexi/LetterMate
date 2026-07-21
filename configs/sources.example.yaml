@@ -1,0 +1,13 @@
+sources:
+  - name: OpenAI Blog
+    platform: blog
+    type: rss
+    url: https://openai.com/news/rss.xml
+    tags: [AI, LLM]
+    enabled: true
+  - name: Bilibili UP Video Feed
+    platform: bilibili
+    type: rsshub
+    url: https://rsshub.example.com/bilibili/user/video/123456
+    tags: [AI, Video]
+    enabled: true

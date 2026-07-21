@@ -1,0 +1,32 @@
+.env
+.venv/
+.package-smoke/
+.worktrees/
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+__pycache__/
+*.py[cod]
+
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+build/
+dist/
+*.egg-info/
+node_modules/
+
+data/
+
+# Private/local Eval artifacts; sanitized samples under evals/datasets remain trackable.
+evals/datasets/private/
+evals/results/local/
+docs/evals/reports/local/
+
+# Local pilot evidence; committed templates under docs/pilot remain trackable.
+docs/pilot/local/

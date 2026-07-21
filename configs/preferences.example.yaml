@@ -1,0 +1,15 @@
+profile:
+  interests:
+    - agent engineering
+    - LLM applications
+    - product design
+    - career growth
+  exclude:
+    - pure marketing
+    - low information density
+    - repeated news
+newsletter:
+  schedule: "08:30"
+  max_items: 10
+  language: zh-CN
+  min_score_to_include: 4
