@@ -25,6 +25,13 @@ class StageResult:
         return self.run.id
 
 
+@dataclass(frozen=True)
+class DailyRunResult:
+    issue_date: date
+    idempotency_key: str
+    stages: tuple[StageResult, ...]
+
+
 class JobRunner:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
@@ -177,3 +184,20 @@ def build_newsletter_issue(
         return {"items": len(built.memberships)}
 
     return runner.run_stage("build", operation)
+
+
+def run_daily(
+    issue_date: date,
+    stages: list[Callable[[], StageResult]],
+) -> DailyRunResult:
+    results: list[StageResult] = []
+    for stage in stages:
+        result = stage()
+        results.append(result)
+        if result.status == "failed":
+            break
+    return DailyRunResult(
+        issue_date=issue_date,
+        idempotency_key=f"daily:{issue_date.isoformat()}",
+        stages=tuple(results),
+    )

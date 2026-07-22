@@ -13,6 +13,7 @@ from lettermate.jobs.runner import (
     analyze_pending,
     build_newsletter_issue,
     collect_fixture,
+    run_daily,
     send_newsletter,
     sync_sources,
 )
@@ -183,3 +184,24 @@ def test_build_stage_persists_ranked_membership_and_signed_feedback(tmp_path: Pa
         assert len(newsletter.items) == 1
         assert "token=" in newsletter.html_body
     engine.dispose()
+
+
+def test_daily_orchestrator_stops_after_failed_dependency():
+    calls: list[str] = []
+
+    def stage(name: str, status: str):
+        def call():
+            calls.append(name)
+            return type("Result", (), {"status": status})()
+
+        return call
+
+    result = run_daily(
+        date(2026, 7, 23),
+        [stage("sync", "succeeded"), stage("collect", "failed"), stage("analyze", "succeeded")],
+    )
+
+    assert calls == ["sync", "collect"]
+    assert result.issue_date == date(2026, 7, 23)
+    assert result.idempotency_key == "daily:2026-07-23"
+    assert len(result.stages) == 2
