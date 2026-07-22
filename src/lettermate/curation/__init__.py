@@ -1,0 +1,1 @@
+"""Structured content curation contracts."""

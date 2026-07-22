@@ -1,0 +1,34 @@
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+
+
+class CurationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int = Field(gt=0)
+    title: str = Field(min_length=1)
+    excerpt: str
+    url: HttpUrl
+    preferences: list[str] = Field(default_factory=list)
+    available_evidence_ids: list[str] = Field(default_factory=list)
+
+
+class CurationOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1)
+    tags: list[str]
+    semantic_score: int = Field(ge=1, le=5, strict=True)
+    recommendation: Literal["include", "exclude", "review"]
+    reason: str = Field(min_length=1)
+    evidence_references: list[str]
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+    available_evidence_ids: list[str] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="after")
+    def validate_evidence_references(self) -> "CurationOutput":
+        unknown = set(self.evidence_references) - set(self.available_evidence_ids)
+        if unknown:
+            raise ValueError(f"unknown evidence reference: {sorted(unknown)[0]}")
+        return self
