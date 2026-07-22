@@ -9,3 +9,4 @@ def test_cli_exposes_implemented_workflow_commands():
     assert result.exit_code == 0
     assert "sync-sources" in result.stdout
     assert "collect" in result.stdout
+    assert "analyze" in result.stdout
