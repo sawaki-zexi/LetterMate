@@ -15,6 +15,12 @@ class StructuredRankingProvider(Protocol):
     ) -> Sequence[RankedItem]: ...
 
 
+def _validate_limit(limit: int) -> int:
+    if type(limit) is not int or not 1 <= limit <= 5:
+        raise ValueError("limit must be an integer from 1 to 5")
+    return limit
+
+
 def _dataset_version(items: Sequence[EvalItem]) -> str:
     if not items:
         raise ValueError("baseline requires at least one candidate")
@@ -36,6 +42,7 @@ def _candidate_ids(items: Sequence[EvalItem]) -> list[str]:
 
 
 def latest_first(items: Sequence[EvalItem], *, limit: int = 5) -> BaselineResult:
+    limit = _validate_limit(limit)
     ranked = sorted(items, key=lambda item: (-item.published_at.timestamp(), item.item_id))
     return BaselineResult(
         baseline="latest-first",
@@ -59,6 +66,7 @@ def static_one_shot(
     provider: StructuredRankingProvider,
     limit: int = 5,
 ) -> BaselineResult:
+    limit = _validate_limit(limit)
     candidate_ids = _candidate_ids(items)
     candidate_sources = {item.item_id: item.source for item in items}
     provider_items = provider.rank(items=items, preferences=preferences, limit=limit)

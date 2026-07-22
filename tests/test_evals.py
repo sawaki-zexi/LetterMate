@@ -1,6 +1,6 @@
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -27,15 +27,35 @@ from lettermate.evals.schemas import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def item(item_id: str, *, hour: int = 0, source: str = "source-a") -> EvalItem:
+def item(
+    item_id: str,
+    *,
+    hour: int = 0,
+    source: str = "source-a",
+    published_at: datetime | None = None,
+    dataset_version: str = "sample-v1",
+) -> EvalItem:
     return EvalItem(
         item_id=item_id,
         source=source,
         title=f"Title {item_id}",
         url=f"https://example.com/{item_id}",
         excerpt="A public, synthetic excerpt with enough context.",
-        published_at=datetime(2026, 7, 20, hour, tzinfo=UTC),
-        dataset_version="sample-v1",
+        published_at=published_at or datetime(2026, 7, 20, hour, tzinfo=UTC),
+        dataset_version=dataset_version,
+    )
+
+
+def label(
+    item_id: str, *, grade: int = 2, dataset_version: str = "sample-v1"
+) -> EvalLabel:
+    return EvalLabel(
+        item_id=item_id,
+        relevance_grade=grade,
+        needs_full_text=False,
+        expected_tags=[],
+        redaction_status="public",
+        dataset_version=dataset_version,
     )
 
 
@@ -70,6 +90,87 @@ def test_eval_schemas_reject_invalid_versions_grades_and_private_notes():
             redaction_status="unredacted",
             private_notes="owner secret",
             dataset_version="sample-v1",
+        )
+
+
+def test_private_note_validation_errors_hide_rejected_input(tmp_path: Path):
+    secret = "TOPSECRET"
+    payload = {
+        "item_id": "one",
+        "relevance_grade": 2,
+        "needs_full_text": False,
+        "expected_tags": [],
+        "redaction_status": "unredacted",
+        "dataset_version": "sample-v1",
+        "private_notes": secret,
+    }
+
+    with pytest.raises(ValidationError) as model_error:
+        EvalLabel.model_validate(payload)
+    assert secret not in str(model_error.value)
+    assert secret not in repr(model_error.value)
+
+    path = tmp_path / "private-label.jsonl"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    with pytest.raises(ValidationError) as loader_error:
+        load_labels(path)
+    assert secret not in str(loader_error.value)
+    assert secret not in repr(loader_error.value)
+
+
+def test_eval_items_require_aware_times_and_normalize_equal_instants_to_utc():
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        item("naive", published_at=datetime(2026, 7, 20, 2))
+
+    offset_item = item(
+        "b",
+        published_at=datetime(2026, 7, 20, 10, tzinfo=timezone(timedelta(hours=8))),
+    )
+    utc_item = item("a", published_at=datetime(2026, 7, 20, 2, tzinfo=UTC))
+
+    assert offset_item.published_at == utc_item.published_at
+    assert offset_item.published_at.tzinfo is UTC
+    assert [entry.item_id for entry in latest_first([offset_item, utc_item]).ranked_items] == [
+        "a",
+        "b",
+    ]
+
+
+@pytest.mark.parametrize("score", [math.nan, math.inf, -math.inf])
+def test_ranked_items_reject_non_finite_scores(score: float):
+    with pytest.raises(ValidationError, match="finite number"):
+        RankedItem(item_id="one", score=score, source="source-a")
+
+
+@pytest.mark.parametrize(
+    ("candidate_ids", "ranked_ids"),
+    [
+        ([], []),
+        (["a", "a"], []),
+        (["a"], ["a", "a"]),
+        (["a"], ["unknown"]),
+        (["a", "b", "c", "d", "e", "f"], ["a", "b", "c", "d", "e", "f"]),
+    ],
+    ids=[
+        "empty-candidates",
+        "duplicate-candidates",
+        "duplicate-ranked-items",
+        "ranked-item-outside-candidates",
+        "more-than-five-ranked-items",
+    ],
+)
+def test_baseline_result_rejects_malformed_membership(
+    candidate_ids: list[str], ranked_ids: list[str]
+):
+    with pytest.raises(ValidationError):
+        BaselineResult(
+            baseline="test",
+            dataset_version="sample-v1",
+            candidate_ids=candidate_ids,
+            ranked_items=[
+                RankedItem(item_id=item_id, score=1.0, source="source-a")
+                for item_id in ranked_ids
+            ],
         )
 
 
@@ -144,6 +245,11 @@ def test_metrics_match_hand_calculated_values_and_edge_cases():
     assert source_diversity([]) == 0.0
 
 
+def test_ndcg_rejects_duplicate_ranked_ids_instead_of_exceeding_one():
+    with pytest.raises(ValueError, match="ranked IDs must be unique"):
+        ndcg_at_5(["a", "a", "a", "a", "a"], {"a": 2})
+
+
 def test_latest_first_is_stable_for_tied_times_and_limits_to_five():
     items = [item("b", hour=2), item("a", hour=2), item("old", hour=1)]
 
@@ -157,6 +263,25 @@ def test_latest_first_is_stable_for_tied_times_and_limits_to_five():
 def test_baselines_reject_empty_candidate_sets():
     with pytest.raises(ValueError, match="at least one candidate"):
         latest_first([])
+
+
+@pytest.mark.parametrize("baseline", ["latest-first", "static-one-shot"])
+@pytest.mark.parametrize("limit", [0, -1, 6, True, 1.0, "1"])
+def test_baselines_require_strict_limits_from_one_to_five(baseline: str, limit: object):
+    class EmptyProvider:
+        def rank(self, *, items, preferences, limit):
+            return []
+
+    with pytest.raises(ValueError, match="limit must be an integer from 1 to 5"):
+        if baseline == "latest-first":
+            latest_first([item("one")], limit=limit)  # type: ignore[arg-type]
+        else:
+            static_one_shot(
+                [item("one")],
+                preferences={},
+                provider=EmptyProvider(),
+                limit=limit,  # type: ignore[arg-type]
+            )
 
 
 class FakeStructuredProvider:
@@ -257,6 +382,55 @@ def test_evaluate_result_rejects_mismatched_labels_and_returns_metrics():
         evaluate_result(result, items, labels[:1])
 
 
+def test_evaluate_result_rejects_duplicate_item_ids():
+    result = latest_first([item("a", source="one"), item("b", source="two")])
+
+    with pytest.raises(ValueError, match="duplicate evaluation item ID: a"):
+        evaluate_result(
+            result,
+            [item("a", source="one"), item("a", source="other"), item("b", source="two")],
+            [label("a"), label("b")],
+        )
+
+
+def test_evaluate_result_rejects_item_candidate_mismatch():
+    result = latest_first([item("a"), item("b")])
+
+    with pytest.raises(ValueError, match="evaluation item IDs must match candidate IDs"):
+        evaluate_result(result, [item("a")], [label("a"), label("b")])
+
+
+def test_evaluate_result_rejects_item_dataset_version_mismatch():
+    result = latest_first([item("a"), item("b")])
+
+    with pytest.raises(ValueError, match="item and result dataset versions must match"):
+        evaluate_result(
+            result,
+            [item("a"), item("b", dataset_version="other-v1")],
+            [label("a"), label("b")],
+        )
+
+
+def test_evaluate_result_rejects_duplicate_label_ids():
+    result = latest_first([item("a"), item("b")])
+
+    with pytest.raises(ValueError, match="duplicate evaluation label ID: a"):
+        evaluate_result(result, [item("a"), item("b")], [label("a"), label("a"), label("b")])
+
+
+def test_evaluate_result_rejects_ranked_ids_outside_candidates_defensively():
+    malformed = BaselineResult.model_construct(
+        schema_version="1.0",
+        baseline="malformed",
+        dataset_version="sample-v1",
+        candidate_ids=["a"],
+        ranked_items=[RankedItem(item_id="unknown", score=1.0, source="source-a")],
+    )
+
+    with pytest.raises(ValueError, match="ranked item IDs must be candidates"):
+        evaluate_result(malformed, [item("a")], [label("a")])
+
+
 def test_runner_prints_normalized_result_and_metrics(tmp_path: Path, capsys):
     items_path = tmp_path / "items.jsonl"
     labels_path = tmp_path / "labels.jsonl"
@@ -312,8 +486,19 @@ def test_eval_docs_define_labeling_and_truthful_control_protocol():
         assert grade in rubric
     assert "needs_full_text" in rubric
     assert "Exact prompt" in control
-    assert "not executed" in control.lower()
-    assert "elapsed" in control.lower()
+    assert "not executed" not in control.lower()
+    for evidence in (
+        "Attempt 1",
+        "Attempt 2",
+        "Start timestamp",
+        "End timestamp",
+        "Raw output",
+        "Normalized output",
+        "87.143",
+        '"baseline": "coding-agent-control"',
+        '"precision_at_5": 0.8',
+        '"ndcg_at_5": 1.0',
+    ):
+        assert evidence in control
     assert "persistent state" in control.lower()
-    assert "precision_at_5" in control
     assert "production reliability" in control.lower()

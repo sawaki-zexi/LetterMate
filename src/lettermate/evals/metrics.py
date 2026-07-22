@@ -32,7 +32,10 @@ def _dcg(grades: Sequence[int]) -> float:
 
 def ndcg_at_5(ranked_ids: Sequence[str], grades: Mapping[str, int]) -> float:
     """Return top-five graded DCG divided by ideal DCG from all labeled candidates."""
-    selected_grades = [grades.get(item_id, 0) for item_id in _top_five(ranked_ids)]
+    selected = _top_five(ranked_ids)
+    if len(set(selected)) != len(selected):
+        raise ValueError("ranked IDs must be unique for nDCG")
+    selected_grades = [grades.get(item_id, 0) for item_id in selected]
     ideal_grades = sorted(grades.values(), reverse=True)[:TOP_K]
     ideal_dcg = _dcg(ideal_grades)
     if ideal_dcg == 0:

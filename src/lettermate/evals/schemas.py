@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 class EvalItem(BaseModel):
@@ -16,9 +16,16 @@ class EvalItem(BaseModel):
     published_at: datetime
     dataset_version: str = Field(min_length=1)
 
+    @field_validator("published_at")
+    @classmethod
+    def require_aware_utc_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("published_at must be timezone-aware")
+        return value.astimezone(UTC)
+
 
 class EvalLabel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     item_id: str = Field(min_length=1)
     relevance_grade: int = Field(strict=True, ge=0, le=2)
@@ -39,7 +46,7 @@ class RankedItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     item_id: str = Field(min_length=1)
-    score: float
+    score: float = Field(allow_inf_nan=False)
     source: str = Field(min_length=1)
 
 
@@ -49,8 +56,22 @@ class BaselineResult(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
     baseline: str = Field(min_length=1)
     dataset_version: str = Field(min_length=1)
-    candidate_ids: list[str]
-    ranked_items: list[RankedItem]
+    candidate_ids: list[str] = Field(min_length=1)
+    ranked_items: list[RankedItem] = Field(max_length=5)
+
+    @model_validator(mode="after")
+    def validate_item_membership(self) -> "BaselineResult":
+        if len(set(self.candidate_ids)) != len(self.candidate_ids):
+            raise ValueError("candidate_ids must be unique")
+
+        ranked_ids = [item.item_id for item in self.ranked_items]
+        if len(set(ranked_ids)) != len(ranked_ids):
+            raise ValueError("ranked item IDs must be unique")
+
+        unknown_ids = set(ranked_ids) - set(self.candidate_ids)
+        if unknown_ids:
+            raise ValueError(f"ranked item ID is not a candidate: {sorted(unknown_ids)[0]}")
+        return self
 
 
 def _load_jsonl[RecordT: (EvalItem, EvalLabel)](

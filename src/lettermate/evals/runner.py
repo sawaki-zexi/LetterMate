@@ -19,16 +19,38 @@ def evaluate_result(
     items: Sequence[EvalItem],
     labels: Sequence[EvalLabel],
 ) -> dict[str, float]:
+    if len(set(result.candidate_ids)) != len(result.candidate_ids):
+        raise ValueError("result candidate IDs must be unique")
     candidate_ids = set(result.candidate_ids)
-    label_ids = {label.item_id for label in labels}
+
+    item_ids: set[str] = set()
+    for item in items:
+        if item.item_id in item_ids:
+            raise ValueError(f"duplicate evaluation item ID: {item.item_id}")
+        item_ids.add(item.item_id)
+    if item_ids != candidate_ids:
+        raise ValueError("evaluation item IDs must match candidate IDs")
+    if {item.dataset_version for item in items} != {result.dataset_version}:
+        raise ValueError("item and result dataset versions must match")
+
+    label_ids: set[str] = set()
+    for label in labels:
+        if label.item_id in label_ids:
+            raise ValueError(f"duplicate evaluation label ID: {label.item_id}")
+        label_ids.add(label.item_id)
     if label_ids != candidate_ids:
         raise ValueError("label item IDs must match candidate IDs")
     if {label.dataset_version for label in labels} != {result.dataset_version}:
         raise ValueError("label and result dataset versions must match")
 
+    ranked_ids = [ranked.item_id for ranked in result.ranked_items]
+    if len(set(ranked_ids)) != len(ranked_ids):
+        raise ValueError("ranked item IDs must be unique")
+    if not set(ranked_ids) <= candidate_ids:
+        raise ValueError("ranked item IDs must be candidates")
+
     item_sources = {item.item_id: item.source for item in items}
     grades = {label.item_id: label.relevance_grade for label in labels}
-    ranked_ids = [ranked.item_id for ranked in result.ranked_items]
     ranked_sources = [item_sources[item_id] for item_id in ranked_ids]
     return {
         "precision_at_5": precision_at_5(ranked_ids, grades),
