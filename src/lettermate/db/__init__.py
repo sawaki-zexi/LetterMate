@@ -1,4 +1,5 @@
 from lettermate.db.models import (
+    AgentRun,
     AnalysisResult,
     Base,
     ContentItem,
@@ -6,16 +7,35 @@ from lettermate.db.models import (
     JobEvent,
     JobRun,
     Newsletter,
+    NewsletterItem,
+    PreferenceSnapshot,
     Source,
+    ToolCallTrace,
+)
+from lettermate.db.statuses import (
+    AgentRunStatus,
+    ContentItemStatus,
+    JobRunStatus,
+    NewsletterStatus,
+    SourceStatus,
 )
 
 __all__ = [
+    "AgentRun",
+    "AgentRunStatus",
     "AnalysisResult",
     "Base",
     "ContentItem",
+    "ContentItemStatus",
     "Feedback",
     "JobEvent",
     "JobRun",
+    "JobRunStatus",
     "Newsletter",
+    "NewsletterItem",
+    "NewsletterStatus",
+    "PreferenceSnapshot",
     "Source",
+    "SourceStatus",
+    "ToolCallTrace",
 ]
