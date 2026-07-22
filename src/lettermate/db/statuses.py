@@ -24,6 +24,7 @@ class NewsletterStatus(StrEnum):
     PREVIEW = "preview"
     SENT = "sent"
     FAILED = "failed"
+    SEND_FAILED = "send_failed"
 
 
 class JobRunStatus(StrEnum):

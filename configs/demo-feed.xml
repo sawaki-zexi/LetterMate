@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>LetterMate Offline Demo</title>
+    <link>https://demo.lettermate.local/</link>
+    <description>Deterministic local feed for the offline workflow.</description>
+    <item>
+      <guid>agent-engineering-field-note</guid>
+      <title>Agent engineering field note</title>
+      <link>https://demo.lettermate.local/agent-engineering-field-note</link>
+      <description>Practical agent engineering patterns for reliable LLM applications.</description>
+      <pubDate>Thu, 23 Jul 2026 00:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

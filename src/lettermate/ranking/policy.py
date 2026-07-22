@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 
 @dataclass(frozen=True)
@@ -116,5 +116,10 @@ class RankingPolicy:
     def _freshness(self, candidate: RankingCandidate, now: datetime) -> float:
         if candidate.published_at is None:
             return 0.0
-        age_hours = max(0.0, (now - candidate.published_at).total_seconds() / 3600)
+        published_at = candidate.published_at
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=UTC)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=UTC)
+        age_hours = max(0.0, (now - published_at).total_seconds() / 3600)
         return max(0.0, self._freshness_max_bonus * (1 - min(age_hours, 24.0) / 24.0))

@@ -5,8 +5,9 @@ from datetime import date, datetime
 from sqlalchemy.orm import Session, sessionmaker
 
 from lettermate.curation.service import CurationService
-from lettermate.db.models import JobRun
+from lettermate.db.models import JobRun, Source
 from lettermate.db.repository import ContentInput, NewsletterItemInput, Repository
+from lettermate.db.statuses import NewsletterStatus
 from lettermate.newsletters.builder import NewsletterEntry, attach_signed_feedback, build_newsletter
 from lettermate.notifiers.email import EmailNotifier
 from lettermate.preferences.signing import FeedbackSigner
@@ -19,6 +20,7 @@ class StageResult:
     run: JobRun
     status: str
     details: dict[str, int]
+    warnings: tuple["StageWarning", ...] = ()
 
     @property
     def job_id(self) -> int:
@@ -32,6 +34,19 @@ class DailyRunResult:
     stages: tuple[StageResult, ...]
 
 
+@dataclass(frozen=True)
+class StageWarning:
+    code: str
+    message: str
+    details: dict[str, object]
+
+
+@dataclass(frozen=True)
+class StageOutcome:
+    details: dict[str, int]
+    warnings: tuple[StageWarning, ...] = ()
+
+
 class JobRunner:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
@@ -39,15 +54,33 @@ class JobRunner:
     def run_stage(
         self,
         job_type: str,
-        operation: Callable[[Repository], dict[str, int]],
+        operation: Callable[[Repository], dict[str, int] | StageOutcome],
     ) -> StageResult:
         with self._session_factory() as session:
             repository = Repository(session)
             run = repository.start_job_run(job_type)
             try:
-                details = operation(repository)
+                outcome = operation(repository)
+                if isinstance(outcome, StageOutcome):
+                    details = outcome.details
+                    warnings = outcome.warnings
+                else:
+                    details = outcome
+                    warnings = ()
+                for warning in warnings:
+                    repository.add_job_event(
+                        run.id,
+                        "warning",
+                        warning.message,
+                        details={"code": warning.code, **warning.details},
+                    )
                 completed = repository.complete_job_run(run.id)
-                return StageResult(run=completed, status=completed.status, details=details)
+                return StageResult(
+                    run=completed,
+                    status=completed.status,
+                    details=details,
+                    warnings=warnings,
+                )
             except Exception as error:
                 failed = repository.fail_job_run(
                     run.id,
@@ -55,6 +88,22 @@ class JobRunner:
                     details={"job_type": job_type},
                 )
                 return StageResult(run=failed, status=failed.status, details={})
+
+    def add_job_event(
+        self,
+        job_id: int,
+        level: str,
+        message: str,
+        *,
+        details: dict[str, object],
+    ) -> None:
+        with self._session_factory() as session:
+            Repository(session).add_job_event(
+                job_id,
+                level,
+                message,
+                details=details,
+            )
 
 
 def sync_sources(runner: JobRunner, sources: list[SourceConfig]) -> StageResult:
@@ -74,26 +123,50 @@ def sync_sources(runner: JobRunner, sources: list[SourceConfig]) -> StageResult:
 
 
 def collect_fixture(runner: JobRunner, feed_bytes: bytes, *, now: datetime) -> StageResult:
-    def operation(repository: Repository) -> dict[str, int]:
-        parsed = parse_feed(FeedResponse(200, feed_bytes, None, None))
+    return collect_sources(runner, lambda _source: feed_bytes, now=now)
+
+
+def collect_sources(
+    runner: JobRunner,
+    feed_loader: Callable[[Source], bytes],
+    *,
+    now: datetime,
+) -> StageResult:
+    def operation(repository: Repository) -> StageOutcome:
         sources = repository.list_enabled_sources()
         item_count = 0
+        warnings: list[StageWarning] = []
         for source in sources:
-            for item in parsed.items:
-                repository.upsert_content_item(
-                    ContentInput(
-                        source_id=source.id,
-                        external_id=item.external_id,
-                        title=item.title,
-                        url=item.url,
-                        author=item.author,
-                        published_at=item.published_at,
-                        raw_content=item.raw_content,
+            try:
+                parsed = parse_feed(FeedResponse(200, feed_loader(source), None, None))
+                for item in parsed.items:
+                    repository.upsert_content_item(
+                        ContentInput(
+                            source_id=source.id,
+                            external_id=item.external_id,
+                            title=item.title,
+                            url=item.url,
+                            author=item.author,
+                            published_at=item.published_at,
+                            raw_content=item.raw_content,
+                        )
+                    )
+                    item_count += 1
+                repository.record_source_fetch(source.id, fetched_at=now)
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                repository.record_source_fetch(source.id, fetched_at=now, error=message)
+                warnings.append(
+                    StageWarning(
+                        code="source_fetch_failed",
+                        message=message,
+                        details={"source_id": source.id, "source_url": source.url},
                     )
                 )
-                item_count += 1
-            repository.record_source_fetch(source.id, fetched_at=now)
-        return {"sources": len(sources), "items": item_count}
+        details = {"sources": len(sources), "items": item_count}
+        if warnings:
+            details["failed_sources"] = len(warnings)
+        return StageOutcome(details=details, warnings=tuple(warnings))
 
     return runner.run_stage("collect", operation)
 
@@ -118,11 +191,17 @@ def send_newsletter(
     notifier: EmailNotifier,
     force: bool = False,
 ) -> StageResult:
-    def operation(repository: Repository) -> dict[str, int]:
+    def operation(repository: Repository) -> dict[str, int] | StageOutcome:
         newsletter = repository.get_newsletter(issue_date)
         if newsletter is None:
             raise LookupError(f"newsletter for {issue_date.isoformat()} not found")
-        result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
+        if newsletter.status == NewsletterStatus.SENT.value and not force:
+            raise ValueError(f"newsletter {newsletter.id} is already sent")
+        try:
+            result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
+        except Exception:
+            repository.mark_newsletter_failed(newsletter.id)
+            raise
         if result.dry_run:
             repository.mark_newsletter_preview(newsletter.id)
         elif result.accepted:
@@ -130,7 +209,24 @@ def send_newsletter(
         else:
             repository.mark_newsletter_failed(newsletter.id)
             raise RuntimeError("SMTP did not accept newsletter")
-        return {"sent": int(result.accepted), "dry_run": int(result.dry_run)}
+        details = {"sent": int(result.accepted), "dry_run": int(result.dry_run)}
+        if result.accepted:
+            return StageOutcome(
+                details=details,
+                warnings=(
+                    StageWarning(
+                        code="smtp_exactly_once_boundary",
+                        message=(
+                            "SMTP acceptance and local status commit are not atomic; "
+                            "reconcile before retrying an ambiguous send"
+                        ),
+                        details={
+                            "reconciliation_required_after_ambiguous_outcome": True,
+                        },
+                    ),
+                ),
+            )
+        return details
 
     return runner.run_stage("send", operation)
 
@@ -143,7 +239,19 @@ def build_newsletter_issue(
     feedback_base_url: str,
     feedback_expires_at: datetime,
 ) -> StageResult:
-    def operation(repository: Repository) -> dict[str, int]:
+    def operation(repository: Repository) -> dict[str, int] | StageOutcome:
+        existing = repository.get_newsletter(issue_date)
+        if existing is not None and existing.status == NewsletterStatus.SENT.value:
+            return StageOutcome(
+                details={"items": len(existing.items)},
+                warnings=(
+                    StageWarning(
+                        code="newsletter_already_sent",
+                        message="newsletter is already sent and was not rebuilt",
+                        details={"newsletter_id": existing.id},
+                    ),
+                ),
+            )
         analyses = repository.list_included_analyses()
         placeholder = repository.save_newsletter(issue_date, "Building", "", "", "draft")
         entries = [
@@ -189,15 +297,28 @@ def build_newsletter_issue(
 def run_daily(
     issue_date: date,
     stages: list[Callable[[], StageResult]],
+    *,
+    runner: JobRunner | None = None,
 ) -> DailyRunResult:
     results: list[StageResult] = []
+    idempotency_key = f"daily:{issue_date.isoformat()}"
     for stage in stages:
         result = stage()
         results.append(result)
+        if len(results) == 1 and runner is not None:
+            runner.add_job_event(
+                result.job_id,
+                "info",
+                "daily_run_context",
+                details={
+                    "issue_date": issue_date.isoformat(),
+                    "idempotency_key": idempotency_key,
+                },
+            )
         if result.status == "failed":
             break
     return DailyRunResult(
         issue_date=issue_date,
-        idempotency_key=f"daily:{issue_date.isoformat()}",
+        idempotency_key=idempotency_key,
         stages=tuple(results),
     )

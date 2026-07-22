@@ -19,3 +19,15 @@ def temp_db_session(tmp_path: Path) -> Iterator[Session]:
             yield session
     finally:
         engine.dispose()
+
+
+@pytest.fixture()
+def temp_db_factory(tmp_path: Path) -> Iterator[sessionmaker[Session]]:
+    db_path = tmp_path / "pipeline.db"
+    engine = create_engine(f"sqlite:///{db_path}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    try:
+        yield factory
+    finally:
+        engine.dispose()

@@ -466,7 +466,7 @@ class Repository:
         newsletter = self.session.get(Newsletter, newsletter_id)
         if newsletter is None:
             raise LookupError(f"newsletter {newsletter_id} not found")
-        newsletter.status = NewsletterStatus.FAILED.value
+        newsletter.status = NewsletterStatus.SEND_FAILED.value
         self.session.commit()
         return newsletter
 
