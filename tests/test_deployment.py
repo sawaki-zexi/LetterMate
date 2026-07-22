@@ -18,7 +18,7 @@ def test_compose_runs_one_postgres_backed_web_and_worker_stack():
 
     for service in ("db:", "migrate:", "web:", "worker:"):
         assert service in compose
-    assert "postgres:16" in compose
+    assert "postgres:17" in compose
     assert "service_healthy" in compose
     assert "service_completed_successfully" in compose
     assert "DATABASE_URL: ${DATABASE_URL:?" in compose
