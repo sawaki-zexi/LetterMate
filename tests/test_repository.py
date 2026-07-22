@@ -604,3 +604,22 @@ def test_successful_job_lifecycle_is_idempotent_and_irreversible(temp_db_session
     with pytest.raises(ValueError, match="terminal succeeded"):
         repo.fail_job_run(run.id, "late failure")
     assert repo.list_job_events(run.id) == []
+
+
+def test_newsletter_send_state_requires_explicit_force_for_a_resend(temp_db_session):
+    repo = Repository(temp_db_session)
+    newsletter = repo.save_newsletter(
+        issue_date=date(2026, 7, 23),
+        title="Daily",
+        markdown_body="# Daily",
+        html_body="<h1>Daily</h1>",
+        status=NewsletterStatus.DRAFT,
+    )
+
+    sent = repo.mark_newsletter_sent(newsletter.id)
+
+    assert sent.status == NewsletterStatus.SENT
+    assert sent.sent_at is not None
+    with pytest.raises(ValueError, match="already sent"):
+        repo.mark_newsletter_sent(newsletter.id)
+    assert repo.mark_newsletter_sent(newsletter.id, force=True).id == newsletter.id

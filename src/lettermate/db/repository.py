@@ -438,6 +438,28 @@ class Repository:
         self.session.refresh(newsletter)
         return newsletter
 
+    def get_newsletter(self, issue_date: date) -> Newsletter | None:
+        return self.session.scalar(select(Newsletter).where(Newsletter.issue_date == issue_date))
+
+    def mark_newsletter_sent(self, newsletter_id: int, *, force: bool = False) -> Newsletter:
+        newsletter = self.session.get(Newsletter, newsletter_id)
+        if newsletter is None:
+            raise LookupError(f"newsletter {newsletter_id} not found")
+        if newsletter.status == NewsletterStatus.SENT.value and not force:
+            raise ValueError(f"newsletter {newsletter_id} is already sent")
+        newsletter.status = NewsletterStatus.SENT.value
+        newsletter.sent_at = utc_now()
+        self.session.commit()
+        return newsletter
+
+    def mark_newsletter_failed(self, newsletter_id: int) -> Newsletter:
+        newsletter = self.session.get(Newsletter, newsletter_id)
+        if newsletter is None:
+            raise LookupError(f"newsletter {newsletter_id} not found")
+        newsletter.status = NewsletterStatus.FAILED.value
+        self.session.commit()
+        return newsletter
+
     def _replace_newsletter_items(
         self, newsletter: Newsletter, items: list[NewsletterItemInput]
     ) -> None:
