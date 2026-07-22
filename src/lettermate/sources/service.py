@@ -1,6 +1,8 @@
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
+from lettermate.db.repository import Repository
 from lettermate.sources.collector import CollectedItem, FeedResponse, parse_feed
 
 
@@ -46,3 +48,18 @@ def collect_sources(
                 )
             )
     return results
+
+
+def record_source_result(
+    repository: Repository,
+    result: SourceCollectionResult,
+    *,
+    fetched_at: datetime,
+) -> None:
+    repository.record_source_fetch(
+        result.source_id,
+        fetched_at=fetched_at,
+        etag=result.etag,
+        last_modified=result.last_modified,
+        error=result.error,
+    )

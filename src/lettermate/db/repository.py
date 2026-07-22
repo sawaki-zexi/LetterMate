@@ -143,6 +143,32 @@ class Repository:
         statement = select(Source).where(Source.enabled.is_(True)).order_by(Source.id)
         return list(self.session.scalars(statement))
 
+    def record_source_fetch(
+        self,
+        source_id: int,
+        *,
+        fetched_at: datetime,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        error: str | None = None,
+    ) -> Source:
+        source = self.session.get(Source, source_id)
+        if source is None:
+            raise LookupError(f"source {source_id} not found")
+        if error is not None:
+            source.status = SourceStatus.ERROR.value
+            source.last_error = error
+        else:
+            source.status = SourceStatus.ACTIVE.value
+            source.last_error = None
+            source.last_fetched_at = fetched_at
+            if etag is not None:
+                source.etag = etag
+            if last_modified is not None:
+                source.last_modified = last_modified
+        self.session.commit()
+        return source
+
     def upsert_content_item(self, item: ContentInput) -> ContentItem:
         content_hash = make_content_hash(item.title, item.url, item.raw_content)
         normalized_url = normalize_url(item.url)

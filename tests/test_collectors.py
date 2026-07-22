@@ -2,9 +2,14 @@ from datetime import UTC, datetime
 
 import pytest
 
+from lettermate.db.repository import Repository
 from lettermate.sources.cleaner import clean_html
 from lettermate.sources.collector import FeedClient, FeedResponse, parse_feed
-from lettermate.sources.service import collect_sources
+from lettermate.sources.service import (
+    SourceCollectionResult,
+    collect_sources,
+    record_source_result,
+)
 
 
 def test_clean_html_removes_active_content_and_marks_links_safe():
@@ -98,3 +103,31 @@ def test_collect_sources_isolates_one_failed_source():
     assert len(results[0].items) == 1
     assert results[1].items == ()
     assert results[1].error == "TimeoutError: timed out"
+
+
+def test_record_source_result_preserves_validators_on_failure(temp_db_session):
+    repo = Repository(temp_db_session)
+    source = repo.create_source(
+        name="Example",
+        platform="blog",
+        source_type="rss",
+        url="https://example.com/feed",
+        tags=[],
+    )
+    first_fetch = datetime(2026, 7, 20, 3, tzinfo=UTC)
+    record_source_result(
+        repo,
+        SourceCollectionResult(source.id, (), etag='"v1"', last_modified="date"),
+        fetched_at=first_fetch,
+    )
+    record_source_result(
+        repo,
+        SourceCollectionResult(source.id, (), error="TimeoutError: timed out"),
+        fetched_at=datetime(2026, 7, 20, 4, tzinfo=UTC),
+    )
+
+    temp_db_session.refresh(source)
+    assert source.etag == '"v1"'
+    assert source.last_modified == "date"
+    assert source.last_fetched_at.replace(tzinfo=UTC) == first_fetch
+    assert source.last_error == "TimeoutError: timed out"
