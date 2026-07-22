@@ -1,0 +1,78 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: lettermate
+      POSTGRES_USER: lettermate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lettermate -d lettermate"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  migrate:
+    build: .
+    environment: &application_environment
+      APP_ENV: ${APP_ENV:-production}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env with the db hostname and URL-encoded password}
+      FEEDBACK_SIGNING_SECRET: ${FEEDBACK_SIGNING_SECRET:?set FEEDBACK_SIGNING_SECRET in .env}
+      FEEDBACK_BASE_URL: ${FEEDBACK_BASE_URL:-http://localhost:8000/feedback}
+      FEEDBACK_TOKEN_TTL_HOURS: ${FEEDBACK_TOKEN_TTL_HOURS:-168}
+      OWNER_API_TOKEN: ${OWNER_API_TOKEN:?set OWNER_API_TOKEN in .env}
+      SCHEDULER_TOKEN: ${SCHEDULER_TOKEN:?set SCHEDULER_TOKEN in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      LLM_MODEL: ${LLM_MODEL:-fake-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-localhost}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-lettermate@example.com}
+      SMTP_TO: ${SMTP_TO:-you@example.com}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-false}
+      EMAIL_DRY_RUN: ${EMAIL_DRY_RUN:-true}
+      SCHEDULER_TIMEZONE: ${SCHEDULER_TIMEZONE:-UTC}
+      SCHEDULER_COLLECT_INTERVAL_MINUTES: ${SCHEDULER_COLLECT_INTERVAL_MINUTES:-30}
+      SCHEDULER_DAILY_HOUR: ${SCHEDULER_DAILY_HOUR:-8}
+      SCHEDULER_DAILY_MINUTE: ${SCHEDULER_DAILY_MINUTE:-0}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  web:
+    build: .
+    environment: *application_environment
+    command: ["uvicorn", "lettermate.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  worker:
+    build: .
+    environment: *application_environment
+    command: ["lettermate", "scheduler"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from lettermate.config import get_settings; from sqlalchemy import create_engine, text; connection = create_engine(get_settings().database_url).connect(); connection.execute(text('select 1')); connection.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:

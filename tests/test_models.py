@@ -361,3 +361,11 @@ def test_normal_session_factory_does_not_create_schema(tmp_path):
 
     assert inspect(engine).get_table_names() == []
     engine.dispose()
+
+
+def test_session_factory_checks_connections_before_reusing_them(tmp_path):
+    factory = create_session_factory(Settings(database_url=f"sqlite:///{tmp_path / 'pooled.db'}"))
+    engine = factory.kw["bind"]
+
+    assert engine.pool._pre_ping is True
+    engine.dispose()

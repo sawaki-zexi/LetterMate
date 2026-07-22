@@ -43,11 +43,13 @@ app = typer.Typer(no_args_is_help=True)
 
 
 def _initialized_session_factory() -> sessionmaker[Session]:
-    factory = create_session_factory()
+    settings = get_settings()
+    factory = create_session_factory(settings)
     bind = factory.kw.get("bind")
     if bind is None:
         raise RuntimeError("database session factory has no engine")
-    Base.metadata.create_all(bind)
+    if settings.app_env.lower() in {"development", "local", "test"}:
+        Base.metadata.create_all(bind)
     return factory
 
 

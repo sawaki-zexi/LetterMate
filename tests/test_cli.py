@@ -2,11 +2,11 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
-from lettermate.cli import app
+from lettermate.cli import _initialized_session_factory, app
 from lettermate.db.models import AnalysisResult, JobRun, Newsletter, NewsletterItem, Source
 from lettermate.sources.config_loader import load_sources
 
@@ -56,6 +56,22 @@ def test_default_sync_and_analyze_commands_use_committed_configs(tmp_path: Path,
     assert "status=succeeded" in sync_result.stdout
     assert analyze_result.exit_code == 0
     assert "status=succeeded" in analyze_result.stdout
+
+
+def test_production_cli_does_not_bypass_alembic_by_creating_schema(tmp_path: Path, monkeypatch):
+    database_path = tmp_path / "production.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{database_path}")
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("FEEDBACK_SIGNING_SECRET", "a" * 32)
+    monkeypatch.setenv("OWNER_API_TOKEN", "b" * 32)
+    monkeypatch.setenv("SCHEDULER_TOKEN", "c" * 32)
+
+    factory = _initialized_session_factory()
+    engine = factory.kw["bind"]
+
+    assert engine is not None
+    assert inspect(engine).get_table_names() == []
+    engine.dispose()
 
 
 def test_single_stage_command_exits_nonzero_for_a_failed_job(tmp_path: Path, monkeypatch):

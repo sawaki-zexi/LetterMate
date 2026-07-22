@@ -27,3 +27,35 @@ jobs:
         run: |
           npm ci --include=dev
           npm run security-eval
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: lettermate
+          POSTGRES_USER: lettermate
+          POSTGRES_PASSWORD: test-password
+        options: >-
+          --health-cmd "pg_isready -U lettermate -d lettermate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql+psycopg://lettermate:test-password@localhost:5432/lettermate
+      LETTERMATE_POSTGRES_TEST_URL: postgresql+psycopg://lettermate:test-password@localhost:5432/lettermate
+      APP_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Verify migrations and shared worker claims
+        run: |
+          alembic upgrade head
+          python -m pytest tests/test_postgres_integration.py -q

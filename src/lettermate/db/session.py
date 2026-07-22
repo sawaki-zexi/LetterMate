@@ -8,7 +8,7 @@ from lettermate.config import Settings, get_settings
 
 def create_session_factory(settings: Settings | None = None) -> sessionmaker[Session]:
     resolved = settings or get_settings()
-    engine = create_engine(resolved.database_url, future=True)
+    engine = create_engine(resolved.database_url, future=True, pool_pre_ping=True)
     return sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 

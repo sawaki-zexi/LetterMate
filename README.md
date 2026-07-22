@@ -4,16 +4,11 @@ LetterMate is an early-stage personal intelligence agent for newsletter curation
 
 ## Current status
 
-This checkpoint implements exactly four foundations:
-
-- Pydantic Settings and environment-based configuration
-- SQLAlchemy database models and session foundations
-- A Repository for the currently supported persistence operations
-- YAML source and preference configuration loading
-
-The end-to-end workflow is incomplete. Collection, analysis, newsletter generation, delivery,
-the API, and the dashboard are not finished. The bounded curation Agent, formal Eval evidence,
-and deployment are also not complete, so this repository does not yet claim those capabilities.
+LetterMate provides source collection, bounded curation with traceable decisions, preference
+snapshots, newsletter generation and delivery, protected operational views, and a separate
+scheduler worker. The deployed topology uses Postgres shared by the web and worker processes.
+Real owner dogfood and an external pilot remain required before the portfolio release can claim
+the business metrics in the requirements.
 
 The authoritative product requirements are the
 [LetterMate Agentic Product Requirements V2](docs/lettermate-agentic-product-requirements-v2.md),
@@ -30,4 +25,26 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\python.exe -m pytest -q
+```
+
+## Docker deployment
+
+Create `.env` from `.env.example` and replace every placeholder with a distinct secret of at
+least 32 characters. `APP_ENV=production` is intentional: the application rejects development
+defaults in this mode.
+
+```powershell
+Copy-Item .env.example .env
+docker compose config
+docker compose up --build -d
+docker compose ps
+curl.exe --fail http://127.0.0.1:8000/health
+```
+
+The `migrate` service runs `alembic upgrade head` before the web and worker start. `web` serves
+the protected dashboard at port 8000; `worker` runs `lettermate scheduler`; Postgres data is kept
+in the `postgres_data` volume. To apply a later migration explicitly, run:
+
+```powershell
+docker compose run --rm migrate alembic upgrade head
 ```
