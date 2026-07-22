@@ -1,6 +1,7 @@
 .env
 .venv/
 .package-smoke/
+.package-smoke-task10/
 .worktrees/
 
 .pytest_cache/

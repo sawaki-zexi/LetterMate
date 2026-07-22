@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     feedback_saved_weight: int = Field(default=2)
     feedback_not_interested_weight: int = Field(default=-2)
 
+    owner_api_token: str = Field(default="local-owner-token")
+    scheduler_token: str = Field(default="local-scheduler-token")
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     @property
@@ -52,6 +55,15 @@ class Settings(BaseSettings):
             raise ValueError(
                 "feedback signing secret must be configured with at least 32 characters"
             )
+        if not self.owner_api_token or not self.scheduler_token:
+            raise ValueError("owner and scheduler tokens must be configured")
+        if not is_local and (
+            self.owner_api_token == "local-owner-token"
+            or self.scheduler_token == "local-scheduler-token"
+            or len(self.owner_api_token) < 32
+            or len(self.scheduler_token) < 32
+        ):
+            raise ValueError("owner and scheduler tokens must be at least 32 characters")
         return self
 
 

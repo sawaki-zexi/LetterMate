@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block content %}<h1>Issues</h1>{% for issue in newsletters %}<article><strong>{{ issue.issue_date }}</strong> {{ issue.title }} {{ issue.status }}</article>{% else %}<p>No issues built yet.</p>{% endfor %}{% endblock %}

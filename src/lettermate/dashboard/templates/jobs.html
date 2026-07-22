@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block content %}<h1>Job Runs</h1>{% for job in jobs %}<p>{{ job.job_type }} {{ job.status }} {{ job.started_at }}</p>{% else %}<p>No jobs recorded.</p>{% endfor %}{% endblock %}

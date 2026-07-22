@@ -163,6 +163,9 @@ class Repository:
         statement = select(Source).where(Source.enabled.is_(True)).order_by(Source.id)
         return list(self.session.scalars(statement))
 
+    def list_sources(self) -> list[Source]:
+        return list(self.session.scalars(select(Source).order_by(Source.id)))
+
     def record_source_fetch(
         self,
         source_id: int,
@@ -268,6 +271,27 @@ class Repository:
                 select(ContentItem).where(ContentItem.content_hash == content_hash)
             )
         return None
+
+    def get_content_item_by_id(self, item_id: int) -> ContentItem | None:
+        return self.session.get(ContentItem, item_id)
+
+    def list_content_items(self, limit: int = 100) -> list[ContentItem]:
+        return list(
+            self.session.scalars(
+                select(ContentItem)
+                .order_by(ContentItem.created_at.desc(), ContentItem.id.desc())
+                .limit(limit)
+            )
+        )
+
+    def list_recent_analyses(self, limit: int = 5) -> list[AnalysisResult]:
+        return list(
+            self.session.scalars(
+                select(AnalysisResult)
+                .order_by(AnalysisResult.analyzed_at.desc(), AnalysisResult.id.desc())
+                .limit(limit)
+            )
+        )
 
     def count_content_items(self) -> int:
         return int(self.session.scalar(select(func.count(ContentItem.id))) or 0)
@@ -384,6 +408,11 @@ class Repository:
             select(PreferenceSnapshot).where(PreferenceSnapshot.version == version)
         )
 
+    def list_preference_snapshots(self) -> list[PreferenceSnapshot]:
+        return list(
+            self.session.scalars(select(PreferenceSnapshot).order_by(PreferenceSnapshot.version.desc()))
+        )
+
     def get_latest_preference_snapshot(self) -> PreferenceSnapshot | None:
         return self.session.scalar(
             select(PreferenceSnapshot).order_by(PreferenceSnapshot.version.desc()).limit(1)
@@ -449,6 +478,9 @@ class Repository:
 
     def get_newsletter(self, issue_date: date) -> Newsletter | None:
         return self.session.scalar(select(Newsletter).where(Newsletter.issue_date == issue_date))
+
+    def list_newsletters(self) -> list[Newsletter]:
+        return list(self.session.scalars(select(Newsletter).order_by(Newsletter.issue_date.desc())))
 
     def list_included_analyses(self, limit: int = 5) -> list[AnalysisResult]:
         return list(
@@ -791,6 +823,13 @@ class Repository:
                 select(ToolCallTrace)
                 .where(ToolCallTrace.agent_run_id == agent_run_id)
                 .order_by(ToolCallTrace.sequence)
+            )
+        )
+
+    def list_job_runs(self, limit: int = 100) -> list[JobRun]:
+        return list(
+            self.session.scalars(
+                select(JobRun).order_by(JobRun.started_at.desc(), JobRun.id.desc()).limit(limit)
             )
         )
 

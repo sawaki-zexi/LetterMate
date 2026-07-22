@@ -55,7 +55,38 @@ def test_production_rejects_default_or_short_feedback_secrets():
     settings = Settings(
         app_env="production",
         feedback_signing_secret="a-secure-production-feedback-secret",
+        owner_api_token="a-long-unpredictable-owner-token-value",
+        scheduler_token="a-long-unpredictable-scheduler-token-value",
         _env_file=None,
     )
 
     assert len(settings.feedback_signing_secret) >= 32
+
+
+def test_production_rejects_default_or_short_owner_and_scheduler_tokens():
+    secure_feedback_secret = "a-secure-production-feedback-secret"
+    with pytest.raises(ValidationError, match="owner and scheduler tokens"):
+        Settings(
+            app_env="production",
+            feedback_signing_secret=secure_feedback_secret,
+            _env_file=None,
+        )
+    with pytest.raises(ValidationError, match="owner and scheduler tokens"):
+        Settings(
+            app_env="production",
+            feedback_signing_secret=secure_feedback_secret,
+            owner_api_token="short",
+            scheduler_token="also-short",
+            _env_file=None,
+        )
+
+    settings = Settings(
+        app_env="production",
+        feedback_signing_secret=secure_feedback_secret,
+        owner_api_token="a-long-unpredictable-owner-token-value",
+        scheduler_token="a-long-unpredictable-scheduler-token-value",
+        _env_file=None,
+    )
+
+    assert len(settings.owner_api_token) >= 32
+    assert len(settings.scheduler_token) >= 32

@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block content %}<h1>Sources</h1>{% for source in sources %}<article><strong>{{ source.name }}</strong> {{ source.status }}<br><a href="{{ source.url }}">{{ source.url }}</a></article>{% else %}<p>No sources configured.</p>{% endfor %}{% endblock %}
