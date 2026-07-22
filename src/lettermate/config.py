@@ -1,4 +1,6 @@
-from pydantic import Field
+from typing import Self
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,7 +22,34 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = Field(default=False)
     email_dry_run: bool = Field(default=True)
 
+    feedback_signing_secret: str = Field(default="dev-only-change-me")
+    feedback_base_url: str = Field(default="http://localhost:8000/feedback")
+    feedback_token_ttl_hours: int = Field(default=168, gt=0)
+    feedback_useful_weight: int = Field(default=1)
+    feedback_saved_weight: int = Field(default=2)
+    feedback_not_interested_weight: int = Field(default=-2)
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    @property
+    def feedback_action_weights(self) -> dict[str, int]:
+        return {
+            "useful": self.feedback_useful_weight,
+            "saved": self.feedback_saved_weight,
+            "not_interested": self.feedback_not_interested_weight,
+        }
+
+    @model_validator(mode="after")
+    def validate_feedback_secret(self) -> Self:
+        is_local = self.app_env.lower() in {"development", "local", "test"}
+        if not is_local and (
+            self.feedback_signing_secret == "dev-only-change-me"
+            or len(self.feedback_signing_secret) < 32
+        ):
+            raise ValueError(
+                "feedback signing secret must be configured with at least 32 characters"
+            )
+        return self
 
 
 def get_settings() -> Settings:

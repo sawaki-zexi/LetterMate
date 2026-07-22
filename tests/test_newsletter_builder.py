@@ -1,6 +1,12 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
-from lettermate.newsletters.builder import NewsletterEntry, build_newsletter
+from lettermate.newsletters.builder import (
+    NewsletterEntry,
+    attach_signed_feedback,
+    build_newsletter,
+)
+from lettermate.preferences.signing import FeedbackSigner
 
 
 def entry(position: int, *, title: str = "Agent update") -> NewsletterEntry:
@@ -44,3 +50,29 @@ def test_builder_rejects_more_than_five_or_non_contiguous_entries():
         assert "five" in str(error)
     else:
         raise AssertionError("expected item limit validation")
+
+
+def test_signed_feedback_is_attached_to_every_newsletter_membership():
+    signer = FeedbackSigner("test-secret")
+    expires_at = datetime(2026, 7, 27, 3, tzinfo=UTC)
+    unsigned = [entry(2), entry(1)]
+
+    signed = attach_signed_feedback(
+        unsigned,
+        issue_id=42,
+        signer=signer,
+        base_url="https://letters.example/feedback",
+        expires_at=expires_at,
+    )
+    built = build_newsletter(date(2026, 7, 22), signed)
+
+    assert [item.content_item_id for item in signed] == [2, 1]
+    assert "token=" in built.html_body
+    for item in signed:
+        assert set(item.feedback_urls) == {"useful", "not_interested", "saved"}
+        for action, url in item.feedback_urls.items():
+            token = parse_qs(urlparse(url).query)["token"][0]
+            payload = signer.verify(token, now=expires_at - timedelta(seconds=1))
+            assert payload.issue_id == 42
+            assert payload.item_id == item.content_item_id
+            assert payload.action == action

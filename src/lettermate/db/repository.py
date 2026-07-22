@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
 
@@ -11,6 +11,7 @@ from lettermate.db.models import (
     AgentRun,
     AnalysisResult,
     ContentItem,
+    Feedback,
     JobEvent,
     JobRun,
     Newsletter,
@@ -67,13 +68,23 @@ def make_preference_hash(
     tag_weights: dict[str, int],
     source_weights: dict[str, int],
     feedback_cutoff: datetime | None,
+    feedback_cutoff_id: int | None = None,
 ) -> str:
+    normalized_cutoff = None
+    if feedback_cutoff is not None:
+        cutoff_with_zone = (
+            feedback_cutoff.replace(tzinfo=UTC)
+            if feedback_cutoff.tzinfo is None
+            else feedback_cutoff
+        )
+        normalized_cutoff = cutoff_with_zone.astimezone(UTC).isoformat()
     payload = {
-        "explicit_interests": explicit_interests,
-        "exclusions": exclusions,
-        "tag_weights": tag_weights,
-        "source_weights": source_weights,
-        "feedback_cutoff": feedback_cutoff.isoformat() if feedback_cutoff else None,
+        "explicit_interests": sorted(set(explicit_interests)),
+        "exclusions": sorted(set(exclusions)),
+        "tag_weights": dict(sorted(tag_weights.items())),
+        "source_weights": dict(sorted(source_weights.items())),
+        "feedback_cutoff": normalized_cutoff,
+        "feedback_cutoff_id": feedback_cutoff_id,
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return sha256(canonical.encode()).hexdigest()
@@ -329,21 +340,30 @@ class Repository:
         tag_weights: dict[str, int],
         source_weights: dict[str, int],
         feedback_cutoff: datetime | None,
+        feedback_cutoff_id: int | None = None,
+        derivation_type: str = "manual",
     ) -> PreferenceSnapshot:
+        normalized_interests = sorted(set(explicit_interests))
+        normalized_exclusions = sorted(set(exclusions))
+        normalized_tag_weights = dict(sorted(tag_weights.items()))
+        normalized_source_weights = dict(sorted(source_weights.items()))
         current_version = self.session.scalar(select(func.max(PreferenceSnapshot.version))) or 0
         snapshot = PreferenceSnapshot(
             version=current_version + 1,
-            explicit_interests=list(explicit_interests),
-            exclusions=list(exclusions),
-            tag_weights=dict(tag_weights),
-            source_weights=dict(source_weights),
+            explicit_interests=normalized_interests,
+            exclusions=normalized_exclusions,
+            tag_weights=normalized_tag_weights,
+            source_weights=normalized_source_weights,
             feedback_cutoff=feedback_cutoff,
+            feedback_cutoff_id=feedback_cutoff_id,
+            derivation_type=derivation_type,
             content_hash=make_preference_hash(
-                explicit_interests=explicit_interests,
-                exclusions=exclusions,
-                tag_weights=tag_weights,
-                source_weights=source_weights,
+                explicit_interests=normalized_interests,
+                exclusions=normalized_exclusions,
+                tag_weights=normalized_tag_weights,
+                source_weights=normalized_source_weights,
                 feedback_cutoff=feedback_cutoff,
+                feedback_cutoff_id=feedback_cutoff_id,
             ),
         )
         self.session.add(snapshot)
@@ -369,13 +389,23 @@ class Repository:
                 tag_weights={},
                 source_weights={},
                 feedback_cutoff=None,
+                derivation_type="reset",
             )
+        latest_feedback = self.session.scalar(
+            select(Feedback).order_by(Feedback.created_at.desc(), Feedback.id.desc()).limit(1)
+        )
         return self.create_preference_snapshot(
             explicit_interests=latest.explicit_interests,
             exclusions=latest.exclusions,
             tag_weights={},
             source_weights={},
-            feedback_cutoff=latest.feedback_cutoff,
+            feedback_cutoff=(
+                latest_feedback.created_at if latest_feedback else latest.feedback_cutoff
+            ),
+            feedback_cutoff_id=(
+                latest_feedback.id if latest_feedback else latest.feedback_cutoff_id
+            ),
+            derivation_type="reset",
         )
 
     def save_newsletter(
@@ -438,6 +468,14 @@ class Repository:
         self.session.flush()
 
         for entry in sorted(items, key=lambda candidate: candidate.position):
+            decision = self.session.get(AnalysisResult, entry.decision_id)
+            content_item = self.session.get(ContentItem, entry.content_item_id)
+            if decision is None or content_item is None:
+                raise RuntimeError("validated newsletter provenance disappeared")
+            agent_run = self.session.get(AgentRun, decision.agent_run_id)
+            if agent_run is None:
+                raise RuntimeError("validated newsletter agent run disappeared")
+            recommendation_snapshot_id = agent_run.preference_snapshot_id
             candidate = existing.get(entry.content_item_id)
             if candidate is None:
                 candidate = NewsletterItem(
@@ -445,6 +483,9 @@ class Repository:
                 )
                 self.session.add(candidate)
             candidate.decision_id = entry.decision_id
+            candidate.source_id = content_item.source_id
+            candidate.preference_snapshot_id = recommendation_snapshot_id
+            candidate.decision_tags = sorted(set(decision.tags))
             candidate.position = entry.position
             candidate.section = entry.section
             candidate.final_score = entry.final_score

@@ -121,6 +121,8 @@ class PreferenceSnapshot(Base):
     tag_weights: Mapped[dict[str, int]] = mapped_column(JSON, default=dict)
     source_weights: Mapped[dict[str, int]] = mapped_column(JSON, default=dict)
     feedback_cutoff: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    feedback_cutoff_id: Mapped[int | None] = mapped_column(Integer)
+    derivation_type: Mapped[str] = mapped_column(String(50), default="manual")
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -269,6 +271,11 @@ class NewsletterItem(Base):
     newsletter_id: Mapped[int] = mapped_column(ForeignKey("newsletters.id"), nullable=False)
     content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), nullable=False)
     decision_id: Mapped[int] = mapped_column(ForeignKey("analysis_results.id"), nullable=False)
+    source_id: Mapped[int | None] = mapped_column(ForeignKey("sources.id"))
+    preference_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("preference_snapshots.id")
+    )
+    decision_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     section: Mapped[str] = mapped_column(String(100), nullable=False)
     final_score: Mapped[float] = mapped_column(Float, nullable=False)
@@ -281,10 +288,28 @@ class NewsletterItem(Base):
 
 class Feedback(Base):
     __tablename__ = "feedback"
+    __table_args__ = (
+        UniqueConstraint(
+            "newsletter_item_id",
+            "feedback_type",
+            name="uq_feedback_membership_action",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), nullable=False)
+    newsletter_item_id: Mapped[int | None] = mapped_column(ForeignKey("newsletter_items.id"))
+    decision_id: Mapped[int | None] = mapped_column(ForeignKey("analysis_results.id"))
+    preference_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("preference_snapshots.id")
+    )
+    resulting_preference_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("preference_snapshots.id")
+    )
+    source_id: Mapped[int | None] = mapped_column(ForeignKey("sources.id"))
     feedback_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    action_source: Mapped[str] = mapped_column(String(50), default="legacy")
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 

@@ -1,6 +1,10 @@
-from dataclasses import dataclass
-from datetime import date
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 from html import escape
+
+from lettermate.preferences.service import build_feedback_urls
+from lettermate.preferences.signing import FeedbackSigner
 
 
 @dataclass(frozen=True)
@@ -16,7 +20,7 @@ class NewsletterEntry:
     summary: str
     reason: str
     confidence: float
-    feedback_urls: dict[str, str]
+    feedback_urls: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,29 @@ class BuiltNewsletter:
     markdown_body: str
     html_body: str
     memberships: tuple[NewsletterMembership, ...]
+
+
+def attach_signed_feedback(
+    entries: list[NewsletterEntry],
+    *,
+    issue_id: int,
+    signer: FeedbackSigner,
+    base_url: str,
+    expires_at: datetime,
+) -> list[NewsletterEntry]:
+    return [
+        replace(
+            entry,
+            feedback_urls=build_feedback_urls(
+                signer=signer,
+                base_url=base_url,
+                issue_id=issue_id,
+                item_id=entry.content_item_id,
+                expires_at=expires_at,
+            ),
+        )
+        for entry in entries
+    ]
 
 
 def build_newsletter(issue_date: date, entries: list[NewsletterEntry]) -> BuiltNewsletter:
