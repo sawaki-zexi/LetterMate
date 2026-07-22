@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from lettermate.db.models import JobRun
 from lettermate.db.repository import Repository
+from lettermate.sources.config_loader import SourceConfig
 
 
 @dataclass(frozen=True)
@@ -41,3 +42,19 @@ class JobRunner:
                     details={"job_type": job_type},
                 )
                 return StageResult(run=failed, status=failed.status, details={})
+
+
+def sync_sources(runner: JobRunner, sources: list[SourceConfig]) -> StageResult:
+    def operation(repository: Repository) -> dict[str, int]:
+        for source in sources:
+            repository.upsert_source(
+                name=source.name,
+                platform=source.platform,
+                source_type=source.source_type,
+                url=str(source.url),
+                tags=source.tags,
+                enabled=source.enabled,
+            )
+        return {"sources": len(sources)}
+
+    return runner.run_stage("sync", operation)
