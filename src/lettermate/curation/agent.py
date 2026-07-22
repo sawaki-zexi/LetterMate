@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from hashlib import sha256
 from typing import Any
 
@@ -15,7 +14,7 @@ from pydantic import ValidationError
 
 from lettermate.curation.prompts import PROMPT_VERSION, SYSTEM_PROMPT
 from lettermate.curation.schemas import CurationOutput
-from lettermate.curation.tools import CurationTools
+from lettermate.curation.tools import CurationTools, ToolDeadlineError
 from lettermate.curation.tracing import TraceRecorder, disable_sdk_tracing
 
 _TOOL_NAMES = ("fetch_full_text", "lookup_recent_topics", "get_preference_evidence")
@@ -64,10 +63,10 @@ class AgentRunTimeout(RuntimeError):
 
 
 class _SDKRunner:
-    def run_sync(
+    async def run(
         self, agent: Agent[Any], input: dict[str, object], *, max_turns: int
     ) -> Any:
-        return Runner.run_sync(
+        return await Runner.run(
             agent,
             json.dumps(input, sort_keys=True, separators=(",", ":"), default=str),
             max_turns=max_turns,
@@ -121,6 +120,11 @@ class AgentCurationProvider:
             model=self.model,
             input_hash=input_hash,
         )
+        if run.status == "succeeded":
+            return self._cached_output(run)
+        if run.status == "failed":
+            raise RuntimeError(f"agent run {run.id} is already failed")
+        deadline = _RunDeadline(self.timeout_seconds)
         tracer = TraceRecorder(self._repository, run.id)
         context = type(
             "CurationToolContext",
@@ -137,6 +141,7 @@ class AgentCurationProvider:
             client=self._http_client,
             resolver=self._resolver,
             tracer=tracer,
+            deadline_expired=deadline.expired,
         )
         agent = build_curation_agent(
             model=self._agent_model,
@@ -147,8 +152,10 @@ class AgentCurationProvider:
             },
         )
         started = time.perf_counter()
+        usage: Any = None
         try:
-            result = self._run_with_timeout(agent, payload)
+            result = asyncio.run(self._run_with_timeout(agent, payload, deadline))
+            usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
             output = self._validated_output(
                 result,
                 request,
@@ -159,7 +166,6 @@ class AgentCurationProvider:
             output = output.model_copy(
                 update={"agent_run_id": run.id, "model_identifier": self.model}
             )
-            usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
             self._repository.complete_agent_run(
                 run.id,
                 semantic_output=output.model_dump(
@@ -177,21 +183,28 @@ class AgentCurationProvider:
                 run.id,
                 _safe_error_message(error, category),
                 error_category=category,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                cost_usd="0",
             )
             raise
 
-    def _run_with_timeout(self, agent: Agent[Any], payload: dict[str, object]) -> Any:
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="curation-agent")
-        future = executor.submit(
-            self._runner.run_sync, agent, payload, max_turns=self.max_turns
-        )
+    async def _run_with_timeout(
+        self, agent: Agent[Any], payload: dict[str, object], deadline: _RunDeadline
+    ) -> Any:
         try:
-            return future.result(timeout=self.timeout_seconds)
-        except FutureTimeoutError as error:
-            future.cancel()
+            result = await asyncio.wait_for(
+                self._runner.run(agent, payload, max_turns=self.max_turns),
+                timeout=self.timeout_seconds,
+            )
+        except TimeoutError as error:
             raise AgentRunTimeout("curation agent exceeded its timeout") from error
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        except ToolDeadlineError as error:
+            raise AgentRunTimeout("curation agent exceeded its timeout") from error
+        if deadline.expired():
+            raise AgentRunTimeout("curation agent exceeded its timeout")
+        return result
 
     @staticmethod
     def _validated_output(
@@ -229,6 +242,19 @@ class AgentCurationProvider:
             "prompt_version": self.prompt_version,
         }
 
+    @staticmethod
+    def _cached_output(run: Any) -> CurationOutput:
+        if not isinstance(run.semantic_output, dict):
+            raise RuntimeError(f"agent run {run.id} succeeded without semantic output")
+        values = dict(run.semantic_output)
+        evidence = [str(value) for value in values.get("evidence_references", [])]
+        return CurationOutput.model_validate(
+            {
+                **values,
+                "available_evidence_ids": evidence,
+            }
+        ).model_copy(update={"agent_run_id": run.id, "model_identifier": run.model})
+
 
 def _model_identifier(model: Any) -> str:
     if isinstance(model, str):
@@ -255,3 +281,11 @@ def _safe_error_message(error: Exception, category: str) -> str:
     if category.startswith("tool_") or category == "agent_timeout":
         return str(error)[:300]
     return f"{category}: {type(error).__name__}"
+
+
+class _RunDeadline:
+    def __init__(self, timeout_seconds: float) -> None:
+        self._expires_at = time.monotonic() + timeout_seconds
+
+    def expired(self) -> bool:
+        return time.monotonic() >= self._expires_at

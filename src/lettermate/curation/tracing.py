@@ -52,7 +52,7 @@ class TraceRecorder:
                 argument_hash,
                 status=AgentRunStatus.FAILED.value,
                 latency_ms=latency,
-                error_message=str(error)[:500],
+                error_message=f"{category}:{type(error).__name__}",
                 error_category=category,
             )
             raise

@@ -5,9 +5,11 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 
+import httpcore
 import httpx
 from bs4 import BeautifulSoup
 
@@ -26,6 +28,79 @@ class ToolBudgetError(ToolError):
     error_category = "tool_budget"
 
 
+class ToolDeadlineError(ToolError):
+    error_category = "agent_timeout"
+
+
+class _PinnedNetworkBackend(httpcore.NetworkBackend):
+    """Connect to an allowlisted IP while httpcore retains the origin hostname for TLS."""
+
+    def __init__(self, hostname: str, pinned_ip: str) -> None:
+        self._hostname = hostname.casefold()
+        self._pinned_ip = pinned_ip
+        self._backend = httpcore.SyncBackend()
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.NetworkStream:
+        if host.casefold() != self._hostname:
+            raise ToolSecurityError("transport attempted an unrelated hostname")
+        return self._backend.connect_tcp(
+            self._pinned_ip,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    def connect_unix_socket(
+        self, path: str, timeout: float | None = None, socket_options: Any = None
+    ) -> httpcore.NetworkStream:
+        raise ToolSecurityError("unix socket connections are not allowed")
+
+
+class _PinnedHTTPTransport(httpx.HTTPTransport):
+    def __init__(self, hostname: str, pinned_ip: str) -> None:
+        # HTTPTransport creates the TLS context with certificate verification enabled.
+        super().__init__(verify=True, trust_env=False, proxy=None, retries=0)
+        original_pool = self._pool
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=original_pool._ssl_context,
+            network_backend=_PinnedNetworkBackend(hostname, pinned_ip),
+            max_connections=1,
+            max_keepalive_connections=0,
+            retries=0,
+        )
+        original_pool.close()
+
+
+class PinnedHTTPClient:
+    """Fresh pinned connection per request; redirects must resolve and pin again."""
+
+    @contextmanager
+    def stream(
+        self, url: str, *, pinned_ip: str, timeout: float
+    ) -> Iterator[httpx.Response]:
+        parsed = httpx.URL(url)
+        hostname = parsed.host
+        if hostname is None:
+            raise ToolSecurityError("URL has no hostname")
+        transport = _PinnedHTTPTransport(hostname, pinned_ip)
+        with httpx.Client(
+            transport=transport,
+            follow_redirects=False,
+            timeout=timeout,
+            trust_env=False,
+        ) as client:
+            with client.stream("GET", url, follow_redirects=False, timeout=timeout) as response:
+                yield response
+
+
 class CurationTools:
     MAX_CALLS = 3
     MAX_REDIRECTS = 3
@@ -41,12 +116,14 @@ class CurationTools:
         client: Any = None,
         resolver: Callable[[str], list[str]] | None = None,
         tracer: TraceRecorder | None = None,
+        deadline_expired: Callable[[], bool] | None = None,
         timeout: float = 5.0,
     ) -> None:
         self.context = context
-        self.client = client or httpx.Client(follow_redirects=False, timeout=timeout)
+        self.client = client or PinnedHTTPClient()
         self.resolver = resolver or _resolve_host
         self.tracer = tracer or TraceRecorder()
+        self._deadline_expired = deadline_expired
         self.timeout = timeout
         self._attempts = 0
         self._used_tools: set[str] = set()
@@ -92,6 +169,8 @@ class CurationTools:
         summary: str,
         operation: Callable[[], Any],
     ) -> Any:
+        if self._deadline_expired is not None and self._deadline_expired():
+            raise ToolDeadlineError("curation agent exceeded its timeout")
         self._attempts += 1
         if self._attempts > self.MAX_CALLS:
             error = ToolBudgetError(f"tool budget exceeded ({self.MAX_CALLS})")
@@ -112,38 +191,46 @@ class CurationTools:
         current = url
         for _redirect in range(self.MAX_REDIRECTS + 1):
             parsed = _validate_url(current, self.context)
-            _validate_dns(parsed.host or "", self.resolver)
-            response = self.client.get(current, follow_redirects=False, timeout=self.timeout)
-            if 300 <= response.status_code < 400:
-                location = response.headers.get("location")
-                if not location:
-                    raise ToolSecurityError("redirect missing location")
-                current = str(parsed.join(location))
-                continue
-            if response.status_code >= 400:
-                raise ToolError(f"content request failed with status {response.status_code}")
-            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            if content_type not in self.ALLOWED_CONTENT_TYPES:
-                raise ToolError(f"unsupported content type: {content_type or 'missing'}")
-            declared_length = response.headers.get("content-length")
-            if declared_length is not None:
-                try:
-                    if int(declared_length) > self.MAX_BYTES:
-                        raise ToolError("content exceeds byte limit")
-                except ValueError as error:
-                    raise ToolError("invalid content length") from error
-            body = response.content
-            if len(body) > self.MAX_BYTES:
-                raise ToolError("content exceeds byte limit")
-            if content_type == "text/plain":
-                text = body.decode(response.encoding or "utf-8", errors="replace")
-            else:
-                soup = BeautifulSoup(body, "html.parser")
-                for node in soup(["script", "style", "noscript", "template"]):
-                    node.decompose()
-                text = soup.get_text(" ", strip=True)
-            return re.sub(r"\s+", " ", text).strip()[: self.MAX_TEXT_CHARS]
+            pinned_ip = _validate_dns(parsed.host or "", self.resolver)[0]
+            with self.client.stream(current, pinned_ip=pinned_ip, timeout=self.timeout) as response:
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ToolSecurityError("redirect missing location")
+                    current = str(parsed.join(location))
+                    continue
+                if response.status_code >= 400:
+                    raise ToolError(f"content request failed with status {response.status_code}")
+                content_type = (
+                    response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                )
+                if content_type not in self.ALLOWED_CONTENT_TYPES:
+                    raise ToolError(f"unsupported content type: {content_type or 'missing'}")
+                body = self._read_bounded(response)
+                if content_type == "text/plain":
+                    text = body.decode(response.encoding or "utf-8", errors="replace")
+                else:
+                    soup = BeautifulSoup(body, "html.parser")
+                    for node in soup(["script", "style", "noscript", "template"]):
+                        node.decompose()
+                    text = soup.get_text(" ", strip=True)
+                return re.sub(r"\s+", " ", text).strip()[: self.MAX_TEXT_CHARS]
         raise ToolSecurityError("redirect limit exceeded")
+
+    def _read_bounded(self, response: httpx.Response) -> bytes:
+        declared_length = response.headers.get("content-length")
+        if declared_length is not None:
+            try:
+                if int(declared_length) > self.MAX_BYTES:
+                    raise ToolError("content exceeds byte limit")
+            except ValueError as error:
+                raise ToolError("invalid content length") from error
+        chunks = bytearray()
+        for chunk in response.iter_bytes(chunk_size=64 * 1024):
+            if len(chunks) + len(chunk) > self.MAX_BYTES:
+                raise ToolError("content exceeds byte limit")
+            chunks.extend(chunk)
+        return bytes(chunks)
 
     def _lookup_topics(self, query: str) -> list[dict[str, Any]]:
         repository = getattr(self.context, "repository", None)
@@ -189,8 +276,8 @@ def _resolve_host(host: str) -> list[str]:
     )
 
 
-def _validate_dns(host: str, resolver: Callable[[str], list[str]]) -> None:
-    addresses = resolver(host)
+def _validate_dns(host: str, resolver: Callable[[str], list[str]]) -> list[str]:
+    addresses = sorted(set(resolver(host)))
     if not addresses:
         raise ToolSecurityError("hostname did not resolve")
     for address in addresses:
@@ -204,6 +291,7 @@ def _validate_dns(host: str, resolver: Callable[[str], list[str]]) -> None:
             or ip.is_unspecified
         ):
             raise ToolSecurityError("resolved address is not public")
+    return addresses
 
 
 def _validate_url(url: str, context: Any) -> httpx.URL:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import tomllib
+from contextlib import contextmanager
 from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +50,18 @@ def _tool_context(**kwargs):
     return SimpleNamespace(**defaults)
 
 
+class MockPinnedClient:
+    def __init__(self, handler):
+        self._client = httpx.Client(transport=httpx.MockTransport(handler))
+        self.pinned_ips: list[str] = []
+
+    @contextmanager
+    def stream(self, url, *, pinned_ip, timeout):
+        self.pinned_ips.append(pinned_ip)
+        with self._client.stream("GET", url, follow_redirects=False, timeout=timeout) as response:
+            yield response
+
+
 def test_fetch_full_text_rejects_unrelated_private_and_non_http_urls():
     from lettermate.curation.tools import CurationTools, ToolSecurityError
 
@@ -80,18 +93,14 @@ def test_fetch_full_text_revalidates_each_redirect_and_returns_bounded_plain_tex
             content=b"<script>bad()</script><article>Hello <b>world</b></article>",
         )
 
-    client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = MockPinnedClient(handler)
     tools = CurationTools(_tool_context(), client=client, resolver=resolver)
 
     assert tools.fetch_full_text("https://example.com/article") == "Hello world"
     assert requests == ["https://example.com/article", "https://example.com/final"]
 
-    private_redirect = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                302, headers={"location": "http://127.0.0.1/private"}
-            )
-        )
+    private_redirect = MockPinnedClient(
+        lambda request: httpx.Response(302, headers={"location": "http://127.0.0.1/private"})
     )
     with pytest.raises(ToolSecurityError):
         CurationTools(_tool_context(), client=private_redirect, resolver=resolver).fetch_full_text(
@@ -102,13 +111,62 @@ def test_fetch_full_text_revalidates_each_redirect_and_returns_bounded_plain_tex
 def test_fetch_full_text_rejects_oversized_content_length_before_reading():
     from lettermate.curation.tools import CurationTools, ToolError
 
-    client = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                200,
-                headers={"content-type": "text/plain", "content-length": "1000001"},
-                content=b"small body",
+    client = MockPinnedClient(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/plain", "content-length": "1000001"},
+            content=b"small body",
+        )
+    )
+
+    with pytest.raises(ToolError, match="byte limit"):
+        CurationTools(
+            _tool_context(),
+            client=client,
+            resolver=lambda _host: ["93.184.216.34"],
+        ).fetch_full_text("https://example.com/article")
+
+
+def test_fetch_full_text_passes_validated_ip_to_pinned_client_not_hostname_dns():
+    from contextlib import contextmanager
+
+    from lettermate.curation.tools import CurationTools
+
+    class RebindingClient:
+        calls: list[tuple[str, str]] = []
+
+        @contextmanager
+        def stream(self, url, *, pinned_ip, timeout):
+            self.calls.append((url, pinned_ip))
+            assert pinned_ip == "93.184.216.34"
+            yield httpx.Response(
+                200, headers={"content-type": "text/plain"}, content=b"pinned public text"
             )
+
+    client = RebindingClient()
+    tools = CurationTools(
+        _tool_context(),
+        client=client,
+        resolver=lambda _host: ["93.184.216.34"],
+    )
+
+    assert tools.fetch_full_text("https://example.com/article") == "pinned public text"
+    assert client.calls == [("https://example.com/article", "93.184.216.34")]
+
+
+def test_fetch_full_text_streams_chunked_body_without_materializing_over_limit():
+    from lettermate.curation.tools import CurationTools, ToolError
+
+    class LargeChunkedBody(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"a" * 700_000
+            yield b"b" * 400_000
+
+    client = MockPinnedClient(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            stream=LargeChunkedBody(),
         )
     )
 
@@ -169,6 +227,17 @@ def test_read_only_history_tools_return_bounded_redacted_records(temp_db_session
             raw_content="PRIVATE RAW ARTICLE SHOULD NOT ESCAPE",
         )
     )
+    repository.upsert_content_item(
+        ContentInput(
+            source_id=source.id,
+            external_id="pending",
+            title="Unrelated pending item",
+            url="https://example.com/pending",
+            author="",
+            published_at=None,
+            raw_content="PENDING RAW CONTENT SHOULD NOT ESCAPE",
+        )
+    )
     snapshot = repository.create_preference_snapshot(
         explicit_interests=["agents"],
         exclusions=[],
@@ -186,6 +255,27 @@ def test_read_only_history_tools_return_bounded_redacted_records(temp_db_session
         )
     )
     temp_db_session.commit()
+    run = repository.start_agent_run(
+        content_item_id=item.id,
+        preference_snapshot_id=snapshot.id,
+        prompt_version="curation-v2",
+        model="fake-model",
+        input_hash="history-test",
+    )
+    repository.save_analysis(
+        item,
+        summary="Agent summary",
+        tags=["agents"],
+        score=4,
+        reason="Relevant",
+        actionable_insight="Read",
+        should_include=True,
+        model="fake-model",
+        agent_run_id=run.id,
+        semantic_score=4.0,
+        final_score=4.0,
+        decision="include",
+    )
     tools = CurationTools(_tool_context(repository=repository))
 
     topics = tools.lookup_recent_topics("agents")
@@ -195,6 +285,7 @@ def test_read_only_history_tools_return_bounded_redacted_records(temp_db_session
     combined = repr(topics + evidence)
     assert "PRIVATE" not in combined
     assert set(topics[0]) <= {"item_id", "tags", "summary"}
+    assert [topic["item_id"] for topic in topics] == [item.id]
     assert set(evidence[0]) <= {
         "feedback_id",
         "content_item_id",
@@ -210,7 +301,7 @@ class ScriptedRunner:
         self.calls = list(calls)
         self.inputs = []
 
-    def run_sync(self, agent, input, *, max_turns):
+    async def run(self, agent, input, *, max_turns):
         from agents import RunConfig
         from agents.tool_context import ToolContext
 
@@ -227,7 +318,7 @@ class ScriptedRunner:
                     tracing_disabled=True, trace_include_sensitive_data=False
                 ),
             )
-            asyncio.run(tool.on_invoke_tool(context, encoded))
+            await tool.on_invoke_tool(context, encoded)
         return SimpleNamespace(
             final_output=self.output,
             context_wrapper=SimpleNamespace(
@@ -296,6 +387,32 @@ def _agent_setup(session):
     return repository, request
 
 
+def _persist_included_topic(repository, request):
+    item = repository.get_content_item(url=str(request.url))
+    assert item is not None
+    run = repository.start_agent_run(
+        content_item_id=item.id,
+        preference_snapshot_id=request.preference_snapshot_id,
+        prompt_version="history-v1",
+        model="history-model",
+        input_hash="history-evidence",
+    )
+    repository.save_analysis(
+        item,
+        summary="Included topic",
+        tags=["agents"],
+        score=4,
+        reason="Relevant",
+        actionable_insight="Read",
+        should_include=True,
+        model="history-model",
+        agent_run_id=run.id,
+        semantic_score=4.0,
+        final_score=4.0,
+        decision="include",
+    )
+
+
 @pytest.mark.parametrize(
     "calls",
     [
@@ -316,11 +433,9 @@ def test_agent_runs_zero_single_and_all_bounded_tools(temp_db_session, calls):
 
     repository, request = _agent_setup(temp_db_session)
     runner = ScriptedRunner(_output(), calls)
-    http_client = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                200, headers={"content-type": "text/plain"}, content=b"Full text"
-            )
+    http_client = MockPinnedClient(
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"Full text"
         )
     )
     provider = AgentCurationProvider(
@@ -372,11 +487,9 @@ def test_duplicate_and_over_budget_fail_agent_run_visibly(temp_db_session, calls
     from lettermate.db.models import AgentRun, ToolCallTrace
 
     repository, request = _agent_setup(temp_db_session)
-    client = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda request: httpx.Response(
-                200, headers={"content-type": "text/plain"}, content=b"Full text"
-            )
+    client = MockPinnedClient(
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/plain"}, content=b"Full text"
         )
     )
     provider = AgentCurationProvider(
@@ -392,6 +505,8 @@ def test_duplicate_and_over_budget_fail_agent_run_visibly(temp_db_session, calls
 
     run = temp_db_session.query(AgentRun).one()
     assert run.status == "failed" and run.error_category == category
+    assert run.latency_ms is not None
+    assert run.input_tokens == 0 and run.output_tokens == 0
     trace = (
         temp_db_session.query(ToolCallTrace)
         .order_by(ToolCallTrace.sequence.desc())
@@ -405,8 +520,8 @@ def test_timeout_invalid_output_and_low_confidence_policy(temp_db_session):
     from lettermate.db.models import AgentRun
 
     class SlowRunner:
-        def run_sync(self, agent, input, *, max_turns):
-            time.sleep(0.1)
+        async def run(self, agent, input, *, max_turns):
+            await asyncio.sleep(0.1)
             return SimpleNamespace(final_output=_output())
 
     repository, request = _agent_setup(temp_db_session)
@@ -415,7 +530,10 @@ def test_timeout_invalid_output_and_low_confidence_policy(temp_db_session):
     )
     with pytest.raises(AgentRunTimeout):
         timeout_provider.curate(request)
-    assert temp_db_session.query(AgentRun).one().error_category == "agent_timeout"
+    timed_out = temp_db_session.query(AgentRun).one()
+    assert timed_out.error_category == "agent_timeout"
+    assert timed_out.latency_ms is not None
+    assert timed_out.input_tokens == 0 and timed_out.output_tokens == 0
 
     temp_db_session.query(AgentRun).delete()
     temp_db_session.commit()
@@ -426,7 +544,10 @@ def test_timeout_invalid_output_and_low_confidence_policy(temp_db_session):
 
     with pytest.raises((ValidationError, TypeError, ValueError)):
         invalid.curate(request)
-    assert temp_db_session.query(AgentRun).one().error_category == "output_validation"
+    invalid_run = temp_db_session.query(AgentRun).one()
+    assert invalid_run.error_category == "output_validation"
+    assert invalid_run.latency_ms is not None
+    assert invalid_run.input_tokens == 11 and invalid_run.output_tokens == 7
 
     temp_db_session.query(AgentRun).delete()
     temp_db_session.commit()
@@ -437,6 +558,83 @@ def test_timeout_invalid_output_and_low_confidence_policy(temp_db_session):
         minimum_confidence=0.6,
     ).curate(request)
     assert low.recommendation == "review"
+
+
+def test_timeout_prevents_late_tool_network_and_trace_writes(temp_db_session):
+    from lettermate.curation.agent import AgentCurationProvider, AgentRunTimeout
+    from lettermate.db.models import ToolCallTrace
+
+    class LateToolRunner(ScriptedRunner):
+        async def run(self, agent, input, *, max_turns):
+            await asyncio.sleep(0.03)
+            return await super().run(agent, input, max_turns=max_turns)
+
+    repository, request = _agent_setup(temp_db_session)
+    network_calls: list[str] = []
+    client = MockPinnedClient(
+        lambda request: (
+            network_calls.append(str(request.url))
+            or httpx.Response(200, headers={"content-type": "text/plain"}, content=b"late")
+        )
+    )
+    provider = AgentCurationProvider(
+        repository,
+        runner=LateToolRunner(
+            _output(), calls=[("fetch_full_text", {"url": "https://example.com/article"})]
+        ),
+        model="fake-model",
+        http_client=client,
+        resolver=lambda _host: ["93.184.216.34"],
+        timeout_seconds=0.01,
+    )
+
+    with pytest.raises(AgentRunTimeout):
+        provider.curate(request)
+
+    time.sleep(0.06)
+    assert network_calls == []
+    assert temp_db_session.query(ToolCallTrace).count() == 0
+
+
+def test_async_runner_hang_is_cancelled_within_configured_timeout(temp_db_session):
+    from lettermate.curation.agent import AgentCurationProvider, AgentRunTimeout
+
+    class HangingRunner:
+        async def run(self, agent, input, *, max_turns):
+            await asyncio.sleep(10)
+
+    repository, request = _agent_setup(temp_db_session)
+    provider = AgentCurationProvider(
+        repository,
+        runner=HangingRunner(),
+        model="fake-model",
+        timeout_seconds=0.02,
+    )
+    started = time.perf_counter()
+    with pytest.raises(AgentRunTimeout):
+        provider.curate(request)
+
+    assert time.perf_counter() - started < 0.2
+
+
+def test_trace_recorder_redacts_urls_queries_and_secrets_in_tool_errors():
+    from lettermate.curation.tracing import TraceRecorder
+
+    recorder = TraceRecorder()
+    with pytest.raises(RuntimeError):
+        recorder.call(
+            "fetch_full_text",
+            {"url": "https://example.com/article?token=secret-token"},
+            lambda: (_ for _ in ()).throw(
+                RuntimeError("request https://example.com/article?token=secret-token failed")
+            ),
+            argument_summary="host=example.com",
+        )
+
+    trace = recorder.records[0]
+    assert "secret-token" not in trace["error_message"]
+    assert "https://" not in trace["error_message"]
+    assert trace["error_message"] == "tool_error:RuntimeError"
 
 
 def test_service_reuses_agent_run_while_ranking_owns_final_decision(temp_db_session):
@@ -472,6 +670,7 @@ def test_agent_accepts_ids_returned_by_bounded_evidence_tools(temp_db_session):
     from lettermate.curation.agent import AgentCurationProvider
 
     repository, request = _agent_setup(temp_db_session)
+    _persist_included_topic(repository, request)
     provider = AgentCurationProvider(
         repository,
         runner=ScriptedRunner(
@@ -491,6 +690,7 @@ def test_agent_revalidates_sdk_parsed_output_with_runtime_evidence(temp_db_sessi
     from lettermate.curation.schemas import CurationOutput
 
     repository, request = _agent_setup(temp_db_session)
+    _persist_included_topic(repository, request)
     sdk_output = CurationOutput(**_output(evidence_references=["item:1"]))
     provider = AgentCurationProvider(
         repository,
@@ -502,6 +702,51 @@ def test_agent_revalidates_sdk_parsed_output_with_runtime_evidence(temp_db_sessi
     )
 
     assert provider.curate(request).evidence_references == ["item:1"]
+
+
+def test_terminal_agent_runs_are_cached_without_runner_or_trace_reexecution(temp_db_session):
+    from lettermate.curation.agent import AgentCurationProvider
+    from lettermate.curation.tools import ToolBudgetError
+    from lettermate.db.models import AgentRun, ToolCallTrace
+
+    repository, request = _agent_setup(temp_db_session)
+    runner = ScriptedRunner(
+        _output(), calls=[("lookup_recent_topics", {"query": "agents"})]
+    )
+    provider = AgentCurationProvider(repository, runner=runner, model="fake-model")
+
+    first = provider.curate(request)
+    first_traces = [
+        (trace.sequence, trace.argument_hash)
+        for trace in temp_db_session.query(ToolCallTrace)
+    ]
+    second = provider.curate(request)
+
+    assert second == first
+    assert len(runner.inputs) == 1
+    assert [
+        (trace.sequence, trace.argument_hash)
+        for trace in temp_db_session.query(ToolCallTrace)
+    ] == first_traces
+
+    failed_repository = repository
+    failed_request = request.model_copy(update={"title": "Failed bounded agent"})
+    failed_runner = ScriptedRunner(
+        _output(),
+        calls=[
+            ("lookup_recent_topics", {"query": "one"}),
+            ("lookup_recent_topics", {"query": "two"}),
+        ],
+    )
+    failed_provider = AgentCurationProvider(
+        failed_repository, runner=failed_runner, model="another-fake-model"
+    )
+    with pytest.raises(ToolBudgetError):
+        failed_provider.curate(failed_request)
+    with pytest.raises(RuntimeError, match="already failed"):
+        failed_provider.curate(failed_request)
+    assert len(failed_runner.inputs) == 1
+    assert temp_db_session.query(AgentRun).count() == 2
 
 
 def test_agent_settings_are_bounded_and_do_not_require_an_api_key():

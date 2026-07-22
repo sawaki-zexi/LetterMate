@@ -463,21 +463,31 @@ class Repository:
     def list_recent_topics(self, *, query: str = "", limit: int = 5) -> list[dict[str, object]]:
         """Return bounded, non-sensitive topic evidence for agent context."""
         bounded = max(0, min(int(limit), 5))
-        statement = select(ContentItem).order_by(
-            ContentItem.published_at.desc().nullslast(), ContentItem.id.desc()
+        statement = (
+            select(AnalysisResult, ContentItem)
+            .join(ContentItem, AnalysisResult.content_item_id == ContentItem.id)
+            .where(AnalysisResult.decision.in_(("include", "exclude")))
+            .order_by(AnalysisResult.analyzed_at.desc(), AnalysisResult.id.desc())
+            .limit(bounded * 10)
         )
-        del query
-        rows = list(self.session.scalars(statement.limit(bounded)))
+        rows = list(self.session.execute(statement))
         result: list[dict[str, object]] = []
-        for item in rows:
-            tags = list(item.analysis.tags) if item.analysis is not None else []
+        needle = query.strip().casefold()
+        for analysis, item in rows:
+            tags = sorted(set(str(tag) for tag in analysis.tags))[:20]
+            if needle and needle not in item.title.casefold() and not any(
+                needle in tag.casefold() for tag in tags
+            ):
+                continue
             result.append(
                 {
                     "item_id": item.id,
-                    "tags": sorted(set(str(tag) for tag in tags))[:20],
+                    "tags": tags,
                     "summary": item.title[:160],
                 }
             )
+            if len(result) >= bounded:
+                break
         return result
 
     def list_preference_evidence(
@@ -707,7 +717,15 @@ class Repository:
         return run
 
     def fail_agent_run(
-        self, agent_run_id: int, error_message: str, *, error_category: str | None = None
+        self,
+        agent_run_id: int,
+        error_message: str,
+        *,
+        error_category: str | None = None,
+        latency_ms: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_usd: str | Decimal = "0",
     ) -> AgentRun:
         self.session.rollback()
         run = self._get_agent_run(agent_run_id)
@@ -718,6 +736,10 @@ class Repository:
         run.status = AgentRunStatus.FAILED.value
         run.error_message = error_message
         run.error_category = error_category
+        run.latency_ms = latency_ms
+        run.input_tokens = input_tokens
+        run.output_tokens = output_tokens
+        run.cost_usd = Decimal(cost_usd)
         run.finished_at = utc_now()
         self._commit()
         return run
