@@ -21,7 +21,7 @@ class EvalLabel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     item_id: str = Field(min_length=1)
-    relevance_grade: int = Field(ge=0, le=2)
+    relevance_grade: int = Field(strict=True, ge=0, le=2)
     needs_full_text: bool
     expected_tags: list[str]
     redaction_status: Literal["public", "sanitized", "unredacted"]

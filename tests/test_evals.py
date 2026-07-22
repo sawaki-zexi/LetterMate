@@ -73,6 +73,41 @@ def test_eval_schemas_reject_invalid_versions_grades_and_private_notes():
         )
 
 
+@pytest.mark.parametrize("grade", [True, "1"], ids=["boolean", "string"])
+def test_eval_label_model_rejects_non_integer_grades(grade: object):
+    with pytest.raises(ValidationError, match="valid integer"):
+        EvalLabel(
+            item_id="one",
+            relevance_grade=grade,  # type: ignore[arg-type]
+            needs_full_text=False,
+            expected_tags=[],
+            redaction_status="public",
+            dataset_version="sample-v1",
+        )
+
+
+@pytest.mark.parametrize("grade", [True, "1"], ids=["boolean", "string"])
+def test_label_loader_rejects_non_integer_grades(tmp_path: Path, grade: object):
+    path = tmp_path / "labels.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "item_id": "one",
+                "relevance_grade": grade,
+                "needs_full_text": False,
+                "expected_tags": [],
+                "redaction_status": "public",
+                "dataset_version": "sample-v1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="valid integer"):
+        load_labels(path)
+
+
 @pytest.mark.parametrize("loader,record", [(load_items, item("one")), (load_labels, EvalLabel(
     item_id="one",
     relevance_grade=2,
