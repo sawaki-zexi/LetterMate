@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     llm_provider: str = Field(default="fake")
     llm_model: str = Field(default="fake-local")
     openai_api_key: str = Field(default="")
+    curation_max_turns: int = Field(default=4, ge=1, le=8)
+    curation_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    curation_minimum_confidence: float = Field(default=0.6, ge=0, le=1)
 
     smtp_host: str = Field(default="localhost")
     smtp_port: int = Field(default=1025)

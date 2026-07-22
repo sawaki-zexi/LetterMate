@@ -1,5 +1,4 @@
 import json
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from hashlib import sha256
 
@@ -7,7 +6,7 @@ from pydantic import HttpUrl
 
 from lettermate.curation.provider import CurationProvider
 from lettermate.curation.schemas import CurationRequest
-from lettermate.db.models import AnalysisResult, ContentItem
+from lettermate.db.models import AnalysisResult, ContentItem, PreferenceSnapshot
 from lettermate.db.repository import Repository
 from lettermate.ranking.policy import RankingCandidate, RankingPolicy
 
@@ -31,7 +30,15 @@ class CurationService:
         items = self._repository.list_pending_analysis_items(limit)
         if not items:
             return []
-        requests = [(item, self._request_for(item, snapshot.explicit_interests)) for item in items]
+        recent = self._repository.list_included_analyses(limit=5)
+        recent_tags = sorted({tag for analysis in recent for tag in analysis.tags})
+        issue_context: dict[str, object] = {
+            "recent_item_ids": [analysis.content_item_id for analysis in recent],
+            "recent_tags": recent_tags,
+        }
+        requests = [
+            (item, self._request_for(item, snapshot, issue_context)) for item in items
+        ]
         outputs = [(item, request, self._provider.curate(request)) for item, request in requests]
         ranked = self._ranking_policy.rank(
             [
@@ -48,27 +55,34 @@ class CurationService:
             source_weights={
                 int(key): float(value) for key, value in snapshot.source_weights.items()
             },
-            recent_tags=set(),
+            recent_tags=set(recent_tags),
             now=now.astimezone(UTC) if now is not None else datetime.now(UTC),
         )
         decisions = {decision.item_id: decision for decision in ranked}
         saved: list[AnalysisResult] = []
         for item, request, output in outputs:
-            run = self._repository.start_agent_run(
-                content_item_id=item.id,
-                preference_snapshot_id=snapshot.id,
-                prompt_version=self._provider.prompt_version,
-                model=self._provider.model,
-                input_hash=self._input_hash(request),
-            )
-            self._repository.complete_agent_run(
-                run.id,
-                semantic_output=output.model_dump(exclude={"available_evidence_ids"}),
-                latency_ms=0,
-                input_tokens=0,
-                output_tokens=0,
-                cost_usd="0",
-            )
+            model = output.model_identifier or self._provider.model
+            if output.agent_run_id is None:
+                run = self._repository.start_agent_run(
+                    content_item_id=item.id,
+                    preference_snapshot_id=snapshot.id,
+                    prompt_version=self._provider.prompt_version,
+                    model=model,
+                    input_hash=self._input_hash(request),
+                )
+                self._repository.complete_agent_run(
+                    run.id,
+                    semantic_output=output.model_dump(
+                        exclude={"available_evidence_ids", "agent_run_id"}
+                    ),
+                    latency_ms=0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    cost_usd="0",
+                )
+                agent_run_id = run.id
+            else:
+                agent_run_id = output.agent_run_id
             decision = decisions[item.id]
             saved.append(
                 self._repository.save_analysis(
@@ -79,8 +93,8 @@ class CurationService:
                     reason=output.reason,
                     actionable_insight=output.reason,
                     should_include=decision.included,
-                    model=self._provider.model,
-                    agent_run_id=run.id,
+                    model=model,
+                    agent_run_id=agent_run_id,
                     semantic_score=decision.semantic_score,
                     preference_boost=decision.preference_boost,
                     freshness_bonus=decision.freshness_bonus,
@@ -93,14 +107,30 @@ class CurationService:
         return saved
 
     @staticmethod
-    def _request_for(item: ContentItem, preferences: Sequence[str]) -> CurationRequest:
+    def _request_for(
+        item: ContentItem,
+        snapshot: PreferenceSnapshot,
+        current_issue_context: dict[str, object],
+    ) -> CurationRequest:
         return CurationRequest(
             item_id=item.id,
             title=item.title,
             excerpt=item.raw_content,
             url=HttpUrl(item.url),
-            preferences=list(preferences),
+            preferences=list(snapshot.explicit_interests),
             available_evidence_ids=[f"feed:{item.id}"],
+            source_url=HttpUrl(item.source.url),
+            preference_snapshot_id=snapshot.id,
+            preference_snapshot={
+                "id": snapshot.id,
+                "version": snapshot.version,
+                "content_hash": snapshot.content_hash,
+                "explicit_interests": list(snapshot.explicit_interests),
+                "exclusions": list(snapshot.exclusions),
+                "tag_weights": dict(snapshot.tag_weights),
+                "source_weights": dict(snapshot.source_weights),
+            },
+            current_issue_context=current_issue_context,
         )
 
     @staticmethod

@@ -460,6 +460,52 @@ class Repository:
             )
         )
 
+    def list_recent_topics(self, *, query: str = "", limit: int = 5) -> list[dict[str, object]]:
+        """Return bounded, non-sensitive topic evidence for agent context."""
+        bounded = max(0, min(int(limit), 5))
+        statement = select(ContentItem).order_by(
+            ContentItem.published_at.desc().nullslast(), ContentItem.id.desc()
+        )
+        del query
+        rows = list(self.session.scalars(statement.limit(bounded)))
+        result: list[dict[str, object]] = []
+        for item in rows:
+            tags = list(item.analysis.tags) if item.analysis is not None else []
+            result.append(
+                {
+                    "item_id": item.id,
+                    "tags": sorted(set(str(tag) for tag in tags))[:20],
+                    "summary": item.title[:160],
+                }
+            )
+        return result
+
+    def list_preference_evidence(
+        self, *, topic: str = "", limit: int = 5
+    ) -> list[dict[str, object]]:
+        """Return bounded feedback metadata without private notes or article bodies."""
+        bounded = max(0, min(int(limit), 5))
+        statement = select(Feedback).order_by(Feedback.created_at.desc(), Feedback.id.desc())
+        rows = list(self.session.scalars(statement.limit(max(bounded * 3, bounded))))
+        result: list[dict[str, object]] = []
+        needle = topic.strip().casefold()
+        for feedback in rows:
+            tags = sorted(set(str(tag) for tag in (feedback.tags or [])))[:20]
+            if needle and not any(needle in tag.casefold() for tag in tags):
+                continue
+            result.append(
+                {
+                    "feedback_id": feedback.id,
+                    "content_item_id": feedback.content_item_id,
+                    "feedback_type": feedback.feedback_type,
+                    "tags": tags,
+                    "summary": f"feedback:{feedback.feedback_type}",
+                }
+            )
+            if len(result) >= bounded:
+                break
+        return result
+
     def mark_newsletter_sent(self, newsletter_id: int, *, force: bool = False) -> Newsletter:
         newsletter = self.session.get(Newsletter, newsletter_id)
         if newsletter is None:
