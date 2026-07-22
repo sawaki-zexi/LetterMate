@@ -1,0 +1,10 @@
+{"item_id":"lm-001","relevance_grade":2,"needs_full_text":false,"expected_tags":["agent engineering","reliability"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-002","relevance_grade":2,"needs_full_text":false,"expected_tags":["LLM applications","evaluation"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-003","relevance_grade":0,"needs_full_text":false,"expected_tags":["marketing"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-004","relevance_grade":2,"needs_full_text":false,"expected_tags":["agent engineering","evaluation"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-005","relevance_grade":1,"needs_full_text":true,"expected_tags":["career growth","portfolio"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-006","relevance_grade":0,"needs_full_text":false,"expected_tags":["retail"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-007","relevance_grade":2,"needs_full_text":false,"expected_tags":["agent engineering","system design"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-008","relevance_grade":0,"needs_full_text":false,"expected_tags":["cloud pricing"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-009","relevance_grade":1,"needs_full_text":true,"expected_tags":["career growth"],"redaction_status":"public","dataset_version":"sample-v1"}
+{"item_id":"lm-010","relevance_grade":0,"needs_full_text":false,"expected_tags":["marketing"],"redaction_status":"public","dataset_version":"sample-v1"}
