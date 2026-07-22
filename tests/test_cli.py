@@ -23,6 +23,7 @@ def test_cli_exposes_implemented_workflow_commands():
     assert "newsletter" in result.stdout
     assert "send" in result.stdout
     assert "run-daily" in result.stdout
+    assert "scheduler" in result.stdout
     assert "eval" in result.stdout
 
 

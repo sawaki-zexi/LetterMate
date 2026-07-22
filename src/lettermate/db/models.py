@@ -316,12 +316,18 @@ class Feedback(Base):
 
 class JobRun(Base):
     __tablename__ = "job_runs"
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_job_runs_idempotency_key"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_type: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default=JobRunStatus.RUNNING.value)
     error_message: Mapped[str | None] = mapped_column(Text)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    claim_token: Mapped[str | None] = mapped_column(String(36))
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    recovered: Mapped[bool] = mapped_column(Boolean, default=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     events: Mapped[list["JobEvent"]] = relationship(

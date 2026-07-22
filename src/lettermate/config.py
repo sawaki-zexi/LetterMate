@@ -34,6 +34,12 @@ class Settings(BaseSettings):
 
     owner_api_token: str = Field(default="local-owner-token")
     scheduler_token: str = Field(default="local-scheduler-token")
+    scheduler_timezone: str = Field(default="UTC")
+    scheduler_collect_interval_minutes: int = Field(default=30, ge=5, le=1440)
+    scheduler_daily_hour: int = Field(default=8, ge=0, le=23)
+    scheduler_daily_minute: int = Field(default=0, ge=0, le=59)
+    scheduler_recovery_window_minutes: int = Field(default=90, ge=1, le=1440)
+    scheduler_claim_stale_minutes: int = Field(default=15, ge=1, le=1440)
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

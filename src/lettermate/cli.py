@@ -1,14 +1,18 @@
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
+import httpx
 import typer
 from sqlalchemy.orm import Session, sessionmaker
 
 from lettermate.config import get_settings
 from lettermate.curation.provider import FakeCurationProvider
 from lettermate.curation.service import CurationService
-from lettermate.db.models import Base
+from lettermate.db.models import Base, Source
 from lettermate.db.repository import Repository
 from lettermate.db.session import create_session_factory
 from lettermate.evals.runner import main as run_eval
@@ -18,9 +22,17 @@ from lettermate.jobs.runner import (
     analyze_pending,
     build_newsletter_issue,
     collect_fixture,
+    collect_sources,
     run_daily,
     send_newsletter,
     sync_sources,
+)
+from lettermate.jobs.scheduler import (
+    DailyClaimGuard,
+    SchedulerCallbacks,
+    create_scheduler,
+    recover_missed_daily_run,
+    schedule_missed_daily_recovery,
 )
 from lettermate.notifiers.email import EmailNotifier, EmailSettings
 from lettermate.preferences.signing import FeedbackSigner
@@ -67,6 +79,92 @@ def _echo_stage(name: str, result: StageResult) -> None:
 def _exit_if_failed(result: StageResult) -> None:
     if result.status == "failed":
         raise typer.Exit(code=1)
+
+
+def _scheduler_callbacks(
+    factory: sessionmaker[Session],
+    *,
+    sources_path: Path,
+    preferences_path: Path,
+) -> SchedulerCallbacks:
+    settings = get_settings()
+    runner = JobRunner(factory)
+
+    def collect() -> None:
+        _exit_if_failed(sync_sources(runner, load_sources(sources_path)))
+
+        def fetch(source: Source) -> bytes:
+            response = httpx.get(source.url, timeout=20.0, follow_redirects=True)
+            response.raise_for_status()
+            return response.content
+
+        _exit_if_failed(collect_sources(runner, fetch, now=datetime.now(UTC)))
+
+    def daily(scheduled_for: datetime, _recovered: bool, guard: DailyClaimGuard) -> None:
+        ensure_held = guard.ensure_held
+        ensure_held()
+        preferences_config = _ensure_preference_snapshot(factory, preferences_path)
+        now = datetime.now(UTC)
+        issue_date = scheduled_for.date()
+        notifier = EmailNotifier(
+            EmailSettings(
+                host=settings.smtp_host,
+                port=settings.smtp_port,
+                username=settings.smtp_username,
+                password=settings.smtp_password,
+                sender=settings.smtp_from,
+                recipient=settings.smtp_to,
+                use_tls=settings.smtp_use_tls,
+                dry_run=settings.email_dry_run,
+            )
+        )
+
+        def analyze_stage() -> StageResult:
+            ensure_held()
+            return analyze_pending(
+                runner,
+                lambda repository: CurationService(
+                    repository,
+                    provider=FakeCurationProvider(),
+                    ranking_policy=RankingPolicy(
+                        item_limit=min(preferences_config.newsletter.max_items, 5),
+                        minimum_score=preferences_config.newsletter.min_score_to_include,
+                    ),
+                ),
+                now=now,
+            )
+
+        def guarded_stage(stage: Callable[[], StageResult]) -> StageResult:
+            ensure_held()
+            result = stage()
+            ensure_held()
+            return result
+
+        result = run_daily(
+            issue_date,
+            [
+                lambda: guarded_stage(analyze_stage),
+                lambda: guarded_stage(
+                    lambda: build_newsletter_issue(
+                        runner,
+                        issue_date,
+                        signer=FeedbackSigner(settings.feedback_signing_secret),
+                        feedback_base_url=settings.feedback_base_url,
+                        feedback_expires_at=now
+                        + timedelta(hours=settings.feedback_token_ttl_hours),
+                    )
+                ),
+                lambda: guarded_stage(
+                    lambda: send_newsletter(runner, issue_date, notifier=notifier)
+                ),
+            ],
+            runner=runner,
+        )
+        ensure_held()
+        if any(stage.status == "failed" for stage in result.stages):
+            raise RuntimeError("daily scheduler run failed")
+
+    return SchedulerCallbacks(collect=collect, daily=daily)
 
 
 @app.command("sync-sources")
@@ -158,6 +256,37 @@ def send_command(issue_date: str = "", dry_run: bool = True, force: bool = False
     )
     typer.echo(f"job={result.job_id} status={result.status}")
     _exit_if_failed(result)
+
+
+@app.command("scheduler")
+def scheduler_command(
+    sources: Path = Path("configs/sources.example.yaml"),
+    preferences: Path = Path("configs/preferences.example.yaml"),
+) -> None:
+    settings = get_settings()
+    factory = _initialized_session_factory()
+    callbacks = _scheduler_callbacks(factory, sources_path=sources, preferences_path=preferences)
+    timezone = ZoneInfo(settings.scheduler_timezone)
+    recovered = recover_missed_daily_run(
+        factory,
+        settings,
+        callbacks,
+        now=datetime.now(timezone),
+    )
+    scheduler = create_scheduler(settings, callbacks, session_factory=factory)
+    if not recovered:
+        schedule_missed_daily_recovery(
+            scheduler,
+            factory,
+            settings,
+            callbacks,
+            now=datetime.now(timezone),
+        )
+    scheduler.start()
+    try:
+        Event().wait()
+    except KeyboardInterrupt:
+        scheduler.shutdown(wait=False)
 
 
 @app.command("run-daily")

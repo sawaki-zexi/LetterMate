@@ -4,9 +4,11 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
 from typing import cast
+from uuid import uuid4
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from lettermate.db.models import (
@@ -833,12 +835,171 @@ class Repository:
             )
         )
 
-    def start_job_run(self, job_type: str, status: str = JobRunStatus.RUNNING) -> JobRun:
+    def start_job_run(
+        self,
+        job_type: str,
+        status: str = JobRunStatus.RUNNING,
+        *,
+        idempotency_key: str | None = None,
+        scheduled_for: datetime | None = None,
+        recovered: bool = False,
+        started_at: datetime | None = None,
+        claim_token: str | None = None,
+        lease_expires_at: datetime | None = None,
+    ) -> JobRun:
         valid_status = require_status(status, JobRunStatus)
-        run = JobRun(job_type=job_type, status=valid_status)
+        run = JobRun(
+            job_type=job_type,
+            status=valid_status,
+            idempotency_key=idempotency_key,
+            scheduled_for=scheduled_for,
+            recovered=recovered,
+            started_at=started_at or utc_now(),
+            claim_token=claim_token,
+            lease_expires_at=lease_expires_at,
+        )
         self.session.add(run)
         self._commit()
         return run
+
+    def claim_scheduled_job(
+        self,
+        *,
+        job_type: str,
+        idempotency_key: str,
+        scheduled_for: datetime,
+        recovered: bool,
+        started_at: datetime | None = None,
+        stale_before: datetime | None = None,
+        lease_expires_at: datetime | None = None,
+    ) -> JobRun | None:
+        existing = self.session.scalar(
+            select(JobRun).where(JobRun.idempotency_key == idempotency_key)
+        )
+        if existing is not None:
+            if (
+                existing.status == JobRunStatus.RUNNING.value
+                and stale_before is not None
+            ):
+                claimed = cast(
+                    CursorResult[object],
+                    self.session.execute(
+                        update(JobRun)
+                        .where(
+                            JobRun.id == existing.id,
+                            JobRun.status == JobRunStatus.RUNNING.value,
+                            or_(
+                                JobRun.lease_expires_at <= started_at,
+                                and_(
+                                    JobRun.lease_expires_at.is_(None),
+                                    JobRun.started_at <= stale_before,
+                                ),
+                            ),
+                        )
+                        .values(
+                            started_at=started_at or utc_now(),
+                            recovered=True,
+                            claim_token=str(uuid4()),
+                            lease_expires_at=lease_expires_at,
+                        )
+                        .execution_options(synchronize_session=False)
+                    ),
+                )
+                if claimed.rowcount == 1:
+                    self._commit()
+                    self.session.expire(existing)
+                    return self.session.get(JobRun, existing.id)
+            return None
+        try:
+            claim_token = str(uuid4())
+            run = self.start_job_run(
+                job_type,
+                idempotency_key=idempotency_key,
+                scheduled_for=scheduled_for,
+                recovered=recovered,
+                started_at=started_at,
+                claim_token=claim_token,
+                lease_expires_at=lease_expires_at,
+            )
+            return run
+        except IntegrityError:
+            self.session.rollback()
+            return None
+
+    def renew_scheduled_job_lease(
+        self,
+        job_run_id: int,
+        claim_token: str,
+        *,
+        lease_expires_at: datetime,
+    ) -> bool:
+        renewed = cast(
+            CursorResult[object],
+            self.session.execute(
+                update(JobRun)
+                .where(
+                    JobRun.id == job_run_id,
+                    JobRun.claim_token == claim_token,
+                    JobRun.status == JobRunStatus.RUNNING.value,
+                )
+                .values(lease_expires_at=lease_expires_at)
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if renewed.rowcount != 1:
+            return False
+        self._commit()
+        return True
+
+    def complete_scheduled_job_claim(self, job_run_id: int, claim_token: str) -> bool:
+        completed = cast(
+            CursorResult[object],
+            self.session.execute(
+                update(JobRun)
+                .where(
+                    JobRun.id == job_run_id,
+                    JobRun.claim_token == claim_token,
+                    JobRun.status == JobRunStatus.RUNNING.value,
+                )
+                .values(
+                    status=JobRunStatus.SUCCEEDED.value,
+                    finished_at=utc_now(),
+                    error_message=None,
+                    lease_expires_at=None,
+                )
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if completed.rowcount != 1:
+            return False
+        self._commit()
+        return True
+
+    def fail_scheduled_job_claim(
+        self, job_run_id: int, claim_token: str, error_message: str
+    ) -> bool:
+        failed = cast(
+            CursorResult[object],
+            self.session.execute(
+                update(JobRun)
+                .where(
+                    JobRun.id == job_run_id,
+                    JobRun.claim_token == claim_token,
+                    JobRun.status == JobRunStatus.RUNNING.value,
+                )
+                .values(
+                    status=JobRunStatus.FAILED.value,
+                    finished_at=utc_now(),
+                    error_message=error_message,
+                    lease_expires_at=None,
+                )
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if failed.rowcount != 1:
+            return False
+        self._commit()
+        return True
 
     def add_job_event(
         self,
