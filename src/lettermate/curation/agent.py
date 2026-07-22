@@ -142,6 +142,7 @@ class AgentCurationProvider:
             resolver=self._resolver,
             tracer=tracer,
             deadline_expired=deadline.expired,
+            deadline_remaining=deadline.remaining_seconds,
         )
         agent = build_curation_agent(
             model=self._agent_model,
@@ -288,4 +289,7 @@ class _RunDeadline:
         self._expires_at = time.monotonic() + timeout_seconds
 
     def expired(self) -> bool:
-        return time.monotonic() >= self._expires_at
+        return self.remaining_seconds() <= 0
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self._expires_at - time.monotonic())

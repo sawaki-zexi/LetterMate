@@ -117,6 +117,7 @@ class CurationTools:
         resolver: Callable[[str], list[str]] | None = None,
         tracer: TraceRecorder | None = None,
         deadline_expired: Callable[[], bool] | None = None,
+        deadline_remaining: Callable[[], float] | None = None,
         timeout: float = 5.0,
     ) -> None:
         self.context = context
@@ -124,6 +125,7 @@ class CurationTools:
         self.resolver = resolver or _resolve_host
         self.tracer = tracer or TraceRecorder()
         self._deadline_expired = deadline_expired
+        self._deadline_remaining = deadline_remaining
         self.timeout = timeout
         self._attempts = 0
         self._used_tools: set[str] = set()
@@ -192,7 +194,10 @@ class CurationTools:
         for _redirect in range(self.MAX_REDIRECTS + 1):
             parsed = _validate_url(current, self.context)
             pinned_ip = _validate_dns(parsed.host or "", self.resolver)[0]
-            with self.client.stream(current, pinned_ip=pinned_ip, timeout=self.timeout) as response:
+            request_timeout = self._request_timeout()
+            with self.client.stream(
+                current, pinned_ip=pinned_ip, timeout=request_timeout
+            ) as response:
                 if 300 <= response.status_code < 400:
                     location = response.headers.get("location")
                     if not location:
@@ -216,6 +221,14 @@ class CurationTools:
                     text = soup.get_text(" ", strip=True)
                 return re.sub(r"\s+", " ", text).strip()[: self.MAX_TEXT_CHARS]
         raise ToolSecurityError("redirect limit exceeded")
+
+    def _request_timeout(self) -> float:
+        if self._deadline_remaining is None:
+            return self.timeout
+        remaining = self._deadline_remaining()
+        if remaining <= 0:
+            raise ToolDeadlineError("curation agent exceeded its timeout")
+        return min(self.timeout, remaining)
 
     def _read_bounded(self, response: httpx.Response) -> bytes:
         declared_length = response.headers.get("content-length")

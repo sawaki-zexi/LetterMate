@@ -596,6 +596,39 @@ def test_timeout_prevents_late_tool_network_and_trace_writes(temp_db_session):
     assert temp_db_session.query(ToolCallTrace).count() == 0
 
 
+def test_agent_deadline_caps_each_full_text_request_timeout(temp_db_session):
+    from lettermate.curation.agent import AgentCurationProvider
+
+    class TimeoutRecordingClient:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        @contextmanager
+        def stream(self, url, *, pinned_ip, timeout):
+            del url, pinned_ip
+            self.timeouts.append(timeout)
+            yield httpx.Response(
+                200, headers={"content-type": "text/plain"}, content=b"bounded"
+            )
+
+    repository, request = _agent_setup(temp_db_session)
+    client = TimeoutRecordingClient()
+    provider = AgentCurationProvider(
+        repository,
+        runner=ScriptedRunner(
+            _output(), calls=[("fetch_full_text", {"url": "https://example.com/article"})]
+        ),
+        model="fake-model",
+        http_client=client,
+        resolver=lambda _host: ["93.184.216.34"],
+        timeout_seconds=0.05,
+    )
+
+    provider.curate(request)
+
+    assert client.timeouts and 0 < client.timeouts[0] <= 0.051
+
+
 def test_async_runner_hang_is_cancelled_within_configured_timeout(temp_db_session):
     from lettermate.curation.agent import AgentCurationProvider, AgentRunTimeout
 
