@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from lettermate.curation.service import CurationService
 from lettermate.db.models import JobRun
 from lettermate.db.repository import ContentInput, Repository
 from lettermate.sources.collector import FeedResponse, parse_feed
@@ -85,3 +86,16 @@ def collect_fixture(runner: JobRunner, feed_bytes: bytes, *, now: datetime) -> S
         return {"sources": len(sources), "items": item_count}
 
     return runner.run_stage("collect", operation)
+
+
+def analyze_pending(
+    runner: JobRunner,
+    service_factory: Callable[[Repository], CurationService],
+    *,
+    now: datetime,
+) -> StageResult:
+    def operation(repository: Repository) -> dict[str, int]:
+        analyses = service_factory(repository).analyze_pending(now=now)
+        return {"analyses": len(analyses)}
+
+    return runner.run_stage("analyze", operation)

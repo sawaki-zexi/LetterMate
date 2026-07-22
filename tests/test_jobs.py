@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from lettermate.db.models import Base, ContentItem, Source
-from lettermate.jobs.runner import JobRunner, collect_fixture, sync_sources
+from lettermate.jobs.runner import JobRunner, analyze_pending, collect_fixture, sync_sources
 from lettermate.sources.config_loader import SourceConfig
 
 
@@ -52,6 +52,27 @@ def test_collect_fixture_persists_feed_items_without_network(tmp_path: Path):
     with factory() as session:
         assert session.query(Source).count() == 1
         assert session.query(ContentItem).count() == 1
+    engine.dispose()
+
+
+def test_analyze_stage_creates_an_independent_job_run(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'analyze.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    class FakeService:
+        def analyze_pending(self, *, now: datetime) -> list[object]:
+            assert now == datetime(2026, 7, 22, tzinfo=UTC)
+            return [object(), object()]
+
+    result = analyze_pending(
+        JobRunner(factory),
+        lambda _repository: FakeService(),
+        now=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    assert result.status == "succeeded"
+    assert result.details == {"analyses": 2}
     engine.dispose()
 
 
