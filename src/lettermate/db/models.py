@@ -76,6 +76,7 @@ class ContentItem(Base):
     __tablename__ = "content_items"
     __table_args__ = (
         UniqueConstraint("url", name="uq_content_items_url"),
+        UniqueConstraint("normalized_url", name="uq_content_items_normalized_url"),
         UniqueConstraint("source_id", "external_id", name="uq_content_items_source_external_id"),
         UniqueConstraint("content_hash", name="uq_content_items_hash"),
     )
@@ -85,6 +86,7 @@ class ContentItem(Base):
     external_id: Mapped[str | None] = mapped_column(String(300))
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     url: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_url: Mapped[str] = mapped_column(Text, nullable=False)
     author: Mapped[str] = mapped_column(String(200), default="")
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw_content: Mapped[str] = mapped_column(Text, default="")
@@ -158,6 +160,7 @@ class AgentRun(Base):
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default=AgentRunStatus.RUNNING.value)
     error_message: Mapped[str | None] = mapped_column(Text)
+    error_category: Mapped[str | None] = mapped_column(String(100))
     semantic_output: Mapped[dict[str, object] | None] = mapped_column(JSON)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     input_tokens: Mapped[int | None] = mapped_column(Integer)
@@ -192,6 +195,7 @@ class ToolCallTrace(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     result_summary: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
+    error_category: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     agent_run: Mapped[AgentRun] = relationship(back_populates="tool_traces")

@@ -83,6 +83,7 @@ def upgrade() -> None:
         sa.Column("external_id", sa.String(length=300), nullable=True),
         sa.Column("title", sa.String(length=500), nullable=False),
         sa.Column("url", sa.Text(), nullable=False),
+        sa.Column("normalized_url", sa.Text(), nullable=False),
         sa.Column("author", sa.String(length=200), nullable=False),
         sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("raw_content", sa.Text(), nullable=False),
@@ -96,6 +97,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("content_hash", name="uq_content_items_hash"),
+        sa.UniqueConstraint("normalized_url", name="uq_content_items_normalized_url"),
         sa.UniqueConstraint("source_id", "external_id", name="uq_content_items_source_external_id"),
         sa.UniqueConstraint("url", name="uq_content_items_url"),
     )
@@ -123,6 +125,7 @@ def upgrade() -> None:
         sa.Column("input_hash", sa.String(length=64), nullable=False),
         sa.Column("status", sa.String(length=50), nullable=False),
         sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("error_category", sa.String(length=100), nullable=True),
         sa.Column("semantic_output", sa.JSON(), nullable=True),
         sa.Column("latency_ms", sa.Integer(), nullable=True),
         sa.Column("input_tokens", sa.Integer(), nullable=True),
@@ -206,6 +209,7 @@ def upgrade() -> None:
         sa.Column("latency_ms", sa.Integer(), nullable=True),
         sa.Column("result_summary", sa.Text(), nullable=True),
         sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("error_category", sa.String(length=100), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("sequence > 0", name="ck_tool_call_traces_sequence"),
         sa.ForeignKeyConstraint(

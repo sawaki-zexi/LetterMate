@@ -10,6 +10,7 @@ from lettermate.db.repository import (
     NewsletterItemInput,
     Repository,
     make_content_hash,
+    normalize_url,
 )
 from lettermate.db.statuses import AgentRunStatus, JobRunStatus, NewsletterStatus, SourceStatus
 
@@ -54,6 +55,58 @@ def test_content_hash_has_unambiguous_field_boundaries():
     assert make_content_hash("a|b", "https://example.com/one", "c") != make_content_hash(
         "a", "https://example.com/two", "b|c"
     )
+
+
+def test_url_normalization_removes_transport_noise_and_known_tracking_parameters():
+    assert normalize_url(
+        "HTTPS://Example.COM:443/post?utm_source=mail&b=2&a=1&fbclid=tracking#section"
+    ) == "https://example.com/post?a=1&b=2"
+
+
+def test_content_upsert_deduplicates_normalized_url_before_other_keys(temp_db_session):
+    repo = Repository(temp_db_session)
+    source = create_source(repo)
+    first = repo.upsert_content_item(
+        content_input(
+            source.id,
+            external_id="original",
+            url="HTTPS://Example.COM:443/post?utm_source=mail#section",
+            raw_content="Original body",
+        )
+    )
+    second = repo.upsert_content_item(
+        content_input(
+            source.id,
+            external_id="changed",
+            url="https://example.com/post",
+            raw_content="Updated body",
+        )
+    )
+
+    assert second.id == first.id
+    assert second.external_id == "original"
+    assert second.normalized_url == "https://example.com/post"
+    assert repo.count_content_items() == 1
+
+
+def test_content_input_rejects_mismatched_pre_normalized_url(temp_db_session):
+    repo = Repository(temp_db_session)
+    source = create_source(repo)
+    item = content_input(source.id)
+
+    with pytest.raises(ValueError, match="normalized URL does not match"):
+        repo.upsert_content_item(
+            ContentInput(
+                source_id=item.source_id,
+                external_id=item.external_id,
+                title=item.title,
+                url=item.url,
+                author=item.author,
+                published_at=item.published_at,
+                raw_content=item.raw_content,
+                normalized_url="https://attacker.example/post",
+            )
+        )
 
 
 def test_source_sync_updates_by_exact_or_normalized_url_with_stable_primary_key(temp_db_session):
@@ -401,9 +454,10 @@ def test_agent_run_lifecycle_records_ordered_redacted_tool_traces(temp_db_sessio
         tool_name="lookup_recent_topics",
         argument_summary="query length=12",
         argument_hash="args-2",
-        status=AgentRunStatus.SUCCEEDED,
+        status=AgentRunStatus.FAILED,
         latency_ms=8,
-        result_summary="2 matches",
+        error_message="tool timed out after 8 ms",
+        error_category="tool_timeout",
     )
     first_trace = repo.add_tool_call_trace(
         agent_run_id=run.id,
@@ -454,7 +508,36 @@ def test_agent_run_lifecycle_records_ordered_redacted_tool_traces(temp_db_sessio
         repo.fail_agent_run(run.id, "late failure")
     assert repeated_first_trace.id == first_trace.id
     assert repeated_first_trace.result_summary == "1300 chars"
+    assert second_trace.error_category == "tool_timeout"
     assert temp_db_session.query(ToolCallTrace).count() == 2
+
+
+def test_failed_agent_run_persists_error_category(temp_db_session):
+    repo = Repository(temp_db_session)
+    item = repo.upsert_content_item(content_input(create_source(repo).id))
+    snapshot = repo.create_preference_snapshot(
+        explicit_interests=[],
+        exclusions=[],
+        tag_weights={},
+        source_weights={},
+        feedback_cutoff=None,
+    )
+    run = repo.start_agent_run(
+        content_item_id=item.id,
+        preference_snapshot_id=snapshot.id,
+        prompt_version="curator-v1",
+        model="fake-local",
+        input_hash="failed-input",
+        error_category="input_validation",
+    )
+    failed = repo.fail_agent_run(
+        run.id,
+        "schema validation failed",
+        error_category="output_validation",
+    )
+
+    assert failed.error_message == "schema validation failed"
+    assert failed.error_category == "output_validation"
 
 
 @pytest.mark.parametrize(

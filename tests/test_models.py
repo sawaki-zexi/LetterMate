@@ -23,6 +23,7 @@ from lettermate.db.statuses import (
     NewsletterStatus,
     SourceStatus,
 )
+from lettermate.sources.urls import normalize_url
 
 
 def add_source(temp_db_session, *, url: str = "https://example.com/feed.xml") -> Source:
@@ -55,6 +56,7 @@ def add_item(
         author="Example Author",
         published_at=datetime(2026, 6, 26, tzinfo=UTC),
         raw_content="Useful article about agent engineering.",
+        normalized_url=normalize_url(url),
         content_hash=content_hash,
         status=ContentItemStatus.PENDING_ANALYSIS,
     )
@@ -138,9 +140,34 @@ def test_nullable_external_ids_do_not_collide_but_non_null_ids_are_source_scoped
             external_id="same",
             title="Other",
             url="https://example.com/d",
+            normalized_url="https://example.com/d",
             content_hash="d",
         )
     )
+    with pytest.raises(IntegrityError):
+        temp_db_session.commit()
+
+
+def test_content_normalized_url_is_required_and_unique(temp_db_session):
+    source = add_source(temp_db_session)
+    add_item(
+        temp_db_session,
+        source,
+        url="HTTPS://Example.COM:443/post#fragment",
+        content_hash="first",
+    )
+    temp_db_session.commit()
+    temp_db_session.add(
+        ContentItem(
+            source_id=source.id,
+            external_id="other",
+            title="Other",
+            url="https://example.com/post",
+            normalized_url="https://example.com/post",
+            content_hash="second",
+        )
+    )
+
     with pytest.raises(IntegrityError):
         temp_db_session.commit()
 
@@ -193,6 +220,11 @@ def test_recommendation_provenance_and_ranking_components_are_required():
     assert not analysis_columns.final_score.nullable
     assert not analysis_columns.decision.nullable
     assert not NewsletterItem.__table__.c.decision_id.nullable
+
+
+def test_agent_and_tool_audit_records_support_error_categories():
+    assert AgentRun.__table__.c.error_category.nullable
+    assert ToolCallTrace.__table__.c.error_category.nullable
 
 
 def test_one_newsletter_per_local_date_and_unique_membership(temp_db_session):

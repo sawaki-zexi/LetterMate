@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from hashlib import sha256
-from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
@@ -29,6 +28,7 @@ from lettermate.db.statuses import (
     SourceStatus,
     require_status,
 )
+from lettermate.sources.urls import normalize_url
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,7 @@ class ContentInput:
     author: str
     published_at: datetime | None
     raw_content: str
+    normalized_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,19 +50,6 @@ class NewsletterItemInput:
     position: int
     section: str
     final_score: float
-
-
-def normalize_url(url: str) -> str:
-    parts = urlsplit(url.strip())
-    scheme = parts.scheme.lower()
-    hostname = (parts.hostname or "").lower()
-    port = parts.port
-    if port is not None and not (
-        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
-    ):
-        hostname = f"{hostname}:{port}"
-    path = parts.path or "/"
-    return urlunsplit((scheme, hostname, path, parts.query, ""))
 
 
 def make_content_hash(title: str, url: str, raw_content: str) -> str:
@@ -157,8 +145,14 @@ class Repository:
 
     def upsert_content_item(self, item: ContentInput) -> ContentItem:
         content_hash = make_content_hash(item.title, item.url, item.raw_content)
-        existing = self.session.scalar(select(ContentItem).where(ContentItem.url == item.url))
+        normalized_url = normalize_url(item.url)
+        if item.normalized_url is not None and normalize_url(item.normalized_url) != normalized_url:
+            raise ValueError("normalized URL does not match content URL")
+        existing = self.session.scalar(
+            select(ContentItem).where(ContentItem.normalized_url == normalized_url)
+        )
         matched_by_identity = existing is not None
+        matched_by_url = existing is not None
         matched_by_external_id = False
         if existing is None and item.external_id is not None:
             existing = self.session.scalar(
@@ -175,7 +169,10 @@ class Repository:
             )
         if existing is None:
             existing = ContentItem(
-                source_id=item.source_id, url=item.url, content_hash=content_hash
+                source_id=item.source_id,
+                url=item.url,
+                normalized_url=normalized_url,
+                content_hash=content_hash,
             )
             self.session.add(existing)
             matched_by_identity = True
@@ -186,8 +183,9 @@ class Repository:
             existing.published_at = item.published_at
             existing.raw_content = item.raw_content
             existing.content_hash = content_hash
-            if matched_by_external_id:
+            if matched_by_url or matched_by_external_id:
                 existing.url = item.url
+                existing.normalized_url = normalized_url
             if existing.external_id is None:
                 existing.external_id = item.external_id
         if existing.status is None:
@@ -204,7 +202,10 @@ class Repository:
         content_hash: str | None = None,
     ) -> ContentItem | None:
         if url is not None:
-            found = self.session.scalar(select(ContentItem).where(ContentItem.url == url))
+            normalized_url = normalize_url(url)
+            found = self.session.scalar(
+                select(ContentItem).where(ContentItem.normalized_url == normalized_url)
+            )
             if found is not None:
                 return found
         if source_id is not None and external_id is not None:
@@ -453,6 +454,7 @@ class Repository:
         model: str,
         input_hash: str,
         status: str = AgentRunStatus.RUNNING,
+        error_category: str | None = None,
     ) -> AgentRun:
         valid_status = require_status(status, AgentRunStatus)
         existing = self.session.scalar(
@@ -473,6 +475,7 @@ class Repository:
             model=model,
             input_hash=input_hash,
             status=valid_status,
+            error_category=error_category,
         )
         self.session.add(run)
         self.session.commit()
@@ -487,6 +490,7 @@ class Repository:
         input_tokens: int,
         output_tokens: int,
         cost_usd: str | Decimal,
+        error_category: str | None = None,
     ) -> AgentRun:
         run = self._get_agent_run(agent_run_id)
         if run.status == AgentRunStatus.SUCCEEDED.value:
@@ -501,10 +505,13 @@ class Repository:
         run.cost_usd = Decimal(cost_usd)
         run.finished_at = utc_now()
         run.error_message = None
+        run.error_category = error_category
         self.session.commit()
         return run
 
-    def fail_agent_run(self, agent_run_id: int, error_message: str) -> AgentRun:
+    def fail_agent_run(
+        self, agent_run_id: int, error_message: str, *, error_category: str | None = None
+    ) -> AgentRun:
         self.session.rollback()
         run = self._get_agent_run(agent_run_id)
         if run.status == AgentRunStatus.FAILED.value:
@@ -513,6 +520,7 @@ class Repository:
             raise ValueError(f"agent run {agent_run_id} is terminal succeeded")
         run.status = AgentRunStatus.FAILED.value
         run.error_message = error_message
+        run.error_category = error_category
         run.finished_at = utc_now()
         self.session.commit()
         return run
@@ -535,6 +543,7 @@ class Repository:
         latency_ms: int | None = None,
         result_summary: str | None = None,
         error_message: str | None = None,
+        error_category: str | None = None,
     ) -> ToolCallTrace:
         valid_status = require_status(status, AgentRunStatus)
         trace = self.session.scalar(
@@ -553,6 +562,7 @@ class Repository:
         trace.latency_ms = latency_ms
         trace.result_summary = result_summary
         trace.error_message = error_message
+        trace.error_category = error_category
         self.session.commit()
         return trace
 
