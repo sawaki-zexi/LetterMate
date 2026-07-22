@@ -15,6 +15,42 @@ class StructuredRankingProvider(Protocol):
     ) -> Sequence[RankedItem]: ...
 
 
+def _interests(preferences: Mapping[str, object]) -> list[str]:
+    values = preferences.get("interests")
+    if not isinstance(values, list):
+        return []
+    return [value.casefold() for value in values if isinstance(value, str)]
+
+
+class DeterministicStructuredProvider:
+    """Offline provider used only for reproducible Eval comparison runs."""
+
+    def rank(
+        self,
+        *,
+        items: Sequence[EvalItem],
+        preferences: Mapping[str, object],
+        limit: int,
+    ) -> Sequence[RankedItem]:
+        interests = _interests(preferences)
+        scored: list[RankedItem] = []
+        for item in items:
+            haystack = f"{item.title} {item.excerpt}".casefold()
+            matches = sum(interest in haystack for interest in interests)
+            keyword_hits = sum(
+                keyword in haystack
+                for keyword in ("agent", "evaluation", "reliability", "engineering")
+            )
+            scored.append(
+                RankedItem(
+                    item_id=item.item_id,
+                    score=float(matches * 2 + keyword_hits),
+                    source=item.source,
+                )
+            )
+        return sorted(scored, key=lambda entry: (-entry.score, entry.item_id))[:limit]
+
+
 def _validate_limit(limit: int) -> int:
     if type(limit) is not int or not 1 <= limit <= 5:
         raise ValueError("limit must be an integer from 1 to 5")
@@ -93,6 +129,30 @@ def static_one_shot(
         candidate_ids=candidate_ids,
         ranked_items=ranked,
     )
+
+
+def fixed_structured_workflow(
+    items: Sequence[EvalItem], *, preferences: Mapping[str, object], limit: int = 5
+) -> BaselineResult:
+    result = static_one_shot(
+        items,
+        preferences=preferences,
+        provider=DeterministicStructuredProvider(),
+        limit=limit,
+    )
+    return result.model_copy(update={"baseline": "fixed-structured-workflow"})
+
+
+def bounded_agent_baseline(
+    items: Sequence[EvalItem], *, preferences: Mapping[str, object], limit: int = 5
+) -> BaselineResult:
+    result = static_one_shot(
+        items,
+        preferences=preferences,
+        provider=DeterministicStructuredProvider(),
+        limit=limit,
+    )
+    return result.model_copy(update={"baseline": "bounded-agent"})
 
 
 def write_result(result: BaselineResult, path: Path) -> None:

@@ -1,0 +1,11 @@
+{
+  "name": "lettermate-security-evals",
+  "private": true,
+  "scripts": {
+    "security-eval": "promptfoo eval -c promptfooconfig.yaml --no-cache",
+    "security-eval:live": "node -e \"if (!process.env.OPENAI_API_KEY) { throw new Error('OPENAI_API_KEY is required'); }\" && promptfoo eval -c promptfooconfig.live.yaml --no-cache"
+  },
+  "devDependencies": {
+    "promptfoo": "0.121.19"
+  }
+}

@@ -8,13 +8,24 @@ from pydantic import ValidationError
 
 from lettermate.evals.baselines import latest_first, static_one_shot, write_result
 from lettermate.evals.metrics import (
+    avoided_full_text_rate,
+    complete_trace_rate,
     duplicate_rate,
+    full_text_precision,
     ndcg_at_5,
+    original_link_coverage,
     precision_at_5,
     source_diversity,
+    tool_budget_violations,
+    unauthorized_tool_attempts,
     useful_rate,
 )
-from lettermate.evals.runner import evaluate_result, main
+from lettermate.evals.runner import (
+    evaluate_quality_targets,
+    evaluate_result,
+    main,
+    run_all_baselines,
+)
 from lettermate.evals.schemas import (
     BaselineResult,
     EvalItem,
@@ -530,3 +541,119 @@ def test_eval_docs_define_labeling_and_truthful_control_protocol():
         assert evidence in control
     assert "persistent state" in control.lower()
     assert "production reliability" in control.lower()
+
+
+def test_quality_and_trajectory_metrics_cover_threshold_boundaries():
+    labels = {
+        "needed": EvalLabel(
+            item_id="needed",
+            relevance_grade=2,
+            needs_full_text=True,
+            expected_tags=[],
+            redaction_status="public",
+            dataset_version="sample-v1",
+        ),
+        "unneeded": label("unneeded", grade=0),
+        "unneeded-two": label("unneeded-two", grade=1),
+    }
+    traces = [
+        {
+            "run_id": "run-1",
+            "sequence": 1,
+            "item_id": "needed",
+            "tool_name": "fetch_full_text",
+            "status": "succeeded",
+            "latency_ms": 1,
+        },
+        {
+            "run_id": "run-2",
+            "sequence": 1,
+            "item_id": "unneeded",
+            "tool_name": "fetch_full_text",
+            "status": "succeeded",
+            "latency_ms": 1,
+        },
+        {
+            "run_id": "run-2",
+            "sequence": 2,
+            "item_id": "unneeded",
+            "tool_name": "lookup_recent_topics",
+            "status": "succeeded",
+            "latency_ms": 1,
+        },
+        {
+            "run_id": "run-2",
+            "sequence": 3,
+            "item_id": "unneeded",
+            "tool_name": "get_preference_evidence",
+            "status": "succeeded",
+            "latency_ms": 1,
+        },
+        {
+            "run_id": "run-2",
+            "sequence": 4,
+            "item_id": "unneeded",
+            "tool_name": "send_email",
+            "status": "failed",
+            "latency_ms": 1,
+        },
+        {"run_id": "incomplete", "tool_name": "lookup_recent_topics"},
+    ]
+
+    assert original_link_coverage(
+        ["needed", "unneeded"], {"needed": "https://x", "unneeded": ""}
+    ) == 0.5
+    assert full_text_precision(traces, labels) == 0.5
+    assert avoided_full_text_rate(traces, labels) == 0.5
+    assert tool_budget_violations(traces) == 1
+    assert unauthorized_tool_attempts(traces) == 1
+    assert complete_trace_rate(traces) == pytest.approx(5 / 6)
+
+
+def test_all_baselines_share_candidates_and_emit_auditable_metadata(tmp_path: Path):
+    items = [item("a", source="one"), item("b", source="two"), item("c", source="three")]
+    labels = [label("a", grade=2), label("b", grade=1), label("c", grade=0)]
+
+    report = run_all_baselines(
+        items,
+        labels,
+        preferences={"interests": ["agent engineering"]},
+        output=tmp_path / "all-baselines.json",
+    )
+
+    assert {run["baseline"] for run in report["runs"]} == {
+        "latest-first",
+        "static-one-shot",
+        "fixed-structured-workflow",
+        "bounded-agent",
+    }
+    assert all(run["candidate_ids"] == ["a", "b", "c"] for run in report["runs"])
+    assert all(len(run["dataset_sha256"]) == 64 for run in report["runs"])
+    assert all("latency_ms" in run and "input_tokens" in run for run in report["runs"])
+    latest = next(run for run in report["runs"] if run["baseline"] == "latest-first")
+    assert latest["quality_targets"]["full_text_precision"] is None
+    assert report["framework_exit"]["status"] in {"justified", "simplify"}
+    assert json.loads((tmp_path / "all-baselines.json").read_text(encoding="utf-8")) == report
+
+
+def test_quality_targets_include_exact_boundaries_and_honest_framework_exit():
+    metrics = {
+        "original_link_coverage": 1.0,
+        "full_text_precision": 0.8,
+        "avoided_full_text_rate": 0.7,
+        "tool_budget_violations": 0,
+        "unauthorized_tool_attempts": 0,
+        "complete_trace_rate": 1.0,
+    }
+
+    assert all(evaluate_quality_targets(metrics).values())
+    metrics["full_text_precision"] = 0.799
+    assert not evaluate_quality_targets(metrics)["full_text_precision"]
+
+    report = run_all_baselines(
+        [item("a"), item("b")],
+        [label("a"), label("b")],
+        preferences={"interests": ["agent engineering"]},
+    )
+    assert report["framework_exit"]["criteria"]["trace_shortened_debugging"] is False
+    assert report["framework_exit"]["status"] == "simplify"
