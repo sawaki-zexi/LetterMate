@@ -346,6 +346,34 @@ def test_static_one_shot_normalizes_ranked_sources_from_candidates():
     assert result.ranked_items[0].source == "source-a"
 
 
+class CountingProvider:
+    def __init__(self):
+        self.calls = 0
+
+    def rank(self, *, items, preferences, limit):
+        self.calls += 1
+        return []
+
+
+def test_static_one_shot_rejects_empty_candidates_before_calling_provider():
+    provider = CountingProvider()
+
+    with pytest.raises(ValueError, match="at least one candidate"):
+        static_one_shot([], preferences={}, provider=provider)
+
+    assert provider.calls == 0
+
+
+def test_static_one_shot_rejects_mixed_versions_before_calling_provider():
+    provider = CountingProvider()
+    candidates = [item("one"), item("two", dataset_version="other-v1")]
+
+    with pytest.raises(ValueError, match="share one dataset version"):
+        static_one_shot(candidates, preferences={}, provider=provider)
+
+    assert provider.calls == 0
+
+
 def test_evaluate_result_rejects_mismatched_labels_and_returns_metrics():
     items = [item("a", source="one"), item("b", source="two")]
     labels = [

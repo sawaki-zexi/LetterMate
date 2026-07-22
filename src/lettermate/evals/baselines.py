@@ -67,6 +67,7 @@ def static_one_shot(
     limit: int = 5,
 ) -> BaselineResult:
     limit = _validate_limit(limit)
+    dataset_version = _dataset_version(items)
     candidate_ids = _candidate_ids(items)
     candidate_sources = {item.item_id: item.source for item in items}
     provider_items = provider.rank(items=items, preferences=preferences, limit=limit)
@@ -88,7 +89,7 @@ def static_one_shot(
     ranked = sorted(ranked, key=lambda entry: (-entry.score, entry.item_id))[:limit]
     return BaselineResult(
         baseline="static-one-shot",
-        dataset_version=_dataset_version(items),
+        dataset_version=dataset_version,
         candidate_ids=candidate_ids,
         ranked_items=ranked,
     )
