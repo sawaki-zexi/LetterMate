@@ -10,3 +10,5 @@ def test_cli_exposes_implemented_workflow_commands():
     assert "sync-sources" in result.stdout
     assert "collect" in result.stdout
     assert "analyze" in result.stdout
+    assert "newsletter" in result.stdout
+    assert "send" in result.stdout
