@@ -55,10 +55,14 @@ class JobRunner:
         self,
         job_type: str,
         operation: Callable[[Repository], dict[str, int] | StageOutcome],
+        *,
+        on_failure: Callable[[Repository, Exception], None] | None = None,
+        failure_details: Callable[[Exception], dict[str, object]] | None = None,
     ) -> StageResult:
         with self._session_factory() as session:
-            repository = Repository(session)
-            run = repository.start_job_run(job_type)
+            run = Repository(session).start_job_run(job_type)
+            job_id = run.id
+            repository = Repository(session, auto_commit=False)
             try:
                 outcome = operation(repository)
                 if isinstance(outcome, StageOutcome):
@@ -75,6 +79,8 @@ class JobRunner:
                         details={"code": warning.code, **warning.details},
                     )
                 completed = repository.complete_job_run(run.id)
+                session.commit()
+                session.refresh(completed)
                 return StageResult(
                     run=completed,
                     status=completed.status,
@@ -82,12 +88,26 @@ class JobRunner:
                     warnings=warnings,
                 )
             except Exception as error:
-                failed = repository.fail_job_run(
-                    run.id,
-                    f"{type(error).__name__}: {error}",
-                    details={"job_type": job_type},
-                )
-                return StageResult(run=failed, status=failed.status, details={})
+                session.rollback()
+                stage_error = error
+                error_message = f"{type(error).__name__}: {error}"
+        with self._session_factory() as failure_session:
+            failure_repository = Repository(failure_session, auto_commit=False)
+            if on_failure is not None:
+                on_failure(failure_repository, stage_error)
+            failed = failure_repository.fail_job_run(
+                job_id,
+                error_message,
+                details={
+                    "job_type": job_type,
+                    **(failure_details(stage_error) if failure_details is not None else {}),
+                },
+                rollback=False,
+            )
+            failure_session.commit()
+            failure_session.refresh(failed)
+            list(failed.events)
+            return StageResult(run=failed, status=failed.status, details={})
 
     def add_job_event(
         self,
@@ -191,44 +211,76 @@ def send_newsletter(
     notifier: EmailNotifier,
     force: bool = False,
 ) -> StageResult:
+    newsletter_id: int | None = None
+    notifier_attempted = False
+    smtp_accepted = False
+
     def operation(repository: Repository) -> dict[str, int] | StageOutcome:
+        nonlocal newsletter_id, notifier_attempted, smtp_accepted
         newsletter = repository.get_newsletter(issue_date)
         if newsletter is None:
             raise LookupError(f"newsletter for {issue_date.isoformat()} not found")
+        newsletter_id = newsletter.id
         if newsletter.status == NewsletterStatus.SENT.value and not force:
             raise ValueError(f"newsletter {newsletter.id} is already sent")
-        try:
-            result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
-        except Exception:
-            repository.mark_newsletter_failed(newsletter.id)
-            raise
+        notifier_attempted = True
+        result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
+        smtp_accepted = result.accepted
         if result.dry_run:
             repository.mark_newsletter_preview(newsletter.id)
         elif result.accepted:
             repository.mark_newsletter_sent(newsletter.id, force=force)
         else:
-            repository.mark_newsletter_failed(newsletter.id)
             raise RuntimeError("SMTP did not accept newsletter")
         details = {"sent": int(result.accepted), "dry_run": int(result.dry_run)}
         if result.accepted:
+            warnings = [
+                StageWarning(
+                    code="smtp_exactly_once_boundary",
+                    message=(
+                        "SMTP acceptance and local status commit are not atomic; "
+                        "reconcile before retrying an ambiguous send"
+                    ),
+                    details={
+                        "newsletter_id": newsletter.id,
+                        "force": force,
+                        "reconciliation_required_after_ambiguous_outcome": True,
+                    },
+                )
+            ]
+            if force:
+                warnings.append(
+                    StageWarning(
+                        code="explicit_forced_resend",
+                        message="newsletter was resent through an explicit force action",
+                        details={"newsletter_id": newsletter.id, "force": True},
+                    )
+                )
             return StageOutcome(
                 details=details,
-                warnings=(
-                    StageWarning(
-                        code="smtp_exactly_once_boundary",
-                        message=(
-                            "SMTP acceptance and local status commit are not atomic; "
-                            "reconcile before retrying an ambiguous send"
-                        ),
-                        details={
-                            "reconciliation_required_after_ambiguous_outcome": True,
-                        },
-                    ),
-                ),
+                warnings=tuple(warnings),
             )
         return details
 
-    return runner.run_stage("send", operation)
+    def persist_send_failure(repository: Repository, _error: Exception) -> None:
+        if newsletter_id is not None and notifier_attempted and not smtp_accepted:
+            repository.mark_newsletter_failed(newsletter_id)
+
+    def send_failure_details(_error: Exception) -> dict[str, object]:
+        if smtp_accepted and newsletter_id is not None:
+            return {
+                "smtp_accepted": True,
+                "newsletter_id": newsletter_id,
+                "reconciliation_required_after_ambiguous_outcome": True,
+            }
+        return {}
+
+    return runner.run_stage(
+        "send",
+        operation,
+        on_failure=persist_send_failure,
+        failure_details=send_failure_details,
+    )
 
 
 def build_newsletter_issue(

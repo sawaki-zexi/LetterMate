@@ -54,6 +54,32 @@ def test_stage_runner_uses_independent_session_and_records_failure_after_rollbac
     engine.dispose()
 
 
+def test_stage_runner_rolls_back_business_writes_before_persisting_failure_event(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'atomic-stage.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+    def fail_after_write(repository: Repository) -> dict[str, int]:
+        repository.create_source(
+            name="Transient",
+            platform="blog",
+            source_type="rss",
+            url="https://example.com/transient",
+            tags=[],
+        )
+        raise RuntimeError("abort stage")
+
+    result = JobRunner(factory).run_stage("sync", fail_after_write)
+
+    assert result.status == "failed"
+    with factory() as session:
+        assert session.query(Source).count() == 0
+        failed_run = session.get(type(result.run), result.job_id)
+        assert failed_run.status == "failed"
+        assert failed_run.events[0].message == "RuntimeError: abort stage"
+    engine.dispose()
+
+
 def test_stage_runner_records_structured_warnings_on_a_successful_run(tmp_path: Path):
     engine = create_engine(f"sqlite:///{tmp_path / 'warning.db'}", future=True)
     Base.metadata.create_all(engine)
@@ -369,10 +395,90 @@ def test_force_send_records_reconciliation_warning_for_smtp_boundary(tmp_path: P
 
     assert result.status == "succeeded"
     assert notifier.calls == 1
-    assert [warning.code for warning in result.warnings] == ["smtp_exactly_once_boundary"]
+    assert [warning.code for warning in result.warnings] == [
+        "smtp_exactly_once_boundary",
+        "explicit_forced_resend",
+    ]
     with factory() as session:
         events = Repository(session).list_job_events(result.job_id)
         assert events[0].details["reconciliation_required_after_ambiguous_outcome"] is True
+    engine.dispose()
+
+
+def test_smtp_accepted_persistence_failure_records_reconciliation_details(
+    tmp_path: Path, monkeypatch
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'accepted-local-failure.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    issue_date = date(2026, 7, 23)
+    with factory() as session:
+        newsletter = Repository(session).save_newsletter(
+            issue_date, "Daily", "# Daily", "<h1>Daily</h1>", "draft"
+        )
+
+    class AcceptingNotifier:
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            return SendResult(accepted=True, dry_run=False)
+
+    def fail_local_mark(
+        _repository: Repository, _newsletter_id: int, *, force: bool = False
+    ) -> object:
+        raise OSError("local status persistence failed")
+
+    monkeypatch.setattr(Repository, "mark_newsletter_sent", fail_local_mark)
+
+    result = send_newsletter(JobRunner(factory), issue_date, notifier=AcceptingNotifier())
+
+    assert result.status == "failed"
+    with factory() as session:
+        events = Repository(session).list_job_events(result.job_id)
+        assert events[0].details == {
+            "job_type": "send",
+            "smtp_accepted": True,
+            "newsletter_id": newsletter.id,
+            "reconciliation_required_after_ambiguous_outcome": True,
+        }
+        assert Repository(session).get_newsletter(issue_date).status == "draft"
+    engine.dispose()
+
+
+def test_send_persists_an_explicit_force_resend_event(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'force-event.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    issue_date = date(2026, 7, 23)
+    with factory() as session:
+        newsletter = Repository(session).save_newsletter(
+            issue_date, "Daily", "# Daily", "<h1>Daily</h1>", "draft"
+        )
+
+    class AcceptingNotifier:
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            return SendResult(accepted=True, dry_run=False)
+
+    first = send_newsletter(JobRunner(factory), issue_date, notifier=AcceptingNotifier())
+    forced = send_newsletter(
+        JobRunner(factory), issue_date, notifier=AcceptingNotifier(), force=True
+    )
+
+    assert first.status == "succeeded"
+    assert forced.status == "succeeded"
+    with factory() as session:
+        first_events = Repository(session).list_job_events(first.job_id)
+        forced_events = Repository(session).list_job_events(forced.job_id)
+        assert first_events[0].details["newsletter_id"] == newsletter.id
+        assert first_events[0].details["force"] is False
+        assert all(event.details.get("code") != "explicit_forced_resend" for event in first_events)
+        assert any(
+            event.details
+            == {
+                "code": "explicit_forced_resend",
+                "newsletter_id": newsletter.id,
+                "force": True,
+            }
+            for event in forced_events
+        )
     engine.dispose()
 
 

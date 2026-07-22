@@ -91,8 +91,15 @@ def make_preference_hash(
 
 
 class Repository:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, *, auto_commit: bool = True) -> None:
         self.session = session
+        self._auto_commit = auto_commit
+
+    def _commit(self) -> None:
+        if self._auto_commit:
+            self.session.commit()
+        else:
+            self.session.flush()
 
     def create_source(
         self,
@@ -141,7 +148,7 @@ class Repository:
         source.tags = list(tags)
         source.enabled = enabled
         source.status = valid_status
-        self.session.commit()
+        self._commit()
         return source
 
     def get_source_by_url(self, url: str) -> Source | None:
@@ -177,7 +184,7 @@ class Repository:
                 source.etag = etag
             if last_modified is not None:
                 source.last_modified = last_modified
-        self.session.commit()
+        self._commit()
         return source
 
     def upsert_content_item(self, item: ContentInput) -> ContentItem:
@@ -227,7 +234,7 @@ class Repository:
                 existing.external_id = item.external_id
         if existing.status is None:
             existing.status = ContentItemStatus.PENDING_ANALYSIS.value
-        self.session.commit()
+        self._commit()
         return existing
 
     def get_content_item(
@@ -278,7 +285,7 @@ class Repository:
         if item is None:
             raise LookupError(f"content item {item_id} not found")
         item.status = valid_status
-        self.session.commit()
+        self._commit()
         return item
 
     def save_analysis(
@@ -329,7 +336,7 @@ class Repository:
         analysis.decision = decision
         analysis.analyzed_at = utc_now()
         item.status = ContentItemStatus.ANALYZED.value
-        self.session.commit()
+        self._commit()
         return analysis
 
     def create_preference_snapshot(
@@ -367,7 +374,7 @@ class Repository:
             ),
         )
         self.session.add(snapshot)
-        self.session.commit()
+        self._commit()
         return snapshot
 
     def get_preference_snapshot(self, version: int) -> PreferenceSnapshot | None:
@@ -434,7 +441,7 @@ class Repository:
         self.session.flush()
         if items is not None:
             self._replace_newsletter_items(newsletter, items)
-        self.session.commit()
+        self._commit()
         self.session.refresh(newsletter)
         return newsletter
 
@@ -459,7 +466,7 @@ class Repository:
             raise ValueError(f"newsletter {newsletter_id} is already sent")
         newsletter.status = NewsletterStatus.SENT.value
         newsletter.sent_at = utc_now()
-        self.session.commit()
+        self._commit()
         return newsletter
 
     def mark_newsletter_failed(self, newsletter_id: int) -> Newsletter:
@@ -467,7 +474,7 @@ class Repository:
         if newsletter is None:
             raise LookupError(f"newsletter {newsletter_id} not found")
         newsletter.status = NewsletterStatus.SEND_FAILED.value
-        self.session.commit()
+        self._commit()
         return newsletter
 
     def mark_newsletter_preview(self, newsletter_id: int) -> Newsletter:
@@ -475,7 +482,7 @@ class Repository:
         if newsletter is None:
             raise LookupError(f"newsletter {newsletter_id} not found")
         newsletter.status = NewsletterStatus.PREVIEW.value
-        self.session.commit()
+        self._commit()
         return newsletter
 
     def _replace_newsletter_items(
@@ -585,7 +592,7 @@ class Repository:
             error_category=error_category,
         )
         self.session.add(run)
-        self.session.commit()
+        self._commit()
         return run
 
     def complete_agent_run(
@@ -613,7 +620,7 @@ class Repository:
         run.finished_at = utc_now()
         run.error_message = None
         run.error_category = error_category
-        self.session.commit()
+        self._commit()
         return run
 
     def fail_agent_run(
@@ -629,7 +636,7 @@ class Repository:
         run.error_message = error_message
         run.error_category = error_category
         run.finished_at = utc_now()
-        self.session.commit()
+        self._commit()
         return run
 
     def _get_agent_run(self, agent_run_id: int) -> AgentRun:
@@ -670,7 +677,7 @@ class Repository:
         trace.result_summary = result_summary
         trace.error_message = error_message
         trace.error_category = error_category
-        self.session.commit()
+        self._commit()
         return trace
 
     def list_tool_call_traces(self, agent_run_id: int) -> list[ToolCallTrace]:
@@ -686,7 +693,7 @@ class Repository:
         valid_status = require_status(status, JobRunStatus)
         run = JobRun(job_type=job_type, status=valid_status)
         self.session.add(run)
-        self.session.commit()
+        self._commit()
         return run
 
     def add_job_event(
@@ -704,7 +711,7 @@ class Repository:
             details=details or {},
         )
         self.session.add(event)
-        self.session.commit()
+        self._commit()
         return event
 
     def complete_job_run(self, job_run_id: int) -> JobRun:
@@ -716,7 +723,7 @@ class Repository:
         run.status = JobRunStatus.SUCCEEDED.value
         run.finished_at = utc_now()
         run.error_message = None
-        self.session.commit()
+        self._commit()
         return run
 
     def fail_job_run(
@@ -725,8 +732,10 @@ class Repository:
         error_message: str,
         *,
         details: dict[str, object] | None = None,
+        rollback: bool = True,
     ) -> JobRun:
-        self.session.rollback()
+        if rollback:
+            self.session.rollback()
         run = self._get_job_run(job_run_id)
         if run.status == JobRunStatus.FAILED.value:
             return run
@@ -736,7 +745,7 @@ class Repository:
         run.finished_at = utc_now()
         run.error_message = error_message
         run.events.append(JobEvent(level="error", message=error_message, details=details or {}))
-        self.session.commit()
+        self._commit()
         return run
 
     def _get_job_run(self, job_run_id: int) -> JobRun:
