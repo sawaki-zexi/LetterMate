@@ -4,6 +4,7 @@ import pytest
 
 from lettermate.sources.cleaner import clean_html
 from lettermate.sources.collector import FeedClient, FeedResponse, parse_feed
+from lettermate.sources.service import collect_sources
 
 
 def test_clean_html_removes_active_content_and_marks_links_safe():
@@ -74,3 +75,26 @@ def test_feed_client_sends_conditional_headers_and_enforces_response_limit():
     assert http.headers == {"If-None-Match": '"v1"', "If-Modified-Since": "old"}
     assert response.etag == '"v2"'
     assert response.last_modified == "date"
+
+
+def test_collect_sources_isolates_one_failed_source():
+    sources = [(1, "https://example.com/good"), (2, "https://example.com/bad")]
+
+    def fetch(url: str) -> FeedResponse:
+        if url.endswith("bad"):
+            raise TimeoutError("timed out")
+        return FeedResponse(
+            status_code=200,
+            content=b"<rss version='2.0'><channel><item><title>Good</title>"
+            b"<link>https://example.com/post</link></item></channel></rss>",
+            etag=None,
+            last_modified=None,
+        )
+
+    results = collect_sources(sources, fetch=fetch)
+
+    assert [result.source_id for result in results] == [1, 2]
+    assert results[0].error is None
+    assert len(results[0].items) == 1
+    assert results[1].items == ()
+    assert results[1].error == "TimeoutError: timed out"
