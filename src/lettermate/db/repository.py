@@ -503,6 +503,17 @@ class Repository:
         self._commit()
         return newsletter
 
+    def restore_newsletter_sent(
+        self, newsletter_id: int, *, sent_at: datetime | None
+    ) -> Newsletter:
+        newsletter = self.session.get(Newsletter, newsletter_id)
+        if newsletter is None:
+            raise LookupError(f"newsletter {newsletter_id} not found")
+        newsletter.status = NewsletterStatus.SENT.value
+        newsletter.sent_at = sent_at
+        self._commit()
+        return newsletter
+
     def mark_newsletter_preview(self, newsletter_id: int) -> Newsletter:
         newsletter = self.session.get(Newsletter, newsletter_id)
         if newsletter is None:

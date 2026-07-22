@@ -22,6 +22,7 @@ class EmailSettings:
 class SendResult:
     accepted: bool
     dry_run: bool
+    ambiguous: bool = False
 
 
 class SmtpConnection(Protocol):
@@ -68,10 +69,23 @@ class EmailNotifier:
         message["To"] = self._settings.recipient
         message.set_content("This briefing requires an HTML-capable email client.")
         message.add_alternative(html_body, subtype="html")
-        with self._smtp_factory(self._settings.host, self._settings.port) as smtp:
-            if self._settings.use_tls:
-                smtp.starttls()
-            if self._settings.username:
-                smtp.login(self._settings.username, self._settings.password)
-            smtp.send_message(message)
+        send_started = False
+        send_completed = False
+        try:
+            with self._smtp_factory(self._settings.host, self._settings.port) as smtp:
+                if self._settings.use_tls:
+                    smtp.starttls()
+                if self._settings.username:
+                    smtp.login(self._settings.username, self._settings.password)
+                send_started = True
+                smtp.send_message(message)
+                send_completed = True
+        except Exception:
+            if send_started:
+                return SendResult(
+                    accepted=send_completed,
+                    dry_run=False,
+                    ambiguous=True,
+                )
+            raise
         return SendResult(accepted=True, dry_run=False)

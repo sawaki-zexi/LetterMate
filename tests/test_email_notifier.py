@@ -58,3 +58,59 @@ def test_real_send_uses_tls_login_and_message():
 
     assert result.accepted is True
     assert smtp.calls == ["tls", "login:user:secret", "send:Daily"]
+
+
+def test_send_message_exception_is_reported_as_ambiguous():
+    class FakeSmtp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def starttls(self):
+            return None
+
+        def login(self, username: str, password: str):
+            return None
+
+        def send_message(self, message):
+            raise OSError("connection lost after DATA")
+
+    result = EmailNotifier(
+        settings(dry_run=False), smtp_factory=lambda host, port: FakeSmtp()
+    ).send(subject="Daily", html_body="<p>Issue</p>")
+
+    assert result.accepted is False
+    assert result.dry_run is False
+    assert result.ambiguous is True
+
+
+def test_smtp_exit_exception_after_send_is_reported_as_ambiguous():
+    class FakeSmtp:
+        sent = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            raise OSError("connection lost during QUIT")
+
+        def starttls(self):
+            return None
+
+        def login(self, username: str, password: str):
+            return None
+
+        def send_message(self, message):
+            self.sent = True
+
+    smtp = FakeSmtp()
+    result = EmailNotifier(
+        settings(dry_run=False), smtp_factory=lambda host, port: smtp
+    ).send(subject="Daily", html_body="<p>Issue</p>")
+
+    assert smtp.sent is True
+    assert result.accepted is True
+    assert result.dry_run is False
+    assert result.ambiguous is True

@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from threading import Event, Lock
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -414,6 +415,121 @@ def test_send_rejection_marks_issue_send_failed(tmp_path: Path):
     assert result.status == "failed"
     with factory() as session:
         assert Repository(session).get_newsletter(issue_date).status == "send_failed"
+    engine.dispose()
+
+
+def test_ambiguous_send_keeps_durable_claim_and_records_reconciliation_details(
+    tmp_path: Path,
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'ambiguous-send.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    issue_date = date(2026, 7, 23)
+    with factory() as session:
+        newsletter = Repository(session).save_newsletter(
+            issue_date, "Daily", "# Daily", "<h1>Daily</h1>", "draft"
+        )
+
+    class AmbiguousNotifier:
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            return SendResult(accepted=False, dry_run=False, ambiguous=True)
+
+    result = send_newsletter(JobRunner(factory), issue_date, notifier=AmbiguousNotifier())
+
+    assert result.status == "failed"
+    with factory() as session:
+        assert Repository(session).get_newsletter(issue_date).status == "sending"
+        events = Repository(session).list_job_events(result.job_id)
+        assert events[0].details == {
+            "job_type": "send",
+            "newsletter_id": newsletter.id,
+            "force": False,
+            "previously_sent": False,
+            "smtp_outcome": "ambiguous",
+            "smtp_accepted": False,
+            "smtp_ambiguous": True,
+            "reconciliation_required": True,
+        }
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "smtp_outcome", "smtp_ambiguous", "reconciliation_required"),
+    [
+        ("rejected", "rejected", False, False),
+        ("raises", "error", False, False),
+        ("ambiguous", "ambiguous", True, True),
+    ],
+)
+def test_failed_forced_resend_restores_sent_status_and_original_timestamp(
+    tmp_path: Path,
+    failure_mode: str,
+    smtp_outcome: str,
+    smtp_ambiguous: bool,
+    reconciliation_required: bool,
+):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / f'failed-forced-{failure_mode}.db'}", future=True
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    issue_date = date(2026, 7, 23)
+    with factory() as session:
+        newsletter = Repository(session).save_newsletter(
+            issue_date, "Daily", "# Daily", "<h1>Daily</h1>", "draft"
+        )
+
+    class AcceptingNotifier:
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            return SendResult(accepted=True, dry_run=False)
+
+    first = send_newsletter(JobRunner(factory), issue_date, notifier=AcceptingNotifier())
+    assert first.status == "succeeded"
+    with factory() as session:
+        original_sent_at = Repository(session).get_newsletter(issue_date).sent_at
+
+    class FailingForcedNotifier:
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            if failure_mode == "raises":
+                raise OSError("SMTP unavailable")
+            return SendResult(
+                accepted=False,
+                dry_run=False,
+                ambiguous=failure_mode == "ambiguous",
+            )
+
+    forced = send_newsletter(
+        JobRunner(factory), issue_date, notifier=FailingForcedNotifier(), force=True
+    )
+
+    class CountingNotifier:
+        calls = 0
+
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            self.calls += 1
+            return SendResult(accepted=True, dry_run=False)
+
+    ordinary_notifier = CountingNotifier()
+    ordinary = send_newsletter(JobRunner(factory), issue_date, notifier=ordinary_notifier)
+
+    assert forced.status == "failed"
+    assert ordinary.status == "failed"
+    assert ordinary_notifier.calls == 0
+    with factory() as session:
+        persisted = Repository(session).get_newsletter(issue_date)
+        assert persisted.status == "sent"
+        assert persisted.sent_at == original_sent_at
+        events = Repository(session).list_job_events(forced.job_id)
+        assert events[0].details == {
+            "job_type": "send",
+            "newsletter_id": newsletter.id,
+            "force": True,
+            "previously_sent": True,
+            "smtp_outcome": smtp_outcome,
+            "smtp_accepted": False,
+            "smtp_ambiguous": smtp_ambiguous,
+            "reconciliation_required": reconciliation_required,
+        }
     engine.dispose()
 
 

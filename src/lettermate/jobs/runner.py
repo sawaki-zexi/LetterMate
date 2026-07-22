@@ -217,16 +217,23 @@ def send_newsletter(
     newsletter_id: int | None = None
     notifier_attempted = False
     smtp_accepted = False
+    smtp_ambiguous = False
+    smtp_outcome = "not_attempted"
     send_claim_lost = False
     claim_status: str | None = None
+    previously_sent = False
+    previous_sent_at: datetime | None = None
 
     def operation(repository: Repository) -> dict[str, int] | StageOutcome:
-        nonlocal newsletter_id, notifier_attempted, smtp_accepted
-        nonlocal send_claim_lost, claim_status
+        nonlocal newsletter_id, notifier_attempted, smtp_accepted, smtp_ambiguous
+        nonlocal smtp_outcome, send_claim_lost, claim_status
+        nonlocal previously_sent, previous_sent_at
         newsletter = repository.get_newsletter(issue_date)
         if newsletter is None:
             raise LookupError(f"newsletter for {issue_date.isoformat()} not found")
         newsletter_id = newsletter.id
+        previously_sent = newsletter.status == NewsletterStatus.SENT.value
+        previous_sent_at = newsletter.sent_at
         if newsletter.status == NewsletterStatus.SENT.value and not force:
             raise ValueError(f"newsletter {newsletter.id} is already sent")
         if (
@@ -259,8 +266,24 @@ def send_newsletter(
             raise RuntimeError(f"newsletter {newsletter.id} send claim is unavailable")
         newsletter = claimed
         notifier_attempted = True
-        result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
+        try:
+            result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
+        except Exception:
+            smtp_outcome = "error"
+            raise
         smtp_accepted = result.accepted
+        smtp_ambiguous = result.ambiguous
+        smtp_outcome = (
+            "ambiguous"
+            if result.ambiguous
+            else "accepted"
+            if result.accepted
+            else "dry_run"
+            if result.dry_run
+            else "rejected"
+        )
+        if result.ambiguous:
+            raise RuntimeError("SMTP outcome is ambiguous; reconciliation required")
         if result.dry_run:
             repository.mark_newsletter_preview(newsletter.id)
         elif result.accepted:
@@ -298,7 +321,17 @@ def send_newsletter(
         return details
 
     def persist_send_failure(repository: Repository, _error: Exception) -> None:
-        if newsletter_id is not None and notifier_attempted and not smtp_accepted:
+        if newsletter_id is not None and notifier_attempted and previously_sent:
+            repository.restore_newsletter_sent(
+                newsletter_id,
+                sent_at=previous_sent_at,
+            )
+        elif (
+            newsletter_id is not None
+            and notifier_attempted
+            and not smtp_accepted
+            and not smtp_ambiguous
+        ):
             repository.mark_newsletter_failed(newsletter_id)
 
     def send_failure_details(_error: Exception) -> dict[str, object]:
@@ -308,11 +341,22 @@ def send_newsletter(
                 "newsletter_id": newsletter_id,
                 "current_status": claim_status or "unknown",
             }
-        if smtp_accepted and newsletter_id is not None:
+        if newsletter_id is not None and notifier_attempted:
+            reconciliation_required = smtp_ambiguous or smtp_accepted
+            if smtp_accepted and not smtp_ambiguous and not force:
+                return {
+                    "smtp_accepted": True,
+                    "newsletter_id": newsletter_id,
+                    "reconciliation_required_after_ambiguous_outcome": True,
+                }
             return {
-                "smtp_accepted": True,
                 "newsletter_id": newsletter_id,
-                "reconciliation_required_after_ambiguous_outcome": True,
+                "force": force,
+                "previously_sent": previously_sent,
+                "smtp_outcome": smtp_outcome,
+                "smtp_accepted": smtp_accepted,
+                "smtp_ambiguous": smtp_ambiguous,
+                "reconciliation_required": reconciliation_required,
             }
         return {}
 
