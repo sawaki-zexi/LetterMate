@@ -3,8 +3,10 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
+from typing import cast
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from lettermate.db.models import (
@@ -468,6 +470,30 @@ class Repository:
         newsletter.sent_at = utc_now()
         self._commit()
         return newsletter
+
+    def claim_newsletter_for_send(
+        self, newsletter_id: int, *, force: bool = False
+    ) -> Newsletter | None:
+        conditions = [
+            Newsletter.id == newsletter_id,
+            Newsletter.status != NewsletterStatus.SENDING.value,
+        ]
+        if not force:
+            conditions.append(Newsletter.status != NewsletterStatus.SENT.value)
+        result = cast(
+            CursorResult[object],
+            self.session.execute(
+                update(Newsletter)
+                .where(*conditions)
+                .values(status=NewsletterStatus.SENDING.value)
+            ),
+        )
+        # The claim must be visible before the external SMTP side effect begins.
+        self.session.commit()
+        self.session.expire_all()
+        if result.rowcount != 1:
+            return None
+        return self.session.get(Newsletter, newsletter_id)
 
     def mark_newsletter_failed(self, newsletter_id: int) -> Newsletter:
         newsletter = self.session.get(Newsletter, newsletter_id)

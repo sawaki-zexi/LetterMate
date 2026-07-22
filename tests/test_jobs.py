@@ -1,5 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Event, Lock
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -8,7 +10,7 @@ import lettermate.jobs.runner as jobs
 from lettermate.curation.provider import FakeCurationProvider
 from lettermate.curation.service import CurationService
 from lettermate.db.models import Base, ContentItem, Source
-from lettermate.db.repository import Repository
+from lettermate.db.repository import ContentInput, Repository
 from lettermate.db.statuses import NewsletterStatus
 from lettermate.jobs.runner import (
     JobRunner,
@@ -182,6 +184,50 @@ def test_collect_sources_isolates_a_failed_source_and_reports_a_warning(tmp_path
         ]
         assert session.query(ContentItem).count() == 1
         assert session.query(ContentItem).one().source.name == "Healthy"
+    engine.dispose()
+
+
+def test_collect_source_rolls_back_earlier_items_when_a_later_item_write_fails(
+    tmp_path: Path, monkeypatch
+):
+    engine = create_engine(f"sqlite:///{tmp_path / 'atomic-source.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    runner = JobRunner(factory)
+    sync_sources(
+        runner,
+        [SourceConfig(name="Example", platform="blog", type="rss", url="https://example.com")],
+    )
+    feed = (
+        b"<rss version='2.0'><channel>"
+        b"<item><guid>one</guid><title>One</title>"
+        b"<link>https://example.com/one</link><description>First</description></item>"
+        b"<item><guid>two</guid><title>Two</title>"
+        b"<link>https://example.com/two</link><description>Second</description></item>"
+        b"</channel></rss>"
+    )
+    original_upsert = Repository.upsert_content_item
+    attempts = 0
+
+    def fail_second_item(repository: Repository, item: ContentInput):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise RuntimeError("second item write failed")
+        return original_upsert(repository, item)
+
+    monkeypatch.setattr(Repository, "upsert_content_item", fail_second_item)
+
+    result = collect_fixture(runner, feed, now=datetime(2026, 7, 23, tzinfo=UTC))
+
+    assert result.status == "succeeded"
+    assert result.details == {"sources": 1, "items": 0, "failed_sources": 1}
+    assert [warning.code for warning in result.warnings] == ["source_fetch_failed"]
+    with factory() as session:
+        assert session.query(ContentItem).count() == 0
+        source = session.query(Source).one()
+        assert source.status == "error"
+        assert source.last_error == "RuntimeError: second item write failed"
     engine.dispose()
 
 
@@ -439,7 +485,7 @@ def test_smtp_accepted_persistence_failure_records_reconciliation_details(
             "newsletter_id": newsletter.id,
             "reconciliation_required_after_ambiguous_outcome": True,
         }
-        assert Repository(session).get_newsletter(issue_date).status == "draft"
+        assert Repository(session).get_newsletter(issue_date).status == "sending"
     engine.dispose()
 
 
@@ -479,6 +525,115 @@ def test_send_persists_an_explicit_force_resend_event(tmp_path: Path):
             }
             for event in forced_events
         )
+    engine.dispose()
+
+
+def test_concurrent_real_sends_use_one_durable_claim_and_one_smtp_call(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'concurrent-send.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    issue_date = date(2026, 7, 23)
+    with factory() as session:
+        newsletter = Repository(session).save_newsletter(
+            issue_date, "Daily", "# Daily", "<h1>Daily</h1>", "draft"
+        )
+
+    class BlockingFirstNotifier:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.first_entered = Event()
+            self.release_first = Event()
+            self.lock = Lock()
+
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            with self.lock:
+                self.calls += 1
+                call_number = self.calls
+            if call_number == 1:
+                self.first_entered.set()
+                assert self.release_first.wait(timeout=5)
+            return SendResult(accepted=True, dry_run=False)
+
+    notifier = BlockingFirstNotifier()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            send_newsletter,
+            JobRunner(factory),
+            issue_date,
+            notifier=notifier,
+        )
+        assert notifier.first_entered.wait(timeout=5)
+        second_future = executor.submit(
+            send_newsletter,
+            JobRunner(factory),
+            issue_date,
+            notifier=notifier,
+        )
+        second = second_future.result(timeout=5)
+        notifier.release_first.set()
+        first = first_future.result(timeout=5)
+
+    assert notifier.calls == 1
+    assert sorted([first.status, second.status]) == ["failed", "succeeded"]
+    loser = first if first.status == "failed" else second
+    with factory() as session:
+        events = Repository(session).list_job_events(loser.job_id)
+        assert events[0].details == {
+            "job_type": "send",
+            "send_claim_lost": True,
+            "newsletter_id": newsletter.id,
+            "current_status": "sending",
+        }
+        assert Repository(session).get_newsletter(issue_date).status == "sent"
+    engine.dispose()
+
+
+def test_force_dry_run_keeps_a_sent_issue_protected_from_later_real_send(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'force-dry-run.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    issue_date = date(2026, 7, 23)
+    with factory() as session:
+        repository = Repository(session)
+        newsletter = repository.save_newsletter(
+            issue_date, "Daily", "# Daily", "<h1>Daily</h1>", "draft"
+        )
+        repository.mark_newsletter_sent(newsletter.id)
+
+    class DryRunNotifier:
+        dry_run = True
+        calls = 0
+
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            self.calls += 1
+            return SendResult(accepted=False, dry_run=True)
+
+    class RealNotifier:
+        calls = 0
+
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            self.calls += 1
+            return SendResult(accepted=True, dry_run=False)
+
+    preview = send_newsletter(
+        JobRunner(factory), issue_date, notifier=DryRunNotifier(), force=True
+    )
+    real_notifier = RealNotifier()
+    blocked = send_newsletter(JobRunner(factory), issue_date, notifier=real_notifier)
+
+    assert preview.status == "succeeded"
+    assert [warning.code for warning in preview.warnings] == ["forced_dry_run_sent_noop"]
+    assert blocked.status == "failed"
+    assert real_notifier.calls == 0
+    with factory() as session:
+        assert Repository(session).get_newsletter(issue_date).status == "sent"
+        events = Repository(session).list_job_events(preview.job_id)
+        assert events[0].details == {
+            "code": "forced_dry_run_sent_noop",
+            "newsletter_id": newsletter.id,
+            "force": True,
+            "preserved_sent_status": True,
+        }
     engine.dispose()
 
 

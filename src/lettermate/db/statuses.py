@@ -22,6 +22,7 @@ class AgentRunStatus(StrEnum):
 class NewsletterStatus(StrEnum):
     DRAFT = "draft"
     PREVIEW = "preview"
+    SENDING = "sending"
     SENT = "sent"
     FAILED = "failed"
     SEND_FAILED = "send_failed"

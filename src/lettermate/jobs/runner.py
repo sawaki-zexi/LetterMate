@@ -158,21 +158,24 @@ def collect_sources(
         warnings: list[StageWarning] = []
         for source in sources:
             try:
-                parsed = parse_feed(FeedResponse(200, feed_loader(source), None, None))
-                for item in parsed.items:
-                    repository.upsert_content_item(
-                        ContentInput(
-                            source_id=source.id,
-                            external_id=item.external_id,
-                            title=item.title,
-                            url=item.url,
-                            author=item.author,
-                            published_at=item.published_at,
-                            raw_content=item.raw_content,
+                source_item_count = 0
+                with repository.session.begin_nested():
+                    parsed = parse_feed(FeedResponse(200, feed_loader(source), None, None))
+                    for item in parsed.items:
+                        repository.upsert_content_item(
+                            ContentInput(
+                                source_id=source.id,
+                                external_id=item.external_id,
+                                title=item.title,
+                                url=item.url,
+                                author=item.author,
+                                published_at=item.published_at,
+                                raw_content=item.raw_content,
+                            )
                         )
-                    )
-                    item_count += 1
-                repository.record_source_fetch(source.id, fetched_at=now)
+                        source_item_count += 1
+                    repository.record_source_fetch(source.id, fetched_at=now)
+                item_count += source_item_count
             except Exception as error:
                 message = f"{type(error).__name__}: {error}"
                 repository.record_source_fetch(source.id, fetched_at=now, error=message)
@@ -214,15 +217,47 @@ def send_newsletter(
     newsletter_id: int | None = None
     notifier_attempted = False
     smtp_accepted = False
+    send_claim_lost = False
+    claim_status: str | None = None
 
     def operation(repository: Repository) -> dict[str, int] | StageOutcome:
         nonlocal newsletter_id, notifier_attempted, smtp_accepted
+        nonlocal send_claim_lost, claim_status
         newsletter = repository.get_newsletter(issue_date)
         if newsletter is None:
             raise LookupError(f"newsletter for {issue_date.isoformat()} not found")
         newsletter_id = newsletter.id
         if newsletter.status == NewsletterStatus.SENT.value and not force:
             raise ValueError(f"newsletter {newsletter.id} is already sent")
+        if (
+            newsletter.status == NewsletterStatus.SENT.value
+            and force
+            and bool(getattr(notifier, "dry_run", False))
+        ):
+            result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
+            if not result.dry_run:
+                raise RuntimeError("dry-run notifier returned a real send result")
+            return StageOutcome(
+                details={"sent": 0, "dry_run": 1},
+                warnings=(
+                    StageWarning(
+                        code="forced_dry_run_sent_noop",
+                        message="forced dry-run preserved an already sent newsletter",
+                        details={
+                            "newsletter_id": newsletter.id,
+                            "force": True,
+                            "preserved_sent_status": True,
+                        },
+                    ),
+                ),
+            )
+        claimed = repository.claim_newsletter_for_send(newsletter.id, force=force)
+        if claimed is None:
+            send_claim_lost = True
+            current = repository.get_newsletter(issue_date)
+            claim_status = current.status if current is not None else "missing"
+            raise RuntimeError(f"newsletter {newsletter.id} send claim is unavailable")
+        newsletter = claimed
         notifier_attempted = True
         result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
         smtp_accepted = result.accepted
@@ -267,6 +302,12 @@ def send_newsletter(
             repository.mark_newsletter_failed(newsletter_id)
 
     def send_failure_details(_error: Exception) -> dict[str, object]:
+        if send_claim_lost and newsletter_id is not None:
+            return {
+                "send_claim_lost": True,
+                "newsletter_id": newsletter_id,
+                "current_status": claim_status or "unknown",
+            }
         if smtp_accepted and newsletter_id is not None:
             return {
                 "smtp_accepted": True,

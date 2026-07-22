@@ -55,6 +55,10 @@ class EmailNotifier:
         self._settings = settings
         self._smtp_factory = smtp_factory
 
+    @property
+    def dry_run(self) -> bool:
+        return self._settings.dry_run
+
     def send(self, *, subject: str, html_body: str) -> SendResult:
         if self._settings.dry_run:
             return SendResult(accepted=False, dry_run=True)

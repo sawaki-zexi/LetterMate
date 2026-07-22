@@ -26,6 +26,11 @@ def test_dry_run_does_not_open_smtp_connection():
     assert result.dry_run is True
 
 
+def test_notifier_exposes_its_configured_dry_run_mode():
+    assert EmailNotifier(settings(dry_run=True)).dry_run is True
+    assert EmailNotifier(settings(dry_run=False)).dry_run is False
+
+
 def test_real_send_uses_tls_login_and_message():
     class FakeSmtp:
         def __init__(self) -> None:

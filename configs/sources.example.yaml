@@ -5,9 +5,27 @@ sources:
     url: https://openai.com/news/rss.xml
     tags: [AI, LLM]
     enabled: true
-  - name: Bilibili UP Video Feed
-    platform: bilibili
-    type: rsshub
-    url: https://rsshub.example.com/bilibili/user/video/123456
-    tags: [AI, Video]
+  - name: Hacker News Frontpage
+    platform: hackernews
+    type: rss
+    url: https://hnrss.org/frontpage
+    tags: [Engineering, News]
+    enabled: true
+  - name: GitHub Blog
+    platform: blog
+    type: rss
+    url: https://github.blog/feed/
+    tags: [Engineering, Open Source]
+    enabled: true
+  - name: Stack Overflow Blog
+    platform: blog
+    type: rss
+    url: https://stackoverflow.blog/feed/
+    tags: [Engineering, Career]
+    enabled: true
+  - name: Simon Willison's Weblog
+    platform: blog
+    type: atom
+    url: https://simonwillison.net/atom/everything/
+    tags: [AI, LLM]
     enabled: true

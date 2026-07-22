@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from lettermate.cli import app
-from lettermate.db.models import AnalysisResult, JobRun, Newsletter, NewsletterItem
+from lettermate.db.models import AnalysisResult, JobRun, Newsletter, NewsletterItem, Source
+from lettermate.sources.config_loader import load_sources
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,6 +24,15 @@ def test_cli_exposes_implemented_workflow_commands():
     assert "send" in result.stdout
     assert "run-daily" in result.stdout
     assert "eval" in result.stdout
+
+
+def test_committed_demo_sources_are_public_and_replaceable():
+    sources = load_sources(ROOT / "configs/sources.example.yaml")
+
+    assert len(sources) >= 5
+    assert all(str(source.url).startswith("https://") for source in sources)
+    assert all("example." not in str(source.url) for source in sources)
+    assert "Hacker News Frontpage" in {source.name for source in sources}
 
 
 def test_eval_command_runs_the_committed_real_eval_service():
@@ -90,6 +100,7 @@ def test_run_daily_literal_initializes_schema_and_never_opens_smtp(
     engine = create_engine(f"sqlite:///{database_path}", future=True)
     with Session(engine) as session:
         assert session.query(JobRun).count() == 5
+        assert session.query(Source).count() == 5
         assert session.query(AnalysisResult).count() == 1
         assert session.query(Newsletter).count() == 1
         assert session.query(NewsletterItem).count() == 1
