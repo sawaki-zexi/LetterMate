@@ -4,16 +4,21 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from lettermate.curation.provider import FakeCurationProvider
+from lettermate.curation.service import CurationService
 from lettermate.db.models import Base, ContentItem, Source
 from lettermate.db.repository import Repository
 from lettermate.jobs.runner import (
     JobRunner,
     analyze_pending,
+    build_newsletter_issue,
     collect_fixture,
     send_newsletter,
     sync_sources,
 )
 from lettermate.notifiers.email import SendResult
+from lettermate.preferences.signing import FeedbackSigner
+from lettermate.ranking.policy import RankingPolicy
 from lettermate.sources.config_loader import SourceConfig
 
 
@@ -126,4 +131,55 @@ def test_send_dry_run_marks_preview_without_marking_issue_sent(tmp_path: Path):
     assert result.details == {"sent": 0, "dry_run": 1}
     with factory() as session:
         assert Repository(session).get_newsletter(issue_date).status == "preview"
+    engine.dispose()
+
+
+def test_build_stage_persists_ranked_membership_and_signed_feedback(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'build.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    runner = JobRunner(factory)
+    sync_sources(
+        runner,
+        [SourceConfig(name="Example", platform="blog", type="rss", url="https://example.com/feed")],
+    )
+    feed = (
+        b"<rss version='2.0'><channel><item><guid>x</guid>"
+        b"<title>Agent engineering update</title>"
+        b"<link>https://example.com/post</link>"
+        b"<description>agent engineering details</description>"
+        b"</item></channel></rss>"
+    )
+    collect_fixture(runner, feed, now=datetime(2026, 7, 23, tzinfo=UTC))
+    with factory() as session:
+        Repository(session).create_preference_snapshot(
+            explicit_interests=["agent engineering"],
+            exclusions=[],
+            tag_weights={},
+            source_weights={},
+            feedback_cutoff=None,
+        )
+    analyze_pending(
+        runner,
+        lambda repository: CurationService(
+            repository,
+            provider=FakeCurationProvider(),
+            ranking_policy=RankingPolicy(item_limit=5, minimum_score=4),
+        ),
+        now=datetime(2026, 7, 23, tzinfo=UTC),
+    )
+
+    result = build_newsletter_issue(
+        runner,
+        date(2026, 7, 23),
+        signer=FeedbackSigner("test-secret"),
+        feedback_base_url="https://letters.example/feedback",
+        feedback_expires_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+
+    assert result.details == {"items": 1}
+    with factory() as session:
+        newsletter = Repository(session).get_newsletter(date(2026, 7, 23))
+        assert len(newsletter.items) == 1
+        assert "token=" in newsletter.html_body
     engine.dispose()

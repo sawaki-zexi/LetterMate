@@ -6,8 +6,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from lettermate.curation.service import CurationService
 from lettermate.db.models import JobRun
-from lettermate.db.repository import ContentInput, Repository
+from lettermate.db.repository import ContentInput, NewsletterItemInput, Repository
+from lettermate.newsletters.builder import NewsletterEntry, attach_signed_feedback, build_newsletter
 from lettermate.notifiers.email import EmailNotifier
+from lettermate.preferences.signing import FeedbackSigner
 from lettermate.sources.collector import FeedResponse, parse_feed
 from lettermate.sources.config_loader import SourceConfig
 
@@ -124,3 +126,54 @@ def send_newsletter(
         return {"sent": int(result.accepted), "dry_run": int(result.dry_run)}
 
     return runner.run_stage("send", operation)
+
+
+def build_newsletter_issue(
+    runner: JobRunner,
+    issue_date: date,
+    *,
+    signer: FeedbackSigner,
+    feedback_base_url: str,
+    feedback_expires_at: datetime,
+) -> StageResult:
+    def operation(repository: Repository) -> dict[str, int]:
+        analyses = repository.list_included_analyses()
+        placeholder = repository.save_newsletter(issue_date, "Building", "", "", "draft")
+        entries = [
+            NewsletterEntry(
+                content_item_id=analysis.content_item_id,
+                decision_id=analysis.id,
+                position=index,
+                section="Top picks",
+                final_score=analysis.final_score,
+                title=analysis.item.title,
+                source=analysis.item.source.name,
+                url=analysis.item.url,
+                summary=analysis.summary,
+                reason=analysis.reason,
+                confidence=1.0,
+                feedback_urls={},
+            )
+            for index, analysis in enumerate(analyses, start=1)
+        ]
+        built = build_newsletter(
+            issue_date,
+            attach_signed_feedback(
+                entries,
+                issue_id=placeholder.id,
+                signer=signer,
+                base_url=feedback_base_url,
+                expires_at=feedback_expires_at,
+            ),
+        )
+        repository.save_newsletter(
+            issue_date,
+            built.title,
+            built.markdown_body,
+            built.html_body,
+            "draft",
+            [NewsletterItemInput(**membership.__dict__) for membership in built.memberships],
+        )
+        return {"items": len(built.memberships)}
+
+    return runner.run_stage("build", operation)

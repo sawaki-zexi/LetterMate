@@ -441,6 +441,16 @@ class Repository:
     def get_newsletter(self, issue_date: date) -> Newsletter | None:
         return self.session.scalar(select(Newsletter).where(Newsletter.issue_date == issue_date))
 
+    def list_included_analyses(self, limit: int = 5) -> list[AnalysisResult]:
+        return list(
+            self.session.scalars(
+                select(AnalysisResult)
+                .where(AnalysisResult.decision == "include")
+                .order_by(AnalysisResult.final_score.desc(), AnalysisResult.id)
+                .limit(limit)
+            )
+        )
+
     def mark_newsletter_sent(self, newsletter_id: int, *, force: bool = False) -> Newsletter:
         newsletter = self.session.get(Newsletter, newsletter_id)
         if newsletter is None:
