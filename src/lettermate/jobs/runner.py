@@ -1,10 +1,12 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from lettermate.db.models import JobRun
-from lettermate.db.repository import Repository
+from lettermate.db.repository import ContentInput, Repository
+from lettermate.sources.collector import FeedResponse, parse_feed
 from lettermate.sources.config_loader import SourceConfig
 
 
@@ -58,3 +60,28 @@ def sync_sources(runner: JobRunner, sources: list[SourceConfig]) -> StageResult:
         return {"sources": len(sources)}
 
     return runner.run_stage("sync", operation)
+
+
+def collect_fixture(runner: JobRunner, feed_bytes: bytes, *, now: datetime) -> StageResult:
+    def operation(repository: Repository) -> dict[str, int]:
+        parsed = parse_feed(FeedResponse(200, feed_bytes, None, None))
+        sources = repository.list_enabled_sources()
+        item_count = 0
+        for source in sources:
+            for item in parsed.items:
+                repository.upsert_content_item(
+                    ContentInput(
+                        source_id=source.id,
+                        external_id=item.external_id,
+                        title=item.title,
+                        url=item.url,
+                        author=item.author,
+                        published_at=item.published_at,
+                        raw_content=item.raw_content,
+                    )
+                )
+                item_count += 1
+            repository.record_source_fetch(source.id, fetched_at=now)
+        return {"sources": len(sources), "items": item_count}
+
+    return runner.run_stage("collect", operation)
