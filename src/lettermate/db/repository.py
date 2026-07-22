@@ -460,6 +460,14 @@ class Repository:
         self.session.commit()
         return newsletter
 
+    def mark_newsletter_preview(self, newsletter_id: int) -> Newsletter:
+        newsletter = self.session.get(Newsletter, newsletter_id)
+        if newsletter is None:
+            raise LookupError(f"newsletter {newsletter_id} not found")
+        newsletter.status = NewsletterStatus.PREVIEW.value
+        self.session.commit()
+        return newsletter
+
     def _replace_newsletter_items(
         self, newsletter: Newsletter, items: list[NewsletterItemInput]
     ) -> None:

@@ -1,12 +1,13 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from lettermate.curation.service import CurationService
 from lettermate.db.models import JobRun
 from lettermate.db.repository import ContentInput, Repository
+from lettermate.notifiers.email import EmailNotifier
 from lettermate.sources.collector import FeedResponse, parse_feed
 from lettermate.sources.config_loader import SourceConfig
 
@@ -99,3 +100,27 @@ def analyze_pending(
         return {"analyses": len(analyses)}
 
     return runner.run_stage("analyze", operation)
+
+
+def send_newsletter(
+    runner: JobRunner,
+    issue_date: date,
+    *,
+    notifier: EmailNotifier,
+    force: bool = False,
+) -> StageResult:
+    def operation(repository: Repository) -> dict[str, int]:
+        newsletter = repository.get_newsletter(issue_date)
+        if newsletter is None:
+            raise LookupError(f"newsletter for {issue_date.isoformat()} not found")
+        result = notifier.send(subject=newsletter.title, html_body=newsletter.html_body)
+        if result.dry_run:
+            repository.mark_newsletter_preview(newsletter.id)
+        elif result.accepted:
+            repository.mark_newsletter_sent(newsletter.id, force=force)
+        else:
+            repository.mark_newsletter_failed(newsletter.id)
+            raise RuntimeError("SMTP did not accept newsletter")
+        return {"sent": int(result.accepted), "dry_run": int(result.dry_run)}
+
+    return runner.run_stage("send", operation)

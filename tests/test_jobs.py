@@ -1,11 +1,19 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from lettermate.db.models import Base, ContentItem, Source
-from lettermate.jobs.runner import JobRunner, analyze_pending, collect_fixture, sync_sources
+from lettermate.db.repository import Repository
+from lettermate.jobs.runner import (
+    JobRunner,
+    analyze_pending,
+    collect_fixture,
+    send_newsletter,
+    sync_sources,
+)
+from lettermate.notifiers.email import SendResult
 from lettermate.sources.config_loader import SourceConfig
 
 
@@ -93,4 +101,29 @@ def test_sync_sources_is_idempotent(tmp_path: Path):
     assert second.details == {"sources": 1}
     with factory() as session:
         assert session.query(Source).count() == 1
+    engine.dispose()
+
+
+def test_send_dry_run_marks_preview_without_marking_issue_sent(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'send.db'}", future=True)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    issue_date = date(2026, 7, 23)
+    with factory() as session:
+        Repository(session).save_newsletter(
+            issue_date, "Daily", "# Daily", "<h1>Daily</h1>", "draft"
+        )
+
+    class DryRunNotifier:
+        def send(self, *, subject: str, html_body: str) -> SendResult:
+            assert subject == "Daily"
+            assert html_body == "<h1>Daily</h1>"
+            return SendResult(accepted=False, dry_run=True)
+
+    result = send_newsletter(JobRunner(factory), issue_date, notifier=DryRunNotifier())
+
+    assert result.status == "succeeded"
+    assert result.details == {"sent": 0, "dry_run": 1}
+    with factory() as session:
+        assert Repository(session).get_newsletter(issue_date).status == "preview"
     engine.dispose()
