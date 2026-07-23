@@ -6,11 +6,30 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
-from lettermate.cli import _initialized_session_factory, app
+from lettermate.cli import _build_curation_service, _initialized_session_factory, app
 from lettermate.db.models import AnalysisResult, JobRun, Newsletter, NewsletterItem, Source
 from lettermate.sources.config_loader import load_sources
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_analysis_composition_uses_the_configured_provider_factory(monkeypatch):
+    from types import SimpleNamespace
+
+    import lettermate.cli as cli
+
+    provider = object()
+    monkeypatch.setattr(cli, "build_curation_provider", lambda settings, repository: provider)
+
+    service = _build_curation_service(
+        object(),
+        settings=cli.get_settings(),
+        preferences=SimpleNamespace(
+            newsletter=SimpleNamespace(max_items=5, min_score_to_include=4)
+        ),
+    )
+
+    assert service._provider is provider
 
 
 def test_cli_exposes_implemented_workflow_commands():

@@ -9,8 +9,8 @@ import httpx
 import typer
 from sqlalchemy.orm import Session, sessionmaker
 
-from lettermate.config import get_settings
-from lettermate.curation.provider import FakeCurationProvider
+from lettermate.config import Settings, get_settings
+from lettermate.curation.provider import build_curation_provider
 from lettermate.curation.service import CurationService
 from lettermate.db.models import Base, Source
 from lettermate.db.repository import Repository
@@ -70,6 +70,22 @@ def _ensure_preference_snapshot(
     return config
 
 
+def _build_curation_service(
+    repository: Repository,
+    *,
+    settings: Settings,
+    preferences: Preferences,
+) -> CurationService:
+    return CurationService(
+        repository,
+        provider=build_curation_provider(settings, repository),
+        ranking_policy=RankingPolicy(
+            item_limit=min(preferences.newsletter.max_items, 5),
+            minimum_score=preferences.newsletter.min_score_to_include,
+        ),
+    )
+
+
 def _echo_stage(name: str, result: StageResult) -> None:
     counts = " ".join(f"{key}={value}" for key, value in result.details.items())
     suffix = f" {counts}" if counts else ""
@@ -125,13 +141,10 @@ def _scheduler_callbacks(
             ensure_held()
             return analyze_pending(
                 runner,
-                lambda repository: CurationService(
+                lambda repository: _build_curation_service(
                     repository,
-                    provider=FakeCurationProvider(),
-                    ranking_policy=RankingPolicy(
-                        item_limit=min(preferences_config.newsletter.max_items, 5),
-                        minimum_score=preferences_config.newsletter.min_score_to_include,
-                    ),
+                    settings=settings,
+                    preferences=preferences_config,
                 ),
                 now=now,
             )
@@ -197,17 +210,15 @@ def collect_command(
 
 @app.command("analyze")
 def analyze_command(preferences: Path = Path("configs/preferences.example.yaml")) -> None:
+    settings = get_settings()
     session_factory = _initialized_session_factory()
     config = _ensure_preference_snapshot(session_factory, preferences)
     result = analyze_pending(
         JobRunner(session_factory),
-        lambda repository: CurationService(
+        lambda repository: _build_curation_service(
             repository,
-            provider=FakeCurationProvider(),
-            ranking_policy=RankingPolicy(
-                item_limit=min(config.newsletter.max_items, 5),
-                minimum_score=config.newsletter.min_score_to_include,
-            ),
+            settings=settings,
+            preferences=config,
         ),
         now=datetime.now(UTC),
     )
@@ -322,13 +333,10 @@ def run_daily_command(
         _ensure_preference_snapshot(factory, preferences)
         return analyze_pending(
             runner,
-            lambda repository: CurationService(
+            lambda repository: _build_curation_service(
                 repository,
-                provider=FakeCurationProvider(),
-                ranking_policy=RankingPolicy(
-                    item_limit=min(preferences_config.newsletter.max_items, 5),
-                    minimum_score=preferences_config.newsletter.min_score_to_include,
-                ),
+                settings=settings,
+                preferences=preferences_config,
             ),
             now=now,
         )

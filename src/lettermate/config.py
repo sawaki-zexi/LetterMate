@@ -52,7 +52,12 @@ class Settings(BaseSettings):
         }
 
     @model_validator(mode="after")
-    def validate_feedback_secret(self) -> Self:
+    def validate_runtime_configuration(self) -> Self:
+        provider = self.llm_provider.casefold()
+        if provider not in {"fake", "openai"}:
+            raise ValueError("LLM_PROVIDER must be one of: fake, openai")
+        if provider == "openai" and not self.openai_api_key.strip():
+            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
         is_local = self.app_env.lower() in {"development", "local", "test"}
         if not is_local and (
             self.feedback_signing_secret == "dev-only-change-me"

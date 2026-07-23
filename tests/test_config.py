@@ -90,3 +90,18 @@ def test_production_rejects_default_or_short_owner_and_scheduler_tokens():
 
     assert len(settings.owner_api_token) >= 32
     assert len(settings.scheduler_token) >= 32
+
+
+def test_settings_reject_unknown_or_unconfigured_live_curation_provider(monkeypatch: MonkeyPatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValidationError, match="LLM_PROVIDER"):
+        Settings(llm_provider="unsupported", _env_file=None)
+    with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+        Settings(llm_provider="openai", _env_file=None)
+    with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+        Settings(
+            llm_provider="openai",
+            openai_api_key="   ",
+            _env_file=None,
+        )

@@ -1,7 +1,9 @@
 import pytest
 from pydantic import ValidationError
 
-from lettermate.curation.provider import FakeCurationProvider
+from lettermate.config import Settings
+from lettermate.curation.agent import AgentCurationProvider
+from lettermate.curation.provider import FakeCurationProvider, build_curation_provider
 from lettermate.curation.schemas import CurationOutput, CurationRequest
 from lettermate.curation.service import CurationService
 from lettermate.db.repository import ContentInput, Repository
@@ -54,6 +56,25 @@ def test_fake_provider_is_deterministic_and_exposes_metadata():
     assert first.semantic_score in range(1, 6)
     assert provider.model == "fake-local"
     assert provider.prompt_version == "curation-v1"
+
+
+def test_curation_provider_factory_selects_fake_or_bounded_openai_agent():
+    repository = object()
+
+    fake = build_curation_provider(Settings(_env_file=None), repository)
+    live = build_curation_provider(
+        Settings(
+            llm_provider="openai",
+            llm_model="gpt-5-mini",
+            openai_api_key="test-openai-api-key",
+            _env_file=None,
+        ),
+        repository,
+    )
+
+    assert isinstance(fake, FakeCurationProvider)
+    assert isinstance(live, AgentCurationProvider)
+    assert live.model == "gpt-5-mini"
 
 
 def test_curation_service_persists_semantic_output_but_ranking_owns_inclusion(temp_db_session):
