@@ -18,23 +18,26 @@ LetterMate 是一个面向单一所有者的个人阅读情报服务。目标产
 
 **Implemented in this checkout / 当前检出版本已实现：**
 
-- Pydantic Settings and environment-based configuration.
-- SQLAlchemy models and session foundations.
-- Repository operations currently supported by the persistence layer.
-- YAML source and preference configuration loading.
+- Environment/YAML configuration, Alembic-backed SQL persistence, immutable preference snapshots,
+  and audited job/Agent/tool-trace records.
+- Source synchronization and failure-isolated feed collection, deterministic curation/ranking,
+  signed newsletters, safe SMTP delivery states, and idempotent offline daily runs.
+- A bounded Curation Agent with three read-only tools, structured output, redacted traces, and
+  deterministic ranking ownership.
+- Protected API/dashboard, a dedicated scheduler worker, Docker Compose/Postgres deployment
+  configuration, and sanitized sample Eval/security regression tooling.
 
-- Pydantic Settings 和基于环境变量的配置。
-- SQLAlchemy 模型与会话基础设施。
-- 当前持久化层支持的 Repository 操作。
-- YAML 来源与偏好配置加载。
+- 环境变量/YAML 配置、Alembic 管理的 SQL 持久化、不可变偏好快照，以及可审计的 Job/Agent/工具轨迹记录。
+- 来源同步与故障隔离的 feed 采集、确定性分析/排序、签名简报、安全 SMTP 状态和可幂等重跑的离线日流程。
+- 受限 Curation Agent，只有三项只读工具、结构化输出与脱敏轨迹；最终入选始终由确定性排序决定。
+- 受保护的 API/Dashboard、独立调度 Worker、Docker Compose/Postgres 部署配置，以及脱敏样例 Eval/安全回归工具。
 
-The end-to-end collection, analysis, newsletter, delivery, API, dashboard, bounded Curation Agent,
-formal Eval evidence, and hosted deployment are not complete unless the code, tests, and README say
-otherwise. Do not describe a planned feature as implemented merely because it appears in the plan.
+Real production deployment with secrets and SMTP, seven-day baseline collection, fourteen-day owner
+dogfood, an isolated external-user pilot, and the real holdout Eval remain incomplete. Do not claim
+personalization, hosted reliability, or business metrics until their dated evidence exists.
 
-端到端采集、分析、简报、投递、API、Dashboard、受限 Curation Agent、正式 Eval 证据和托管部署
-均未完成，除非代码、测试和 README 已明确证明其完成。不能因为某项能力出现在计划中，就把它
-描述为已经实现。
+真实密钥与 SMTP 的生产部署、七天基线、十四天 owner dogfood、隔离外部用户试点和真实 holdout Eval
+仍未完成。在存在带日期的证据之前，不得声称个性化改进、托管可靠性或业务指标已达成。
 
 ## Source of Truth / 事实来源优先级
 
