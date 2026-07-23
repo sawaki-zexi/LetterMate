@@ -104,4 +104,3 @@ Run `git diff -- AGENTS.md` and confirm every rule is bilingual, actionable, sco
 git add AGENTS.md docs/superpowers/plans/2026-07-23-agents-maintenance-implementation-plan.md
 git commit -m "docs: add bilingual agent maintenance guide"
 ```
-
