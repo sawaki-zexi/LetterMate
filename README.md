@@ -10,6 +10,10 @@ scheduler worker. The deployed topology uses Postgres shared by the web and work
 Real owner dogfood and an external pilot remain required before the portfolio release can claim
 the business metrics in the requirements.
 
+The container topology has been exercised against a fresh Postgres volume; see the
+[container deployment verification record](docs/deployment-verification.md) for the exact
+scope, evidence, and host-specific limitations.
+
 The authoritative product requirements are the
 [LetterMate Agentic Product Requirements V2](docs/lettermate-agentic-product-requirements-v2.md),
 and active implementation work follows the
