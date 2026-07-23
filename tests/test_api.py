@@ -4,6 +4,7 @@ from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -54,6 +55,31 @@ def test_health_is_public_but_operational_routes_require_owner_authentication():
     assert client.get(
         "/api/sources", headers={"Authorization": "Bearer owner-test-token"}
     ).status_code == 200
+
+
+def test_health_reports_database_unavailability_without_leaking_connection_details():
+    from lettermate.api.app import create_app
+
+    def unavailable_session_factory():
+        raise OperationalError("select 1", {}, RuntimeError("database unavailable"))
+
+    client = TestClient(
+        create_app(
+            Settings(
+                database_url="sqlite://",
+                app_env="test",
+                owner_api_token="owner-test-token",
+                scheduler_token="scheduler-test-token",
+            ),
+            session_factory=unavailable_session_factory,
+        )
+    )
+
+    response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unavailable"}
+    assert "database unavailable" not in response.text
 
 
 def test_scheduler_token_is_separate_from_owner_authentication_and_invokes_stage_trigger():

@@ -165,8 +165,9 @@ curl.exe --fail http://127.0.0.1:8000/health
 ```
 
 The `migrate` service runs `alembic upgrade head` before the web and worker start. `web` serves
-the protected dashboard at port 8000; `worker` runs `lettermate scheduler`; Postgres data is kept
-in the `postgres_data` volume. To apply a later migration explicitly, run:
+the protected dashboard at port 8000 and reports unhealthy when its database probe fails; `worker`
+runs `lettermate scheduler`; Postgres data is kept in the `postgres_data` volume. To apply a later
+migration explicitly, run:
 
 ```powershell
 docker compose run --rm migrate alembic upgrade head
