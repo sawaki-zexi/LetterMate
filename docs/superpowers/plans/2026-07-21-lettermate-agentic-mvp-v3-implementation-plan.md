@@ -10,6 +10,20 @@
 
 ---
 
+## Implementation Status (2026-07-23)
+
+Tasks 0 through 12 have been implemented in this checkout and verified with the repository's
+offline tests, static checks, package build, migration checks, security regression evaluation, and
+the recorded local container acceptance. The unchecked substeps below are preserved as the
+historical pre-execution plan; they are not a live completion tracker.
+
+Task 13 is intentionally incomplete. A production deployment with real secrets/OpenAI/SMTP, a
+seven-day baseline, fourteen consecutive owner-dogfood days, an isolated external-user pilot, and
+a dated real holdout Eval still require independently collected evidence. See `README.md`,
+`docs/evals/reports/portfolio-final.md`, and `docs/pilot/` for the current evidence state.
+
+---
+
 ## 1. Plan Authority
 
 本计划是 `docs/lettermate-agentic-product-requirements-v2.md` 的唯一活动任务级实施基线，并完整取代以下历史计划：
