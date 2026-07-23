@@ -1,5 +1,11 @@
 # Bilingual AGENTS.md Implementation Plan
 
+> **Status:** Completed on 2026-07-23. This is a historical maintenance plan; the active product
+> implementation sequence remains `2026-07-21-lettermate-agentic-mvp-v3-implementation-plan.md`.
+> Its original four-foundation baseline was superseded when the verified `feature/agentic-mvp`
+> implementation was integrated into `master`. Current implementation status is maintained in
+> `README.md` and `AGENTS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a bilingual root `AGENTS.md` that gives coding agents accurate, maintainable LetterMate repository rules.
