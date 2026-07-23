@@ -1,7 +1,8 @@
 # AGENTS.md Maintenance Design / AGENTS.md 维护设计
 
-**Date / 日期:** 2026-07-23  
-**Status / 状态:** Approved design / 已确认设计  
+**Date / 日期:** 2026-07-23
+
+**Status / 状态:** Approved design / 已确认设计
 **Scope / 范围:** Repository-root `AGENTS.md` only / 仅仓库根目录 `AGENTS.md`
 
 ## Purpose / 目的
