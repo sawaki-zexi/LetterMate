@@ -1,4 +1,7 @@
-import type { DiscoveryJobData } from '@lettermate/contracts';
+import {
+  discoveryQueueName,
+  type DiscoveryJobData,
+} from '@lettermate/contracts';
 import {
   Worker,
   type BackoffStrategy,
@@ -11,8 +14,6 @@ import {
   type DiscoveryRepository,
   type TopicDiscoveryService,
 } from './discovery-service.js';
-
-export const DISCOVERY_QUEUE_NAME = 'topic-discovery';
 
 export const backoffStrategy: BackoffStrategy = (attemptsMade, _type, error) => {
   if (error instanceof AiGatewayError && error.retryAfterMs !== undefined) {
@@ -50,7 +51,7 @@ export function createDiscoveryWorker(
   repository: Pick<DiscoveryRepository, 'saveFailure'>,
 ): Worker<DiscoveryJobData> {
   return new Worker<DiscoveryJobData>(
-    DISCOVERY_QUEUE_NAME,
+    discoveryQueueName,
     createDiscoveryJobHandler(service, repository),
     { connection, settings: { backoffStrategy } },
   );

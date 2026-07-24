@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
+  discoveryQueueName,
   discoveryResultSchema,
   topicInputSchema,
 } from './index.js';
 
 describe('AI discovery contracts', () => {
+  it('shares one stable discovery queue name', () => {
+    expect(discoveryQueueName).toBe('topic-discovery');
+  });
+
   it('accepts exactly one trimmed keyword', () => {
     expect(topicInputSchema.parse({ keyword: '  AI Agent  ' })).toEqual({ keyword: 'AI Agent' });
     expect(() => topicInputSchema.parse({ keyword: '' })).toThrow();

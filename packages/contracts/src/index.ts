@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+export const discoveryQueueName = 'topic-discovery';
+
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
 export const runStatusSchema = z.enum(['queued', 'running', 'succeeded', 'failed']);
 
