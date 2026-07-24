@@ -1,188 +1,194 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { MonitorRuleInput, TrustStatus } from '@lettermate/contracts';
+import type { DiscoveryKind, Topic } from '@lettermate/contracts';
 import {
-  Bell, BellRing, BookOpenCheck, Check, ChevronRight, CircleUserRound, FileSearch,
-  Inbox, LayoutList, LibraryBig, Menu, Pause, Plus, Radar, RefreshCw, Save, Settings, ShieldCheck,
-  SlidersHorizontal, X,
+  AlertCircle,
+  ChevronRight,
+  ExternalLink,
+  Inbox,
+  Menu,
+  Newspaper,
+  Plus,
+  RefreshCw,
+  Search,
 } from 'lucide-react';
 import { useState } from 'react';
-import { useForm } from 'react-hook-form';
-import { Link, NavLink, Route, Routes, useParams } from 'react-router-dom';
+import { NavLink, Route, Routes, useParams } from 'react-router-dom';
 import { api } from './api.js';
-import { EventCard } from './components/EventCard.js';
-import { enableBrowserPush } from './push.js';
+import { DiscoveryCard } from './components/DiscoveryCard.js';
 
 const navigation = [
-  { to: '/', label: '事件流', icon: LayoutList },
-  { to: '/monitor-rules', label: '监控规则', icon: Radar },
-  { to: '/notifications', label: '通知', icon: Bell },
-  { to: '/sources', label: '来源', icon: LibraryBig },
-  { to: '/settings', label: '设置', icon: Settings },
+  { to: '/', label: '发现', icon: Newspaper },
+  { to: '/topics', label: '主题', icon: Search },
 ];
 
+const statusLabel: Record<Topic['runStatus'], string> = {
+  queued: '等待中',
+  running: '搜索中',
+  succeeded: '已完成',
+  failed: '失败',
+};
+
+function useTopics() {
+  return useQuery({
+    queryKey: ['topics'],
+    queryFn: api.topics,
+    refetchInterval: (query) => query.state.data?.some((topic) =>
+      topic.runStatus === 'queued' || topic.runStatus === 'running') ? 1_500 : false,
+  });
+}
+
 function QueryState({ isLoading, error, retry }: { isLoading: boolean; error: Error | null; retry: () => void }) {
-  if (isLoading) return <div className="state"><RefreshCw className="spin" />正在同步最新内容</div>;
-  if (error) return <div className="state state--error"><FileSearch /><strong>无法载入数据</strong><span>{error.message}</span><button className="button button--secondary" onClick={retry}><RefreshCw size={16} />重试</button></div>;
+  if (isLoading) return <div className="state"><RefreshCw className="spin" />正在加载</div>;
+  if (error) return (
+    <div className="state state--error">
+      <AlertCircle />
+      <strong>无法加载数据</strong>
+      <span>{error.message}</span>
+      <button className="button button--secondary" onClick={retry}><RefreshCw size={16} />重试</button>
+    </div>
+  );
   return null;
 }
 
+function TopicErrors({ topics }: { topics: Topic[] }) {
+  const failed = topics.filter((topic) => topic.lastError);
+  if (failed.length === 0) return null;
+  return (
+    <div className="error-stack" aria-live="polite">
+      {failed.map((topic) => (
+        <div className="error-banner" key={topic.id}>
+          <AlertCircle size={18} />
+          <div><strong>{topic.keyword}</strong><span>{topic.lastError?.message}</span></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function FeedPage() {
-  const query = useQuery({ queryKey: ['events'], queryFn: api.events });
-  const [status, setStatus] = useState<TrustStatus | 'all'>('all');
-  const events = (query.data ?? []).filter((event) => status === 'all' || event.status === status);
-  return (
-    <Page title="事件流" description="按证据状态追踪你关注的最新事件" action={<button className="icon-button" title="刷新" onClick={() => query.refetch()}><RefreshCw size={18} /></button>}>
-      <div className="segmented" aria-label="事件状态筛选">
-        {([['all', '全部'], ['confirmed', '已确认'], ['pending', '待核实'], ['rejected', '已驳回']] as const).map(([value, label]) =>
-          <button key={value} aria-pressed={status === value} onClick={() => setStatus(value)}>{label}</button>)}
-      </div>
-      <QueryState isLoading={query.isLoading} error={query.error} retry={() => query.refetch()} />
-      {!query.isLoading && !query.error && events.length === 0 && <div className="state"><Inbox />暂无符合筛选条件的事件</div>}
-      <div className="event-list">{events.map((event) => <EventCard key={event.id} event={event} />)}</div>
-    </Page>
-  );
-}
-
-interface RuleFormData {
-  name: string;
-  keywords: string;
-  synonyms: string;
-  exclusions: string;
-  priority: MonitorRuleInput['priority'];
-  notifyImmediately: boolean;
-}
-
-function RulesPage() {
-  const client = useQueryClient();
-  const query = useQuery({ queryKey: ['rules'], queryFn: api.rules });
-  const [editing, setEditing] = useState(false);
-  const { register, handleSubmit, reset, formState: { errors } } = useForm<RuleFormData>({
-    defaultValues: { priority: 'normal', notifyImmediately: false },
-  });
-  const create = useMutation({
-    mutationFn: api.createRule,
-    onSuccess: async () => { await client.invalidateQueries({ queryKey: ['rules'] }); reset(); setEditing(false); },
-  });
-  const submit = handleSubmit((value) => create.mutate({
-    name: value.name,
-    keywords: value.keywords.split(',').map((item) => item.trim()).filter(Boolean),
-    synonyms: value.synonyms.split(',').map((item) => item.trim()).filter(Boolean),
-    exclusions: value.exclusions.split(',').map((item) => item.trim()).filter(Boolean),
-    scope: { mode: 'all' }, priority: value.priority,
-    notifyImmediately: value.notifyImmediately, enabled: true,
-  }));
-  return (
-    <Page title="监控规则" description="定义关键词、排除项与即时通知条件" action={<button className="button" onClick={() => setEditing(true)}><Plus size={17} />新建监控</button>}>
-      {editing && <section className="editor" aria-label="新建监控规则">
-        <div className="section-heading"><div><h2>新建监控</h2><p>逗号分隔多个关键词，保存后立即生效。</p></div><button className="icon-button" title="关闭" onClick={() => setEditing(false)}><X size={18} /></button></div>
-        <form onSubmit={submit} className="form-grid">
-          <label>规则名称<input {...register('name', { required: '请输入规则名称' })} placeholder="例如：AI Agent 进展" />{errors.name && <span className="field-error">{errors.name.message}</span>}</label>
-          <label>关键词<input {...register('keywords', { required: '至少输入一个关键词' })} placeholder="AI Agent, Agentic AI" />{errors.keywords && <span className="field-error">{errors.keywords.message}</span>}</label>
-          <label>同义词<input {...register('synonyms')} placeholder="智能体, 自主代理" /></label>
-          <label>排除词<input {...register('exclusions')} placeholder="招聘, 课程广告" /></label>
-          <label>优先级<select {...register('priority')}><option value="low">低</option><option value="normal">普通</option><option value="high">高</option></select></label>
-          <label className="check-field"><input type="checkbox" {...register('notifyImmediately')} /><span>符合确认规则时发送即时通知</span></label>
-          {create.error && <p className="field-error form-wide">{create.error.message}</p>}
-          <div className="form-actions"><button type="button" className="button button--secondary" onClick={() => setEditing(false)}>取消</button><button className="button" disabled={create.isPending}><Save size={16} />保存</button></div>
-        </form>
-      </section>}
-      <QueryState isLoading={query.isLoading} error={query.error} retry={() => query.refetch()} />
-      <div className="table-list">
-        {(query.data ?? []).map((rule) => <div className="table-row" key={rule.id}>
-          <span className="leading-icon"><Radar size={18} /></span><div className="table-row__main"><strong>{rule.name}</strong><span>{rule.keywords.join(' · ')}</span></div>
-          <span className={`priority priority--${rule.priority}`}>{rule.priority === 'high' ? '高优先级' : rule.priority === 'low' ? '低优先级' : '普通'}</span>
-          <span className="meta">{rule.notifyImmediately ? <><BellRing size={15} />即时通知</> : <><Bell size={15} />仅站内</>}</span>
-          <button className="icon-button" title="暂停"><Pause size={17} /></button>
-        </div>)}
-        {!query.isLoading && !query.error && query.data?.length === 0 && <div className="state"><Radar />尚未创建监控规则</div>}
-      </div>
-    </Page>
-  );
-}
-
-function EventDetailPage() {
-  const { id = '' } = useParams();
-  const query = useQuery({ queryKey: ['event', id], queryFn: () => api.event(id) });
-  return <Page title="事件证据" description="核对状态判定和原始来源">
-    <QueryState isLoading={query.isLoading} error={query.error} retry={() => query.refetch()} />
-    {query.data && <>
-      <div className="detail-header"><Link className="back-link" to="/"><ChevronRight size={15} />返回事件流</Link><h2>{query.data.event.title}</h2><p>{query.data.event.summary ?? '摘要暂不可用'}</p><div className="decision"><ShieldCheck size={20} /><div><strong>{query.data.event.statusReason}</strong><span>系统可信规则判定，AI 不参与最终状态决策</span></div></div></div>
-      <section className="evidence"><div className="section-heading"><div><h2>证据链</h2><p>{query.data.evidence.length} 条可复核原始记录</p></div></div>
-        {query.data.evidence.map((item) => <a className="evidence-row" href={item.sourceUrl} target="_blank" rel="noreferrer noopener" key={item.id}>
-          <span className={`source-level source-level--${item.trustLevel}`}>{item.trustLevel === 'primary' ? '一级' : '二级'}</span><div><strong>{item.sourceName}</strong><span>{item.title}</span></div><ChevronRight size={18} />
-        </a>)}
-      </section>
-    </>}
-  </Page>;
-}
-
-function NotificationsPage() {
-  const client = useQueryClient();
-  const query = useQuery({ queryKey: ['notifications'], queryFn: api.notifications });
-  const read = useMutation({ mutationFn: api.readNotification, onSuccess: async () => client.invalidateQueries({ queryKey: ['notifications'] }) });
-  return <Page title="通知中心" description="已确认事件、证据更新与更正记录">
-    <QueryState isLoading={query.isLoading} error={query.error} retry={() => query.refetch()} />
-    <div className="table-list">{(query.data ?? []).map((item) => <div className={`table-row ${item.status === 'unread' ? 'table-row--unread' : ''}`} key={item.id}>
-      <span className="leading-icon"><BellRing size={18} /></span><div className="table-row__main"><strong>{item.title}</strong><span>{item.type === 'confirmed' ? '事件已确认' : '证据有更新'} · {new Date(item.createdAt).toLocaleString('zh-CN')}</span></div>
-      {item.status === 'unread' ? <button className="button button--secondary" onClick={() => read.mutate(item.id)}><Check size={15} />标为已读</button> : <span className="meta"><Check size={15} />已读</span>}
-    </div>)}</div>
-  </Page>;
-}
-
-function SourcesPage() {
-  const query = useQuery({ queryKey: ['sources'], queryFn: api.sources });
-  return <Page title="来源说明" description="可信等级、合规状态与最近采集结果">
-    <QueryState isLoading={query.isLoading} error={query.error} retry={() => query.refetch()} />
-    <div className="table-list">{(query.data ?? []).map((source) => <div className="table-row" key={source.id}>
-      <span className="leading-icon"><BookOpenCheck size={18} /></span><div className="table-row__main"><strong>{source.name}</strong><span>{source.type.toUpperCase()} · {source.trustLevel === 'primary' ? '一级来源' : '二级来源'}</span></div>
-      <span className={`compliance compliance--${source.complianceStatus}`}>{source.complianceStatus === 'allowed' ? '允许采集' : source.complianceStatus === 'blocked' ? '已阻断' : '待审核'}</span>
-      <span className="source-message">{source.failureReason ?? (source.lastSuccessAt ? `最近成功 ${new Date(source.lastSuccessAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}` : '暂无运行记录')}</span>
-    </div>)}</div>
-  </Page>;
-}
-
-function SettingsPage() {
-  const vapidPublicKey = import.meta.env.VITE_VAPID_PUBLIC_KEY as string | undefined;
-  const [pushStatus, setPushStatus] = useState<'idle' | 'enabling' | 'enabled' | 'error'>('idle');
-  const [pushMessage, setPushMessage] = useState(
-    vapidPublicKey ? '授权后接收已确认高优先级事件' : '未配置 VAPID 公钥，站内通知仍可用',
-  );
-  const togglePush = async () => {
-    if (!vapidPublicKey || pushStatus === 'enabled') return;
-    setPushStatus('enabling');
-    try {
-      await enableBrowserPush(vapidPublicKey);
-      setPushStatus('enabled');
-      setPushMessage('浏览器 Push 已启用');
-    } catch (error) {
-      setPushStatus('error');
-      setPushMessage(error instanceof Error ? error.message : '浏览器 Push 启用失败');
-    }
+  const topics = useTopics();
+  const [kind, setKind] = useState<DiscoveryKind | 'all'>('all');
+  const [topicId, setTopicId] = useState('');
+  const filter = {
+    ...(topicId ? { topicId } : {}),
+    ...(kind === 'all' ? {} : { kind }),
   };
-  return <Page title="个人设置" description="时区、免打扰和浏览器通知">
-    <section className="settings-band"><div className="settings-copy"><CircleUserRound /><div><h2>个人资料</h2><p>user-a@example.local</p></div></div><label>时区<select defaultValue="Asia/Shanghai"><option>Asia/Shanghai</option><option>UTC</option></select></label></section>
-    <section className="settings-band"><div className="settings-copy"><BellRing /><div><h2>浏览器 Push</h2><p>{'Notification' in window ? pushMessage : '当前浏览器不支持 Push，站内通知仍可用'}</p></div></div><button className={`toggle ${pushStatus === 'enabled' ? 'toggle--on' : ''}`} role="switch" aria-label="浏览器 Push" aria-checked={pushStatus === 'enabled'} disabled={!vapidPublicKey || !('Notification' in window) || pushStatus === 'enabling'} onClick={() => void togglePush()}><span /></button></section>
-    <section className="settings-band"><div className="settings-copy"><SlidersHorizontal /><div><h2>免打扰</h2><p>在设定时间内延迟 Push，站内通知仍会立即创建</p></div></div><div className="time-range"><input aria-label="免打扰开始" type="time" defaultValue="23:00" /><span>至</span><input aria-label="免打扰结束" type="time" defaultValue="07:00" /></div></section>
-  </Page>;
+  const feed = useQuery({
+    queryKey: ['feed', filter],
+    queryFn: () => api.feed(filter),
+  });
+
+  return (
+    <Page title="发现" description="由 AI 搜索、分类并生成中文摘要" action={
+      <button className="icon-button" title="刷新发现" aria-label="刷新发现" onClick={() => void feed.refetch()}><RefreshCw size={18} /></button>
+    }>
+      <div className="feed-tools">
+        <div className="segmented" aria-label="发现分类">
+          {([['all', '全部'], ['hot', '热点'], ['quality', '优质']] as const).map(([value, label]) => (
+            <button key={value} aria-pressed={kind === value} onClick={() => setKind(value)}>{label}</button>
+          ))}
+        </div>
+        <label className="topic-filter">
+          <span>主题</span>
+          <select value={topicId} onChange={(event) => setTopicId(event.target.value)}>
+            <option value="">全部主题</option>
+            {(topics.data ?? []).map((topic) => <option key={topic.id} value={topic.id}>{topic.keyword}</option>)}
+          </select>
+        </label>
+      </div>
+      <TopicErrors topics={topics.data ?? []} />
+      {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
+      {!feed.data && <QueryState isLoading={feed.isLoading} error={feed.error} retry={() => void feed.refetch()} />}
+      {feed.data?.length === 0 && <div className="state"><Inbox />暂无发现内容</div>}
+      <div className="discovery-list">
+        {(feed.data ?? []).map((item) => <DiscoveryCard key={item.id} item={item} detailHref={`/items/${item.id}`} />)}
+      </div>
+    </Page>
+  );
+}
+
+function TopicsPage() {
+  const client = useQueryClient();
+  const topics = useTopics();
+  const [keyword, setKeyword] = useState('');
+  const create = useMutation({
+    mutationFn: api.createTopic,
+    onSuccess: (topic) => {
+      client.setQueryData<Topic[]>(['topics'], (current = []) => [topic, ...current.filter((item) => item.id !== topic.id)]);
+      setKeyword('');
+    },
+  });
+  const refresh = useMutation({
+    mutationFn: api.refreshTopic,
+    onSuccess: (topic) => client.setQueryData<Topic[]>(['topics'], (current = []) =>
+      current.map((item) => item.id === topic.id ? topic : item)),
+  });
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (keyword.trim()) create.mutate({ keyword });
+  };
+
+  return (
+    <Page title="主题" description="输入一个关键词，AI 自动扩展中英文搜索表达式">
+      <form className="topic-create" onSubmit={submit}>
+        <label htmlFor="topic-keyword">主题关键词</label>
+        <input id="topic-keyword" value={keyword} maxLength={100} onChange={(event) => setKeyword(event.target.value)} placeholder="例如：AI Agent" />
+        <button className="button" disabled={create.isPending || !keyword.trim()}><Plus size={17} />创建主题</button>
+      </form>
+      {create.error && <div className="error-banner"><AlertCircle size={18} /><span>{create.error.message}</span></div>}
+      {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
+      <div className="topic-list">
+        {(topics.data ?? []).map((topic) => (
+          <article className="topic-row" key={topic.id}>
+            <div className="topic-row__main">
+              <div className="topic-row__title"><h2>{topic.keyword}</h2><span className={`run-state run-state--${topic.runStatus}`}>{statusLabel[topic.runStatus]}</span></div>
+              {topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term) => <span key={term}>{term}</span>)}</div>}
+              {topic.lastError && <p className="inline-error"><AlertCircle size={15} />{topic.lastError.message}</p>}
+            </div>
+            <button className="icon-button" title="重新搜索" aria-label={`刷新 ${topic.keyword}`} disabled={refresh.isPending} onClick={() => refresh.mutate(topic.id)}><RefreshCw size={17} /></button>
+          </article>
+        ))}
+        {topics.data?.length === 0 && <div className="state"><Search />尚未创建主题</div>}
+      </div>
+    </Page>
+  );
+}
+
+function ItemPage() {
+  const { id = '' } = useParams();
+  const item = useQuery({ queryKey: ['item', id], queryFn: () => api.item(id) });
+  return (
+    <Page title="发现详情" description="AI 中文摘要、推荐理由与引用原文">
+      <QueryState isLoading={item.isLoading} error={item.error} retry={() => void item.refetch()} />
+      {item.data && <article className="item-detail">
+        <span className={`classification classification--${item.data.kind}`}>{item.data.kind === 'hot' ? '热点' : '优质'}</span>
+        <h2>{item.data.title}</h2>
+        <section><h3>中文摘要</h3><p>{item.data.summary}</p></section>
+        <section><h3>推荐理由</h3><p>{item.data.reason}</p></section>
+        <section className="item-sources"><h3>原始来源</h3>{item.data.sourceUrls.map((url) => (
+          <a href={url} target="_blank" rel="noreferrer noopener" key={url}><ExternalLink size={16} /><span>{url}</span><ChevronRight size={16} /></a>
+        ))}</section>
+      </article>}
+    </Page>
+  );
 }
 
 function Page({ title, description, action, children }: { title: string; description: string; action?: React.ReactNode; children: React.ReactNode }) {
   return <main className="page"><header className="page-header"><div><h1>{title}</h1><p>{description}</p></div>{action}</header>{children}</main>;
 }
 
-function AppShell() {
+export default function App() {
   const [mobileMenu, setMobileMenu] = useState(false);
   return <div className="shell">
     <aside className={`sidebar ${mobileMenu ? 'sidebar--open' : ''}`}>
-      <div className="brand"><span>LM</span><div><strong>LetterMate</strong><small>可信信息工作台</small></div></div>
+      <div className="brand"><span>LM</span><div><strong>LetterMate</strong><small>AI 信息发现工作台</small></div></div>
       <nav>{navigation.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} onClick={() => setMobileMenu(false)}><Icon size={19} />{label}</NavLink>)}</nav>
-      <div className="sidebar-status"><span className="pulse" /><div><strong>采集服务正常</strong><small>3 个来源 · 刚刚同步</small></div></div>
+      <div className="sidebar-note"><span className="live-dot" /><div><strong>OpenRouter</strong><small>Web Search</small></div></div>
     </aside>
-    <div className="workspace"><header className="mobile-header"><button className="icon-button" title="菜单" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={20} /></button><strong>LetterMate</strong><span className="live-dot" /></header>
-      <Routes><Route path="/" element={<FeedPage />} /><Route path="/monitor-rules" element={<RulesPage />} /><Route path="/events/:id" element={<EventDetailPage />} /><Route path="/notifications" element={<NotificationsPage />} /><Route path="/sources" element={<SourcesPage />} /><Route path="/settings" element={<SettingsPage />} /></Routes>
+    <div className="workspace">
+      <header className="mobile-header"><button className="icon-button" title="菜单" aria-label="菜单" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={20} /></button><strong>LetterMate</strong><span className="live-dot" /></header>
+      <Routes><Route path="/" element={<FeedPage />} /><Route path="/topics" element={<TopicsPage />} /><Route path="/items/:id" element={<ItemPage />} /></Routes>
     </div>
-    <nav className="bottom-nav">{navigation.slice(0, 4).map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'}><Icon size={19} /><span>{label}</span></NavLink>)}</nav>
+    <nav className="bottom-nav">{navigation.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'}><Icon size={19} /><span>{label}</span></NavLink>)}</nav>
   </div>;
 }
-
-export default AppShell;

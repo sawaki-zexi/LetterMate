@@ -22,8 +22,12 @@ export class ApiError extends Error {
   }
 }
 
-function compact(values: Record<string, string | undefined>) {
-  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
+function compact(values: Record<string, string | undefined>): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
 }
 
 async function apiRequest<T>(
