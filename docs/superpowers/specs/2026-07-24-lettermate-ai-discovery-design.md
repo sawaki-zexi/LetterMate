@@ -15,9 +15,9 @@ LetterMate 第一版聚焦一个完整且可真实运行的流程：用户输入
 - 搜索和分析使用真实的 OpenRouter 请求，而不是静态种子数据；
 - 每个展示条目至少有一个来自本次搜索 citation 的 HTTP(S) 原始链接；
 - 每个条目都有 `hot` 或 `quality` 分类、中文摘要和中文推荐理由；
-- 业务代码不依赖 OpenRouter、OpenAI 或任一具体模型 SDK；
+- 主题发现业务不直接依赖 OpenRouter HTTP 格式或具体模型；
 - 默认只配置 OpenRouter Key 即可运行，指定模型时只修改 `AI_MODEL`；
-- 后续接入 LiteLLM 时不重写主题发现、筛选、持久化或前端代码。
+- 首版只实现和验收 OpenRouter，不设计其他模型网关或供应商切换方案。
 
 ## 2. 范围与明确删除项
 
@@ -29,7 +29,7 @@ LetterMate 第一版聚焦一个完整且可真实运行的流程：用户输入
 - AI 去重、时效判断、`hot | quality` 分类、中文摘要和推荐理由；
 - 手动刷新主题及首次创建后的自动刷新；
 - 主题运行状态、真实错误和发现结果展示；
-- OpenAI-compatible `AiGateway`、OpenRouter 首版适配及 LiteLLM 配置兼容；
+- 内部 `AiGateway` 抽象与 OpenRouter 实现；
 - Fake Gateway 自动化测试与可选的真实 OpenRouter 冒烟测试。
 
 现有账号与用户数据隔离能力继续作为基础设施保留。主题和发现结果属于当前用户，跨用户不可读取或触发刷新。
@@ -49,23 +49,15 @@ LetterMate 第一版聚焦一个完整且可真实运行的流程：用户输入
 
 ## 3. 方案选择
 
-### 3.1 采用方案：OpenRouter 直连 + 内部统一抽象
+### 3.1 OpenRouter 直连 + 内部统一抽象
 
 首版由服务端直接调用 OpenRouter。OpenRouter 提供单一 OpenAI-compatible endpoint、`openrouter/auto` 模型路由和统一 Web Search，因而只需要一个 Key 就能完成模型调用与联网搜索。
 
-应用内部只依赖 `AiGateway` 接口。具体 HTTP 格式、OpenRouter 的 `plugins: [{ "id": "web" }]` 扩展、响应 annotations 和错误格式全部封装在适配器内。主题发现服务只接收规范化的结构化结果与 citations，不识别供应商名称。
+应用内部只依赖 `AiGateway` 接口。具体 HTTP 格式、OpenRouter 的 `plugins: [{ "id": "web" }]` 扩展、响应 annotations 和错误格式全部封装在 `OpenRouterAiGateway` 内。主题发现服务只接收规范化的结构化结果与 citations，不识别 OpenRouter 请求细节。
 
-### 3.2 保留方案：LiteLLM 作为后续网关
+### 3.2 范围边界
 
-当需要自托管路由、模型故障转移、预算、虚拟 Key 或集中审计时，可在 OpenRouter 前增加 LiteLLM Proxy。应用将 `AI_BASE_URL` 指向 LiteLLM，并把 `AI_MODEL` 设为网关中的固定别名，例如 `lettermate-main`。
-
-LiteLLM 兼容目标是 OpenAI 请求/响应外壳和固定模型别名。联网搜索仍是必需能力：LiteLLM 路由必须把 Web Search 扩展透传给支持它的上游，或在网关侧提供等价 citations。若所选路由不返回 citations，应用会拒绝展示该结果；不能把“OpenAI-compatible”误解为所有供应商都天然支持联网搜索。
-
-### 3.3 未采用方案
-
-- **首版自托管 LiteLLM：** 能力完整，但增加部署、升级、鉴权和故障排查成本；当前只有一个应用和一个 Key，没有足够收益。
-- **在业务中直接使用各厂商 SDK：** 上手快，但模型切换会渗透到提示词、错误处理、citation 解析和测试，违背统一抽象目标。
-- **单独接入搜索 API：** 可加强搜索控制，但会新增 Key、费用和结果融合链路；OpenRouter Web Search 已能完成首版闭环。
+本期只实现 OpenRouter，不增加其他模型网关、供应商适配器或独立搜索服务的配置、测试和验收要求。`AiGateway` 的目的仅是隔离主题发现业务、集中处理 OpenRouter 行为并支持 Fake 测试，不代表本期承诺跨供应商兼容。
 
 ## 4. 系统架构
 
@@ -80,10 +72,10 @@ NestJS API ---- TopicRepository / DiscoveryRepository ---- PostgreSQL
 Worker ---- TopicDiscoveryService ---- AiGateway
                                       |
                                       v
-                         OpenAiCompatibleAiGateway
+                           OpenRouterAiGateway
                                       |
                                       v
-                   OpenRouter / future LiteLLM Proxy
+                                  OpenRouter
 ```
 
 各单元职责如下：
@@ -92,9 +84,9 @@ Worker ---- TopicDiscoveryService ---- AiGateway
 - `DiscoveryRuns`：首次发现与手动刷新任务、并发保护和失败记录；
 - `TopicDiscoveryService`：编排语义扩展、联网发现、验证、去重和持久化；
 - `AiGateway`：向业务提供语义扩展与带 citations 的发现能力；
-- `OpenAiCompatibleAiGateway`：构造请求、启用 Web Search、解析结构化输出与 citations、规范化上游错误；
-- `Repositories`：持久化主题、运行状态和发现结果，不包含 AI 或供应商逻辑；
-- `Web`：只消费 API，不读取 Key，也不直接请求模型供应商。
+- `OpenRouterAiGateway`：构造请求、启用 Web Search、解析结构化输出与 citations、规范化 OpenRouter 错误；
+- `Repositories`：持久化主题、运行状态和发现结果，不包含 AI 或 OpenRouter 逻辑；
+- `Web`：只消费 API，不读取 Key，也不直接请求 OpenRouter。
 
 API 接到创建或刷新请求后只负责校验并入队，返回 `202` 或带初始任务状态的 `201`，不在长连接内等待模型。Worker 对同一主题最多运行一个发现任务；重复刷新合并为一个待执行任务。
 
@@ -111,12 +103,11 @@ interface AiGateway {
 
 `ExpandedTopic` 包含规范化关键词、去重后的中英文相关词和搜索表达。`DiscoveryResult` 同时包含候选条目和本次请求的规范化 citation URL 集合；其中 `DiscoveryCandidate` 包含标题、分类、中文摘要、中文推荐理由、发布时间以及一个或多个来源 URL。分开返回 citation 集合使服务层可以复核候选 URL，而不必信任模型输出或厂商适配器的隐式过滤。
 
-适配器内部使用 OpenAI-compatible `POST /chat/completions`。结构化输出由共享 Zod schema 校验；实现可使用供应商支持的 JSON Schema response format，但业务正确性不能依赖 TypeScript 类型断言。Web Search 开启时，OpenRouter 请求附加 `plugins: [{ "id": "web" }]`，并将返回的 `url_citation` annotations 规范化为 URL 集合。
+`OpenRouterAiGateway` 使用 OpenRouter 的 OpenAI-compatible `POST https://openrouter.ai/api/v1/chat/completions`。结构化输出由共享 Zod schema 校验；实现可使用 OpenRouter 支持的 JSON Schema response format，但业务正确性不能依赖 TypeScript 类型断言。Web Search 开启时，请求附加 `plugins: [{ "id": "web" }]`，并将返回的 `url_citation` annotations 规范化为 URL 集合。
 
 只有以下内容属于配置，不进入业务调用参数：
 
 ```env
-AI_BASE_URL=https://openrouter.ai/api/v1
 AI_API_KEY=sk-or-xxx
 AI_MODEL=openrouter/auto
 AI_WEB_SEARCH=true
@@ -125,9 +116,8 @@ AI_TIMEOUT_MS=60000
 
 配置规则：
 
-- `AI_BASE_URL`、`AI_MODEL` 和 `AI_WEB_SEARCH` 有以上默认值，因此本机只填写 `AI_API_KEY` 即可运行；
+- OpenRouter API 地址由 `OpenRouterAiGateway` 固定管理；`AI_MODEL` 和 `AI_WEB_SEARCH` 有以上默认值，因此本机只填写 `AI_API_KEY` 即可运行；
 - 更换 OpenRouter 模型只改 `AI_MODEL`，例如改成明确的模型标识；
-- 更换到 LiteLLM 时改 `AI_BASE_URL`、`AI_API_KEY` 和 `AI_MODEL` 别名，不修改业务代码；
 - Key 只由 API/Worker 服务端环境读取，禁止以 `VITE_` 前缀暴露；
 - 日志、错误响应、追踪属性和测试快照必须脱敏 Key 与 Authorization header；
 - `.env.example` 只包含占位值，真实 `.env` 不提交版本库。
@@ -229,7 +219,7 @@ AI 的分类是产品推荐判断，不是真实性认证。界面不得使用�
 
 所有常规测试使用可编程的 Fake `AiGateway`，不访问外网：
 
-- 配置默认值、缺 Key、脱敏和 LiteLLM base URL/模型别名；
+- 配置默认值、缺 Key、脱敏和 OpenRouter 模型选择；
 - 单关键词校验、用户隔离、重复主题和首次自动入队；
 - 扩展词保存、`hot | quality` 分类、中文字段和幂等去重；
 - citation 白名单验证、非法 URL 丢弃、全丢弃失败和显式空结果成功；
@@ -242,24 +232,23 @@ AI 的分类是产品推荐判断，不是真实性认证。界面不得使用�
 
 真实测试默认跳过，只有本机同时设置 `RUN_LIVE_AI_TESTS=1` 和 `AI_API_KEY` 时运行。测试创建一个稳定、非敏感的技术主题，并验证：
 
-- 请求确实经过配置的 `AI_BASE_URL`；
+- 请求确实到达 OpenRouter，并返回可识别的 OpenRouter 响应；
 - 至少一个有效结果含原始 HTTP(S) URL；
 - 每个结果都有 `hot | quality` 分类、非空中文摘要和推荐理由；
 - 响应 citation 能与保存的 `sourceUrls` 对应；
 - 测试输出和失败信息不泄露 Key。
 
-实时搜索结果不可断言固定标题、数量或具体模型供应商，以免把外部内容变化误判为代码回归。
+实时搜索结果不可断言固定标题、数量或 `openrouter/auto` 最终选择的上游模型，以免把外部内容变化误判为代码回归。
 
 ## 12. 验收标准
 
 1. 新用户只输入一个关键词即可创建主题，无需理解搜索语法或维护同义词。
 2. 在配置有效 OpenRouter Key 的本机环境中，系统完成真实联网搜索、AI 筛选、中文摘要和原始链接展示。
 3. 默认 `openrouter/auto` 下只配置 `AI_API_KEY` 可以运行；修改 `AI_MODEL` 后无需改代码即可使用另一个模型。
-4. 把 `AI_BASE_URL`、`AI_API_KEY` 和 `AI_MODEL` 改为可提供 Web Search citations 的 LiteLLM 配置后，业务与前端无需修改。
-5. 所有展示条目至少有一个本次请求返回的 citation URL；没有来源的 AI 内容绝不展示。
-6. UI、API、领域代码和数据库中不再存在三种可信状态、来源等级、证据计数或复杂监控规则。
-7. 上游失败、限流、缺 Key 和非法响应均显示可操作的真实错误，且不会删除上一次成功结果。
-8. Fake Gateway 测试全量通过；启用实时测试时真实结果满足 URL、分类和中文内容要求。
+4. 所有展示条目至少有一个本次请求返回的 citation URL；没有来源的 AI 内容绝不展示。
+5. UI、API、领域代码和数据库中不再存在三种可信状态、来源等级、证据计数或复杂监控规则。
+6. 上游失败、限流、缺 Key 和非法响应均显示可操作的真实错误，且不会删除上一次成功结果。
+7. Fake Gateway 测试全量通过；启用实时测试时真实结果满足 URL、分类和中文内容要求。
 
 ## 13. 实施边界
 
