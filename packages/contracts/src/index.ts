@@ -1,94 +1,52 @@
 import { z } from 'zod';
 
-export const trustStatusSchema = z.enum(['pending', 'confirmed', 'rejected']);
-export const trustLevelSchema = z.enum(['primary', 'secondary', 'interest']);
-export const prioritySchema = z.enum(['low', 'normal', 'high']);
+export const discoveryKindSchema = z.enum(['hot', 'quality']);
+export const runStatusSchema = z.enum(['queued', 'running', 'succeeded', 'failed']);
 
-export const monitorScopeSchema = z.discriminatedUnion('mode', [
-  z.object({ mode: z.literal('all') }),
-  z.object({ mode: z.literal('types'), sourceTypes: z.array(z.enum(['rss', 'web'])).min(1) }),
-  z.object({ mode: z.literal('sources'), sourceIds: z.array(z.string().min(1)).min(1) }),
-]);
-
-export const monitorRuleInputSchema = z.object({
-  name: z.string().trim().min(1).max(80),
-  keywords: z.array(z.string().trim().min(1)).min(1).max(20),
-  synonyms: z.array(z.string().trim().min(1)).max(40).default([]),
-  exclusions: z.array(z.string().trim().min(1)).max(40).default([]),
-  scope: monitorScopeSchema.default({ mode: 'all' }),
-  priority: prioritySchema.default('normal'),
-  notifyImmediately: z.boolean().default(false),
-  enabled: z.boolean().default(true),
+export const topicInputSchema = z.object({
+  keyword: z.string().trim().min(1).max(100),
 });
 
-export const monitorRuleSchema = monitorRuleInputSchema.extend({
+export const safeErrorSchema = z.object({
+  code: z.string().min(1),
+  message: z.string().min(1),
+});
+
+export const topicSchema = z.object({
   id: z.string().min(1),
   userId: z.string().min(1),
+  keyword: z.string().min(1).max(100),
+  expandedTerms: z.array(z.string().min(1)),
   createdAt: z.iso.datetime(),
-  updatedAt: z.iso.datetime(),
+  lastRunAt: z.iso.datetime().nullable(),
+  runStatus: runStatusSchema,
+  lastError: safeErrorSchema.nullable(),
 });
 
-export const eventEvidenceSchema = z.object({
+export const discoveryCandidateSchema = z.object({
+  kind: discoveryKindSchema,
+  title: z.string().trim().min(1).max(300),
+  summary: z.string().trim().min(1).max(1_000),
+  reason: z.string().trim().min(1).max(500),
+  sourceUrls: z.array(z.url()).min(1).max(8),
+  publishedAt: z.iso.datetime().nullable(),
+});
+
+export const discoveryResultSchema = z.object({
+  items: z.array(discoveryCandidateSchema).max(30),
+  citations: z.array(z.url()).max(100),
+});
+
+export const discoveryItemSchema = discoveryCandidateSchema.extend({
   id: z.string().min(1),
-  eventId: z.string().min(1),
-  sourceId: z.string().min(1),
-  sourceName: z.string().min(1),
-  sourceUrl: z.url(),
-  title: z.string().min(1),
-  publishedAt: z.iso.datetime(),
-  trustLevel: trustLevelSchema,
-  independenceGroup: z.string().min(1),
-  stance: z.enum(['supports', 'contradicts']),
+  topicId: z.string().min(1),
+  discoveredAt: z.iso.datetime(),
 });
 
-export const eventSchema = z.object({
-  id: z.string().min(1),
-  title: z.string().min(1),
-  subject: z.string().min(1),
-  action: z.string().min(1),
-  summary: z.string().nullable(),
-  summaryStatus: z.enum(['ready', 'unavailable']),
-  status: trustStatusSchema,
-  statusReason: z.string().min(1),
-  firstPublishedAt: z.iso.datetime(),
-  lastDiscoveredAt: z.iso.datetime(),
-  updatedAt: z.iso.datetime(),
-  sourceCount: z.number().int().nonnegative(),
-  matchedRuleIds: z.array(z.string()),
+export const discoveryJobDataSchema = z.object({
+  topicId: z.string().min(1),
+  userId: z.string().min(1),
 });
-
-export const notificationSchema = z.object({
-  id: z.string().min(1),
-  eventId: z.string().min(1),
-  type: z.enum(['confirmed', 'correction', 'evidence_update']),
-  status: z.enum(['unread', 'read']),
-  title: z.string().min(1),
-  createdAt: z.iso.datetime(),
-  readAt: z.iso.datetime().nullable(),
-});
-
-export const sourceSchema = z
-  .object({
-    id: z.string().min(1),
-    name: z.string().min(1),
-    type: z.enum(['rss', 'web']),
-    baseUrl: z.url().optional(),
-    trustLevel: trustLevelSchema,
-    complianceStatus: z.enum(['pending', 'allowed', 'blocked']),
-    independenceGroup: z.string().min(1).optional(),
-    enabled: z.boolean(),
-    lastSuccessAt: z.iso.datetime().nullable().optional(),
-    failureReason: z.string().nullable().optional(),
-  })
-  .superRefine((source, context) => {
-    if (source.complianceStatus !== 'allowed' && source.enabled) {
-      context.addIssue({
-        code: 'custom',
-        path: ['enabled'],
-        message: 'Only allowed sources can be enabled',
-      });
-    }
-  });
 
 export const apiErrorSchema = z.object({
   code: z.string().min(1),
@@ -97,11 +55,12 @@ export const apiErrorSchema = z.object({
   traceId: z.string().min(1),
 });
 
-export type MonitorRuleInput = z.infer<typeof monitorRuleInputSchema>;
-export type MonitorRule = z.infer<typeof monitorRuleSchema>;
-export type Event = z.infer<typeof eventSchema>;
-export type EventEvidence = z.infer<typeof eventEvidenceSchema>;
-export type Notification = z.infer<typeof notificationSchema>;
-export type Source = z.infer<typeof sourceSchema>;
-export type TrustStatus = z.infer<typeof trustStatusSchema>;
-export type TrustLevel = z.infer<typeof trustLevelSchema>;
+export type TopicInput = z.infer<typeof topicInputSchema>;
+export type Topic = z.infer<typeof topicSchema>;
+export type DiscoveryCandidate = z.infer<typeof discoveryCandidateSchema>;
+export type DiscoveryResult = z.infer<typeof discoveryResultSchema>;
+export type DiscoveryItem = z.infer<typeof discoveryItemSchema>;
+export type DiscoveryKind = z.infer<typeof discoveryKindSchema>;
+export type DiscoveryJobData = z.infer<typeof discoveryJobDataSchema>;
+export type SafeError = z.infer<typeof safeErrorSchema>;
+export type RunStatus = z.infer<typeof runStatusSchema>;

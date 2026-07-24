@@ -1,45 +1,48 @@
 import { describe, expect, it } from 'vitest';
 import {
-  eventSchema,
-  monitorRuleInputSchema,
-  sourceSchema,
+  discoveryResultSchema,
+  topicInputSchema,
 } from './index.js';
 
-describe('public contracts', () => {
-  it('rejects a monitor rule without a keyword', () => {
-    expect(() =>
-      monitorRuleInputSchema.parse({
-        name: 'AI',
-        keywords: [],
-        synonyms: [],
-        exclusions: [],
-        scope: { mode: 'all' },
-        priority: 'normal',
-        notifyImmediately: false,
-      }),
-    ).toThrow();
+describe('AI discovery contracts', () => {
+  it('accepts exactly one trimmed keyword', () => {
+    expect(topicInputSchema.parse({ keyword: '  AI Agent  ' })).toEqual({ keyword: 'AI Agent' });
+    expect(() => topicInputSchema.parse({ keyword: '' })).toThrow();
+    expect(() => topicInputSchema.parse({ keyword: 'x'.repeat(101) })).toThrow();
   });
 
-  it('requires evidence-backed event timestamps', () => {
-    expect(() =>
-      eventSchema.parse({
-        id: 'event-1',
-        title: 'Release',
-        status: 'confirmed',
-        firstPublishedAt: 'not-a-date',
-      }),
-    ).toThrow();
+  it('requires hot or quality items with summary, reason and source URLs', () => {
+    const result = discoveryResultSchema.parse({
+      citations: ['https://example.com/release'],
+      items: [
+        {
+          kind: 'quality',
+          title: 'Agent release',
+          summary: '这是中文摘要。',
+          reason: '内容提供了完整实现细节。',
+          sourceUrls: ['https://example.com/release'],
+          publishedAt: '2026-07-24T06:30:00.000Z',
+        },
+      ],
+    });
+
+    expect(result.items[0]?.kind).toBe('quality');
   });
 
-  it('does not allow a blocked source to appear enabled', () => {
+  it('rejects obsolete trust classifications', () => {
     expect(() =>
-      sourceSchema.parse({
-        id: 'source-1',
-        name: 'Blocked feed',
-        type: 'rss',
-        trustLevel: 'secondary',
-        complianceStatus: 'blocked',
-        enabled: true,
+      discoveryResultSchema.parse({
+        citations: ['https://example.com/release'],
+        items: [
+          {
+            kind: 'confirmed',
+            title: 'Agent release',
+            summary: '这是中文摘要。',
+            reason: '错误的旧状态。',
+            sourceUrls: ['https://example.com/release'],
+            publishedAt: null,
+          },
+        ],
       }),
     ).toThrow();
   });
