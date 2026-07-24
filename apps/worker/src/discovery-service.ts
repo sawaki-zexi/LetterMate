@@ -12,9 +12,9 @@ import {
 } from '@lettermate/domain';
 import {
   Prisma,
-  PrismaClient,
   type Topic as PrismaTopic,
 } from '@prisma/client';
+import type { PrismaClient } from '@prisma/client';
 import { AiGatewayError, type AiGateway } from './ai-gateway.js';
 
 export interface DiscoveryRepository {

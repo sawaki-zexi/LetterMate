@@ -9,23 +9,20 @@ import {
   Body,
   ConflictException,
   Controller,
-  DynamicModule,
   Get,
   Headers,
   HttpCode,
   Inject,
   Injectable,
   Module,
-  NestModule,
   NotFoundException,
-  OnModuleDestroy,
   Param,
   Post,
   Query,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
-import type { INestApplication } from '@nestjs/common';
+import type { DynamicModule, INestApplication, NestModule, OnModuleDestroy } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';

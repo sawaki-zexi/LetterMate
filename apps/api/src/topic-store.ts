@@ -10,10 +10,10 @@ import {
 import { canonicalizeUrl, normalizeKeyword } from '@lettermate/domain';
 import {
   Prisma,
-  PrismaClient,
   type DiscoveryItem as PrismaDiscoveryItem,
   type Topic as PrismaTopic,
 } from '@prisma/client';
+import type { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 
 export class TopicAlreadyExistsError extends Error {

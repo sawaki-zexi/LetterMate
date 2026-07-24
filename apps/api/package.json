@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/main.ts",
+    "dev:e2e": "tsx src/e2e-main.ts",
     "build": "tsc -b tsconfig.json",
     "start": "node dist/main.js"
   },
