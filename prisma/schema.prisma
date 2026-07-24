@@ -7,47 +7,26 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum TrustLevel {
-  primary
-  secondary
-  interest
+enum DiscoveryKind {
+  hot
+  quality
 }
 
-enum TrustStatus {
-  pending
-  confirmed
-  rejected
-}
-
-enum ComplianceStatus {
-  pending
-  allowed
-  blocked
-}
-
-enum SourceType {
-  rss
-  web
-}
-
-enum NotificationStatus {
-  unread
-  read
+enum RunStatus {
+  queued
+  running
+  succeeded
+  failed
 }
 
 model User {
-  id                String             @id @default(uuid())
-  email             String             @unique
-  passwordHash      String
-  timezone          String             @default("UTC")
-  quietHoursStart   String?
-  quietHoursEnd     String?
-  createdAt         DateTime           @default(now())
-  sessions          Session[]
-  monitorRules      MonitorRule[]
-  ruleMatches       RuleMatch[]
-  notifications     Notification[]
-  pushSubscriptions PushSubscription[]
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  timezone     String    @default("UTC")
+  createdAt    DateTime  @default(now())
+  sessions     Session[]
+  topics       Topic[]
 }
 
 model Session {
@@ -57,177 +36,41 @@ model Session {
   expiresAt DateTime
   revokedAt DateTime?
   user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
   @@index([userId, expiresAt])
 }
 
-model MonitorRule {
-  id                String      @id @default(uuid())
+model Topic {
+  id                String          @id @default(uuid())
   userId            String
-  name              String
-  keywords          String[]
-  synonyms          String[]
-  exclusions        String[]
-  scope             Json
-  priority          String
-  notifyImmediately Boolean     @default(false)
-  enabled           Boolean     @default(true)
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
-  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  matches           RuleMatch[]
-  @@index([userId, enabled])
+  keyword           String
+  normalizedKeyword String
+  expandedTerms     String[]        @default([])
+  createdAt         DateTime        @default(now())
+  lastRunAt         DateTime?
+  runStatus         RunStatus       @default(queued)
+  lastError         Json?
+  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items             DiscoveryItem[]
+
+  @@unique([userId, normalizedKeyword])
+  @@index([userId, createdAt])
 }
 
-model Source {
-  id                String           @id @default(uuid())
-  type              SourceType
-  name              String
-  baseUrl            String
-  trustLevel        TrustLevel
-  independenceGroup String
-  complianceStatus  ComplianceStatus @default(pending)
-  enabled           Boolean          @default(false)
-  policy            Json
-  contents          CandidateContent[]
-  runs              CollectorRun[]
-  @@unique([type, baseUrl])
-  @@index([complianceStatus, enabled])
-}
+model DiscoveryItem {
+  id                  String        @id @default(uuid())
+  topicId             String
+  kind                DiscoveryKind
+  title               String
+  summary             String
+  reason              String
+  sourceUrls          String[]
+  canonicalPrimaryUrl String
+  publishedAt         DateTime?
+  discoveredAt        DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  topic               Topic         @relation(fields: [topicId], references: [id], onDelete: Cascade)
 
-model CollectorRun {
-  id            String   @id @default(uuid())
-  sourceId      String
-  startedAt     DateTime
-  finishedAt    DateTime?
-  result        String
-  httpStatus    Int?
-  itemCount     Int      @default(0)
-  retryCount    Int      @default(0)
-  errorCategory String?
-  errorMessage  String?
-  nextRunAt     DateTime?
-  traceId       String
-  source        Source   @relation(fields: [sourceId], references: [id], onDelete: Cascade)
-  @@index([sourceId, startedAt])
-}
-
-model CandidateContent {
-  id            String          @id @default(uuid())
-  sourceId      String
-  canonicalUrl  String
-  fingerprint   String
-  title         String
-  author        String?
-  publishedAt   DateTime
-  fetchedAt     DateTime        @default(now())
-  body          String
-  language      String?
-  metadata      Json
-  source        Source          @relation(fields: [sourceId], references: [id])
-  evidence      EventEvidence[]
-  @@unique([sourceId, canonicalUrl])
-  @@index([fingerprint])
-}
-
-model Event {
-  id                String               @id @default(uuid())
-  subject           String
-  action            String
-  windowKey         String
-  title             String
-  status            TrustStatus          @default(pending)
-  statusReason      String
-  firstPublishedAt  DateTime
-  lastDiscoveredAt  DateTime
-  updatedAt         DateTime             @updatedAt
-  summary           String?
-  summaryStatus     String               @default("unavailable")
-  summaryVersion    Int                  @default(0)
-  evidence          EventEvidence[]
-  statusHistory     EventStatusHistory[]
-  matches           RuleMatch[]
-  notifications     Notification[]
-  @@index([status, updatedAt])
-  @@index([subject, action, windowKey])
-}
-
-model EventEvidence {
-  id              String           @id @default(uuid())
-  eventId         String
-  contentId       String
-  stance          String
-  evidenceLevel   TrustLevel
-  independenceKey String
-  confidence      Float
-  event           Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  content         CandidateContent @relation(fields: [contentId], references: [id])
-  @@unique([eventId, contentId])
-  @@index([eventId, independenceKey])
-}
-
-model EventStatusHistory {
-  id               String      @id @default(uuid())
-  eventId          String
-  previousStatus   TrustStatus
-  nextStatus       TrustStatus
-  ruleVersion      String
-  reason           String
-  evidenceSnapshot Json
-  changedAt        DateTime    @default(now())
-  event             Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  @@index([eventId, changedAt])
-}
-
-model RuleMatch {
-  id             String      @id @default(uuid())
-  userId         String
-  monitorRuleId  String
-  eventId        String
-  reason         String
-  firstMatchedAt DateTime    @default(now())
-  lastMatchedAt  DateTime    @updatedAt
-  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  monitorRule    MonitorRule @relation(fields: [monitorRuleId], references: [id], onDelete: Cascade)
-  event          Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  @@unique([userId, monitorRuleId, eventId])
-  @@index([userId, lastMatchedAt])
-}
-
-model Notification {
-  id          String             @id @default(uuid())
-  userId      String
-  eventId     String
-  type        String
-  status      NotificationStatus @default(unread)
-  title       String
-  dedupKey    String             @unique
-  createdAt   DateTime           @default(now())
-  deliveredAt DateTime?
-  readAt      DateTime?
-  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
-  event       Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
-  @@index([userId, status, createdAt])
-}
-
-model PushSubscription {
-  id             String    @id @default(uuid())
-  userId         String
-  endpointHash   String    @unique
-  encryptedValue String
-  createdAt      DateTime  @default(now())
-  invalidatedAt  DateTime?
-  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  @@index([userId, invalidatedAt])
-}
-
-model OutboxMessage {
-  id           String    @id @default(uuid())
-  type         String
-  aggregateId  String
-  payload      Json
-  createdAt    DateTime  @default(now())
-  dispatchedAt DateTime?
-  retryCount   Int       @default(0)
-  lastError    String?
-  @@index([dispatchedAt, createdAt])
+  @@unique([topicId, canonicalPrimaryUrl])
+  @@index([topicId, publishedAt, discoveredAt])
 }
