@@ -1,0 +1,15 @@
+{
+  "name": "@lettermate/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -b tsconfig.json",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@lettermate/contracts": "*",
+    "@lettermate/domain": "*"
+  }
+}

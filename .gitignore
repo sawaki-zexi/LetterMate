@@ -1,2 +1,11 @@
 .superpowers/
-
+node_modules/
+dist/
+dist-types/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

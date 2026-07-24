@@ -8,6 +8,10 @@
 
 **Tech Stack:** TypeScript, npm workspaces, React, Vite, NestJS, Prisma, PostgreSQL, Redis, BullMQ, Zod, Vitest, Testing Library, Supertest, Playwright, Docker Compose.
 
+**Execution result (2026-07-24):** The runnable local vertical slice is implemented: shared contracts and domain rules, an isolated NestJS API adapter, Prisma schema, RSS/HTML parsing and worker safety rules, responsive Web workspace, Service Worker and Push subscription flow, plus desktop/tablet/mobile acceptance tests.
+
+**Production integrations remaining:** Replace the deterministic in-memory API repository with Prisma migrations and repositories; run BullMQ scheduling and the transactional Outbox dispatcher; add production password/session, Origin/CSRF and OpenAPI wiring; configure encrypted Push storage and live VAPID delivery; add DNS-resolution checks and approved-source schedules for external collectors.
+
 ---
 
 ## File Map
