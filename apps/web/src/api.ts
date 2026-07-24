@@ -1,37 +1,65 @@
 import {
-  eventEvidenceSchema,
-  eventSchema,
-  monitorRuleInputSchema,
-  monitorRuleSchema,
-  notificationSchema,
-  sourceSchema,
-  type MonitorRuleInput,
+  apiErrorSchema,
+  discoveryItemSchema,
+  discoveryKindSchema,
+  topicInputSchema,
+  topicSchema,
+  type DiscoveryKind,
+  type TopicInput,
 } from '@lettermate/contracts';
 import { z } from 'zod';
 
 const headers = { 'content-type': 'application/json', 'x-user-id': 'user-a' };
 
-async function apiRequest<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
-  const response = await fetch(`/api/v1${path}`, { ...init, headers: { ...headers, ...init?.headers } });
+export class ApiError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+function compact(values: Record<string, string | undefined>) {
+  return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined));
+}
+
+async function apiRequest<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  init?: RequestInit,
+): Promise<T> {
+  const response = await fetch(`/api/v1${path}`, {
+    ...init,
+    headers: { ...headers, ...init?.headers },
+  });
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ message: '请求失败' }));
-    throw new Error(error.message ?? `请求失败 (${response.status})`);
+    const raw = await response.json().catch(() => null);
+    const parsed = apiErrorSchema.safeParse(raw);
+    if (parsed.success) {
+      throw new ApiError(parsed.data.code, parsed.data.message, response.status);
+    }
+    throw new ApiError('HTTP_ERROR', `请求失败 (${response.status})`, response.status);
   }
   return schema.parse(await response.json());
 }
 
 export const api = {
-  events: () => apiRequest('/events', z.array(eventSchema)),
-  event: (id: string) => apiRequest(`/events/${id}`, z.object({ event: eventSchema, evidence: z.array(eventEvidenceSchema) })),
-  rules: () => apiRequest('/monitor-rules', z.array(monitorRuleSchema)),
-  createRule: (input: MonitorRuleInput) => apiRequest('/monitor-rules', monitorRuleSchema, {
-    method: 'POST', body: JSON.stringify(monitorRuleInputSchema.parse(input)),
+  topics: () => apiRequest('/topics', z.array(topicSchema)),
+  createTopic: (input: TopicInput) => apiRequest('/topics', topicSchema, {
+    method: 'POST',
+    body: JSON.stringify(topicInputSchema.parse(input)),
   }),
-  notifications: () => apiRequest('/notifications', z.array(notificationSchema)),
-  readNotification: (id: string) => apiRequest(`/notifications/${id}/read`, notificationSchema, { method: 'POST' }),
-  sources: () => apiRequest('/sources', z.array(sourceSchema)),
-  createPushSubscription: (input: { endpoint: string; keys: { p256dh: string; auth: string } }) =>
-    apiRequest('/push-subscriptions', z.object({ id: z.string(), endpoint: z.url(), createdAt: z.iso.datetime() }).passthrough(), {
-      method: 'POST', body: JSON.stringify(input),
-    }),
+  refreshTopic: (id: string) => apiRequest(`/topics/${encodeURIComponent(id)}/refresh`, topicSchema, { method: 'POST' }),
+  feed: (filter: { topicId?: string; kind?: DiscoveryKind } = {}) => {
+    const query = new URLSearchParams(compact({
+      topicId: filter.topicId,
+      kind: filter.kind && discoveryKindSchema.parse(filter.kind),
+    }));
+    const suffix = query.size ? `?${query.toString()}` : '';
+    return apiRequest(`/feed${suffix}`, z.array(discoveryItemSchema));
+  },
+  item: (id: string) => apiRequest(`/items/${encodeURIComponent(id)}`, discoveryItemSchema),
 };
