@@ -3,6 +3,7 @@
 node_modules/
 dist/
 dist-types/
+.vite/
 coverage/
 playwright-report/
 test-results/

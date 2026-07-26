@@ -1,6 +1,7 @@
 # LetterMate
-
 LetterMate is an AI discovery workspace. Enter one topic keyword; the worker asks OpenRouter to expand Chinese and English search terms, searches the web, classifies findings as `hot` or `quality`, and writes Chinese summaries and reasons with the original cited URLs.
+
+个人订阅助手，用于筛选个人关注订阅的内容，定时发给用户。
 
 ## OpenRouter configuration
 
