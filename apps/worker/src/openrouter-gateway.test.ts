@@ -63,6 +63,18 @@ describe('OpenRouterAiGateway', () => {
     expect(url).toBe('https://openrouter.ai/api/v1/chat/completions');
     expect(JSON.parse(String(init.body))).toMatchObject({
       model: 'openrouter/auto',
+      max_tokens: 8_192,
+      provider: { require_parameters: true },
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'discovery_result',
+          strict: true,
+          schema: {
+            required: ['items'],
+          },
+        },
+      },
       plugins: [{ id: 'web' }],
     });
     expect(init.headers).toMatchObject({ authorization: 'Bearer secret-key' });
@@ -83,6 +95,20 @@ describe('OpenRouterAiGateway', () => {
     expect(result.terms).toContain('智能体');
     const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
     expect(body.plugins).toBeUndefined();
+    expect(body).toMatchObject({
+      max_tokens: 1_024,
+      provider: { require_parameters: true },
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'topic_expansion',
+          strict: true,
+          schema: {
+            required: ['terms', 'searchQueries'],
+          },
+        },
+      },
+    });
     expect(body.messages.at(-1).content).toContain('AI Agent');
   });
 

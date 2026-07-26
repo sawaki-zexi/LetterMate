@@ -20,6 +20,61 @@ const discoveryContentSchema = z.object({
   items: z.array(discoveryCandidateSchema).max(30),
 });
 
+const expansionJsonSchema = {
+  type: 'object',
+  properties: {
+    terms: {
+      type: 'array',
+      items: { type: 'string', minLength: 1, maxLength: 100 },
+      minItems: 1,
+      maxItems: 20,
+    },
+    searchQueries: {
+      type: 'array',
+      items: { type: 'string', minLength: 1, maxLength: 200 },
+      minItems: 1,
+      maxItems: 12,
+    },
+  },
+  required: ['terms', 'searchQueries'],
+  additionalProperties: false,
+} as const;
+
+const discoveryJsonSchema = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      maxItems: 30,
+      items: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['hot', 'quality'] },
+          title: { type: 'string', minLength: 1, maxLength: 300 },
+          summary: { type: 'string', minLength: 1, maxLength: 1_000 },
+          reason: { type: 'string', minLength: 1, maxLength: 500 },
+          sourceUrls: {
+            type: 'array',
+            items: { type: 'string', format: 'uri' },
+            minItems: 1,
+            maxItems: 8,
+          },
+          publishedAt: {
+            anyOf: [
+              { type: 'string', format: 'date-time' },
+              { type: 'null' },
+            ],
+          },
+        },
+        required: ['kind', 'title', 'summary', 'reason', 'sourceUrls', 'publishedAt'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['items'],
+  additionalProperties: false,
+} as const;
+
 const openRouterMessageSchema = z.object({
   role: z.string().optional(),
   content: z.string(),
@@ -44,6 +99,12 @@ type ChatMessage = {
 };
 
 type OpenRouterMessage = z.infer<typeof openRouterMessageSchema>;
+
+interface StructuredOutput {
+  name: string;
+  schema: Record<string, unknown>;
+  maxTokens: number;
+}
 
 export interface OpenRouterGatewayConfig {
   apiKey: string;
@@ -120,7 +181,16 @@ export class OpenRouterAiGateway implements AiGateway {
         content: `Expand this single topic keyword: ${input.keyword}`,
       },
     ];
-    const { data } = await this.completeStructured(messages, expansionSchema, false);
+    const { data } = await this.completeStructured(
+      messages,
+      expansionSchema,
+      false,
+      {
+        name: 'topic_expansion',
+        schema: expansionJsonSchema,
+        maxTokens: 1_024,
+      },
+    );
     return {
       terms: unique(data.terms),
       searchQueries: unique(data.searchQueries),
@@ -153,6 +223,11 @@ export class OpenRouterAiGateway implements AiGateway {
       messages,
       discoveryContentSchema,
       true,
+      {
+        name: 'discovery_result',
+        schema: discoveryJsonSchema,
+        maxTokens: 8_192,
+      },
     );
     const citations = unique(
       message.annotations.flatMap((annotation) => {
@@ -167,8 +242,9 @@ export class OpenRouterAiGateway implements AiGateway {
     messages: ChatMessage[],
     schema: z.ZodType<T>,
     useWeb: boolean,
+    output: StructuredOutput,
   ): Promise<{ data: T; message: OpenRouterMessage }> {
-    const first = await this.complete(messages, useWeb);
+    const first = await this.complete(messages, useWeb, output);
     const firstData = parseStructured(first.content, schema);
     if (firstData !== null) return { data: firstData, message: first };
 
@@ -181,7 +257,7 @@ export class OpenRouterAiGateway implements AiGateway {
           'The previous response was invalid. Return only valid JSON matching the requested object shape, with every required field and no Markdown.',
       },
     ];
-    const second = await this.complete(correction, useWeb);
+    const second = await this.complete(correction, useWeb, output);
     const secondData = parseStructured(second.content, schema);
     if (secondData !== null) return { data: secondData, message: second };
 
@@ -192,7 +268,11 @@ export class OpenRouterAiGateway implements AiGateway {
     );
   }
 
-  private async complete(messages: ChatMessage[], useWeb: boolean): Promise<OpenRouterMessage> {
+  private async complete(
+    messages: ChatMessage[],
+    useWeb: boolean,
+    output: StructuredOutput,
+  ): Promise<OpenRouterMessage> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
@@ -207,6 +287,16 @@ export class OpenRouterAiGateway implements AiGateway {
           model: this.config.model,
           messages,
           temperature: 0.1,
+          max_tokens: output.maxTokens,
+          provider: { require_parameters: true },
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: output.name,
+              strict: true,
+              schema: output.schema,
+            },
+          },
           ...(useWeb && this.config.webSearch ? { plugins: [{ id: 'web' }] } : {}),
         }),
       });

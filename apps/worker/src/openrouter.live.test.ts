@@ -19,11 +19,11 @@ describe.skipIf(!enabled)('OpenRouter live discovery', () => {
       webSearch: true,
       timeoutMs: 120_000,
     });
-    const expanded = await gateway.expandTopic({ keyword: 'TypeScript' });
+    const expanded = await gateway.expandTopic({ keyword: '人工智能' });
     const result = await gateway.discover({
-      keyword: 'TypeScript',
+      keyword: '人工智能',
       expandedTerms: [...expanded.terms, ...expanded.searchQueries],
-      lookbackDays: 7,
+      lookbackDays: 30,
       now: new Date().toISOString(),
     });
     const valid = validateDiscoveryResult(result);
