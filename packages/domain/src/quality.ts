@@ -16,8 +16,29 @@ export interface RejectCandidateOptions {
 }
 
 const nonContentPath = /^\/(?:search|tag|tags|category|categories|login|signin)(?:\/|$)/i;
-const concreteSocialSignal =
-  /\b(?:release(?:d)?|launch(?:ed)?|announce(?:d)?|publish(?:ed)?|available|version)\b|\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b|https?:\/\/|发布|上线|推出|更新|开源|宣布/iu;
+const englishReleaseAction =
+  /\b(?:release(?:d)?|launch(?:ed)?|announce(?:d)?|publish(?:ed)?|available|open[\s-]?source(?:d)?)\b/iu;
+const chineseReleaseAction = /发布|上线|推出|更新|开源|宣布/u;
+const numberedVersion =
+  /\b(?:v|version)\s*\d+(?:\.\d+)*\b|\d+(?:\.\d+)*\s*版本/iu;
+const concreteDate = /\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b/u;
+const concreteLink = /https?:\/\//iu;
+
+function hasConcreteSocialSignal(text: string): boolean {
+  if (numberedVersion.test(text) || concreteDate.test(text) || concreteLink.test(text)) {
+    return true;
+  }
+  if (!englishReleaseAction.test(text) && !chineseReleaseAction.test(text)) return false;
+
+  const context = text
+    .replace(
+      /\b(?:release(?:d)?|launch(?:ed)?|announce(?:d)?|publish(?:ed)?|available|open[\s-]?source(?:d)?|today|now|soon|tbd)\b/giu,
+      '',
+    )
+    .replace(/发布|上线|推出|更新|开源|宣布|今天|正式|即将/gu, '')
+    .replace(/[\p{P}\p{S}\s]+/gu, '');
+  return [...context].length >= 2;
+}
 
 function isFirstPartyShortPost(candidate: ValidatedSourceCandidate, text: string): boolean {
   return (
@@ -25,7 +46,7 @@ function isFirstPartyShortPost(candidate: ValidatedSourceCandidate, text: string
     candidate.proof.kind === 'api_record' &&
     candidate.externalId !== null &&
     (candidate.authorHandle !== null || candidate.authorName !== null) &&
-    concreteSocialSignal.test(text)
+    hasConcreteSocialSignal(text)
   );
 }
 
@@ -125,9 +146,9 @@ export function selectDiverseCandidates(
   const normalizedLimit = Math.max(0, Math.floor(limit));
   if (normalizedLimit === 0) return [];
   const bucketCount = new Set(candidates.map(diversityBucket)).size;
-  if (bucketCount < 3) return candidates.slice(0, normalizedLimit);
+  if (normalizedLimit < 3 || bucketCount < 3) return candidates.slice(0, normalizedLimit);
 
-  const perBucketLimit = Math.ceil(normalizedLimit * 0.4);
+  const perBucketLimit = Math.max(1, Math.floor(normalizedLimit * 0.4));
   const selectedIndices = new Set<number>();
   const selectedPerBucket = new Map<string, number>();
   for (const [index, candidate] of candidates.entries()) {

@@ -81,6 +81,54 @@ describe('deterministic candidate rejection', () => {
     },
   );
 
+  it('rejects a short social post with a bare version token', () => {
+    const candidate = makeCandidate({
+      connectorId: 'social-api',
+      sourceType: 'social',
+      platform: 'Social',
+      externalId: 'post-tbd',
+      title: null,
+      content: 'Version TBD.',
+      excerpt: null,
+      authorName: 'Project Team',
+      authorHandle: '@project',
+      proof: {
+        kind: 'api_record',
+        connectorId: 'social-api',
+        externalId: 'post-tbd',
+      },
+    });
+
+    expect(rejectCandidate(candidate)).toEqual({
+      rejected: true,
+      reason: 'INSUFFICIENT_CONTENT',
+    });
+  });
+
+  it.each(['v2.', 'Version 2.1.', '2.1 版本。'])(
+    'keeps a short social post with a concrete numbered version: %s',
+    (content) => {
+      const candidate = makeCandidate({
+        connectorId: 'social-api',
+        sourceType: 'social',
+        platform: 'Social',
+        externalId: `post-${content}`,
+        title: null,
+        content,
+        excerpt: null,
+        authorName: 'Project Team',
+        authorHandle: '@project',
+        proof: {
+          kind: 'api_record',
+          connectorId: 'social-api',
+          externalId: `post-${content}`,
+        },
+      });
+
+      expect(rejectCandidate(candidate)).toEqual({ rejected: false, reason: null });
+    },
+  );
+
   it.each(['2026-07-19T23:59:59.000Z', '2026-07-28T00:00:00.001Z'])(
     'rejects a candidate outside the requested time window: %s',
     (publishedAt) => {
@@ -257,6 +305,23 @@ describe('candidate diversity selection', () => {
         ),
       ),
     ).toBe(2);
+  });
+
+  it('uses a floor-based 40 percent cap for six diverse results', () => {
+    const candidates = ['Alpha', 'Beta', 'Gamma'].flatMap((platform) =>
+      ['1', '2', '3', '4'].map((id) =>
+        makeSocialCandidate(platform, `${platform.toLocaleLowerCase()}${id}`),
+      ),
+    );
+
+    const selected = selectDiverseCandidates(candidates, 6);
+    const counts = ['Alpha', 'Beta', 'Gamma'].map(
+      (platform) => selected.filter((candidate) => candidate.platform === platform).length,
+    );
+
+    expect(selected).toHaveLength(6);
+    expect(counts).toEqual([2, 2, 2]);
+    expect(Math.max(...counts)).toBe(Math.floor(6 * 0.4));
   });
 
   it('relaxes the cap only to fill a result shortage while retaining order', () => {
