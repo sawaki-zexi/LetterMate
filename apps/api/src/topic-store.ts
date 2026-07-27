@@ -30,7 +30,7 @@ export interface TopicStore {
   queueRefresh(userId: string, id: string): Promise<Topic | null>;
   listFeed(
     userId: string,
-    filter: { topicId?: string; kind?: DiscoveryKind },
+    filter: { topicId?: string; kind?: DiscoveryKind; since?: Date },
   ): Promise<DiscoveryItem[]>;
   findItem(userId: string, id: string): Promise<DiscoveryItem | null>;
   close(): Promise<void>;
@@ -135,11 +135,17 @@ export class PrismaTopicStore implements TopicStore {
 
   async listFeed(
     userId: string,
-    filter: { topicId?: string; kind?: DiscoveryKind },
+    filter: { topicId?: string; kind?: DiscoveryKind; since?: Date },
   ): Promise<DiscoveryItem[]> {
     const items = await this.prisma.discoveryItem.findMany({
       where: {
         ...(filter.kind ? { kind: filter.kind } : {}),
+        ...(filter.since ? {
+          OR: [
+            { publishedAt: { gte: filter.since } },
+            { publishedAt: null, discoveredAt: { gte: filter.since } },
+          ],
+        } : {}),
         topic: {
           userId,
           ...(filter.topicId ? { id: filter.topicId } : {}),
@@ -216,7 +222,7 @@ export class MemoryTopicStore implements TopicStore {
 
   async listFeed(
     userId: string,
-    filter: { topicId?: string; kind?: DiscoveryKind },
+    filter: { topicId?: string; kind?: DiscoveryKind; since?: Date },
   ): Promise<DiscoveryItem[]> {
     const topicIds = new Set(
       this.topics.filter((topic) => topic.userId === userId).map((topic) => topic.id),
@@ -226,7 +232,8 @@ export class MemoryTopicStore implements TopicStore {
         (item) =>
           topicIds.has(item.topicId) &&
           (!filter.topicId || item.topicId === filter.topicId) &&
-          (!filter.kind || item.kind === filter.kind),
+          (!filter.kind || item.kind === filter.kind) &&
+          (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()),
       )
       .sort((left, right) =>
         (right.publishedAt ?? right.discoveredAt).localeCompare(
@@ -262,7 +269,11 @@ export class MemoryTopicStore implements TopicStore {
     return structuredClone(topic);
   }
 
-  seedItem(topicId: string, kind: DiscoveryKind): DiscoveryItem {
+  seedItem(
+    topicId: string,
+    kind: DiscoveryKind,
+    timestamps: { publishedAt?: string | null; discoveredAt?: string } = {},
+  ): DiscoveryItem {
     const id = randomUUID();
     const item: DiscoveryItem = {
       id,
@@ -272,8 +283,8 @@ export class MemoryTopicStore implements TopicStore {
       summary: '中文摘要',
       reason: kind === 'hot' ? '近期讨论集中' : '内容深入且可复现',
       sourceUrls: [`https://example.com/${id}`],
-      publishedAt: null,
-      discoveredAt: new Date().toISOString(),
+      publishedAt: timestamps.publishedAt ?? null,
+      discoveredAt: timestamps.discoveredAt ?? new Date().toISOString(),
       sourceType: 'web',
       platform: 'Web',
       authorName: null,

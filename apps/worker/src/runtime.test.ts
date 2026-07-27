@@ -40,6 +40,7 @@ describe('worker connector runtime', () => {
       YOUTUBE_API_KEY: 'youtube-test-key',
       REDDIT_CLIENT_ID: 'reddit-client',
       REDDIT_CLIENT_SECRET: 'reddit-secret',
+      DISCOVERY_RSS_FEED_URLS: 'https://example.com/feed.xml',
     }));
     const enabled = new Set(
       connectors.filter((connector) => connector.isEnabled()).map(({ id }) => id),
@@ -47,6 +48,7 @@ describe('worker connector runtime', () => {
 
     expect([...enabled]).toEqual(expect.arrayContaining([
       'twitterapi-io',
+      'rss',
       'search-brave',
       'youtube',
       'reddit',

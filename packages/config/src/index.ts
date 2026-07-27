@@ -10,6 +10,13 @@ const optionalUrl = z.preprocess(
   z.url().optional(),
 );
 
+const rssFeedUrls = z.preprocess(
+  (value) => typeof value === 'string'
+    ? value.split(',').map((url) => url.trim()).filter(Boolean)
+    : value,
+  z.array(z.url()).default([]),
+);
+
 const baseConfigSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
@@ -33,6 +40,7 @@ const baseConfigSchema = z.object({
   SEARCH_PROVIDER: optionalNonEmptyString,
   SEARCH_API_KEY: optionalNonEmptyString,
   SEARCH_API_BASE_URL: optionalUrl,
+  DISCOVERY_RSS_FEED_URLS: rssFeedUrls,
   DISCOVERY_RUN_TIMEOUT_MS: z.coerce
     .number()
     .int()

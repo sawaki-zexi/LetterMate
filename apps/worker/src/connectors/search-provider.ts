@@ -8,7 +8,7 @@ const braveSchema = z.object({ web: z.object({ results: z.array(z.object({
 })).max(50) }).optional() });
 
 export interface SearchProviderConfig {
-  provider: 'brave'; apiKey?: string; baseUrl?: string; siteConstraints?: string[]; pageBudget?: number;
+  provider: 'brave'; apiKey?: string | undefined; baseUrl?: string; siteConstraints?: string[]; pageBudget?: number;
 }
 
 const httpUrl = (value: string): string => {

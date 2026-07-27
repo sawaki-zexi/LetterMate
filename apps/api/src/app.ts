@@ -1,7 +1,10 @@
 import { parseConfig } from '@lettermate/config';
 import {
   discoveryKindSchema,
+  discoverySourceStatusSchema,
+  feedRangeSchema,
   topicInputSchema,
+  type DiscoverySourceStatus,
 } from '@lettermate/contracts';
 import { normalizeKeyword } from '@lettermate/domain';
 import {
@@ -41,6 +44,8 @@ import {
 const STORE = Symbol('TopicStore');
 const QUEUE = Symbol('TopicQueue');
 const AI_CONFIGURED = Symbol('AiConfigured');
+const DISCOVERY_SOURCES = Symbol('DiscoverySources');
+const NOW = Symbol('Now');
 
 function errorBody(code: string, message: string) {
   return { code, message, traceId: randomUUID() };
@@ -67,6 +72,7 @@ function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, message: string):
 const feedFilterSchema = z.object({
   topicId: z.string().min(1).optional(),
   kind: discoveryKindSchema.optional(),
+  range: feedRangeSchema.default('recent'),
 });
 
 @Controller('api/v1')
@@ -75,6 +81,8 @@ class ApiController {
     @Inject(STORE) private readonly store: TopicStore,
     @Inject(QUEUE) private readonly queue: TopicQueue,
     @Inject(AI_CONFIGURED) private readonly aiConfigured: boolean,
+    @Inject(DISCOVERY_SOURCES) private readonly discoverySources: DiscoverySourceStatus[],
+    @Inject(NOW) private readonly now: () => Date,
   ) {}
 
   @Get('health')
@@ -102,7 +110,7 @@ class ApiController {
         input.keyword,
         normalizeKeyword(input.keyword),
       );
-      await this.queue.enqueue({ topicId: topic.id, userId });
+      await this.queue.enqueue({ topicId: topic.id, userId, trigger: 'initial' });
       return topic;
     } catch (error) {
       if (error instanceof TopicAlreadyExistsError) {
@@ -131,7 +139,7 @@ class ApiController {
     if (!topic) {
       throw new NotFoundException(errorBody('NOT_FOUND', '主题不存在'));
     }
-    await this.queue.enqueue({ topicId: id, userId });
+    await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
     return topic;
   }
 
@@ -148,7 +156,16 @@ class ApiController {
     return this.store.listFeed(userId, {
       ...(filter.topicId ? { topicId: filter.topicId } : {}),
       ...(filter.kind ? { kind: filter.kind } : {}),
+      ...(filter.range === 'recent'
+        ? { since: new Date(this.now().getTime() - 90 * 24 * 60 * 60 * 1_000) }
+        : {}),
     });
+  }
+
+  @Get('discovery-sources')
+  listDiscoverySources(@Headers('x-user-id') header?: string) {
+    authenticatedUser(header);
+    return this.discoverySources;
   }
 
   @Get('items/:id')
@@ -193,6 +210,8 @@ class AppModule implements NestModule {
     store: TopicStore,
     queue: TopicQueue,
     aiConfigured: boolean,
+    discoverySources: DiscoverySourceStatus[],
+    now: () => Date,
   ): DynamicModule {
     return {
       module: AppModule,
@@ -201,6 +220,8 @@ class AppModule implements NestModule {
         { provide: STORE, useValue: store },
         { provide: QUEUE, useValue: queue },
         { provide: AI_CONFIGURED, useValue: aiConfigured },
+        { provide: DISCOVERY_SOURCES, useValue: discoverySources },
+        { provide: NOW, useValue: now },
         ResourceCloser,
       ],
     };
@@ -211,7 +232,58 @@ export interface CreateApiAppOptions {
   store?: TopicStore;
   queue?: TopicQueue;
   aiConfigured?: boolean;
+  discoverySources?: DiscoverySourceStatus[];
+  now?: () => Date;
   webOrigin?: string;
+}
+
+export function configuredDiscoverySources(
+  config: ReturnType<typeof parseConfig>,
+): DiscoverySourceStatus[] {
+  const status = (enabled: boolean) => enabled ? 'enabled' as const : 'not_configured' as const;
+  return discoverySourceStatusSchema.array().parse([
+    {
+      id: 'openrouter-search',
+      label: 'OpenRouter Web Search',
+      category: 'web',
+      status: status(Boolean(config.AI_API_KEY && config.AI_WEB_SEARCH)),
+    },
+    {
+      id: 'twitterapi-io',
+      label: 'X',
+      category: 'social',
+      status: status(Boolean(config.TWITTERAPI_IO_API_KEY)),
+    },
+    {
+      id: 'rss',
+      label: 'RSS/Atom',
+      category: 'feed',
+      status: status(config.DISCOVERY_RSS_FEED_URLS.length > 0),
+    },
+    { id: 'hacker-news', label: 'Hacker News', category: 'community', status: 'enabled' },
+    { id: 'arxiv', label: 'arXiv', category: 'paper', status: 'enabled' },
+    { id: 'github', label: 'GitHub', category: 'code', status: 'enabled' },
+    {
+      id: 'search-brave',
+      label: 'Brave Search',
+      category: 'web',
+      status: status(config.SEARCH_PROVIDER === 'brave' && Boolean(config.SEARCH_API_KEY)),
+    },
+    {
+      id: 'youtube',
+      label: 'YouTube',
+      category: 'video',
+      status: status(Boolean(config.YOUTUBE_API_KEY)),
+    },
+    {
+      id: 'reddit',
+      label: 'Reddit',
+      category: 'community',
+      status: status(Boolean(config.REDDIT_CLIENT_ID && config.REDDIT_CLIENT_SECRET)),
+    },
+    { id: 'bluesky', label: 'Bluesky', category: 'social', status: 'enabled' },
+    { id: 'bilibili', label: 'Bilibili', category: 'video', status: 'enabled' },
+  ]);
 }
 
 export async function createApiApp(
@@ -221,8 +293,17 @@ export async function createApiApp(
   const store = options.store ?? new PrismaTopicStore(new PrismaClient());
   const queue = options.queue ?? createBullTopicQueue(config.REDIS_URL);
   const aiConfigured = options.aiConfigured ?? Boolean(config.AI_API_KEY);
+  const discoverySources = discoverySourceStatusSchema.array().parse(
+    options.discoverySources ?? configuredDiscoverySources(config),
+  );
   const app = await NestFactory.create(
-    AppModule.register(store, queue, aiConfigured),
+    AppModule.register(
+      store,
+      queue,
+      aiConfigured,
+      discoverySources,
+      options.now ?? (() => new Date()),
+    ),
     { logger: false },
   );
   app.enableCors({

@@ -12,6 +12,15 @@ describe('topic normalization', () => {
 });
 
 describe('discovery citation validation', () => {
+  const sourceMetadata = {
+    sourceType: 'web' as const,
+    platform: 'Web',
+    authorName: null,
+    authorHandle: null,
+    externalId: null,
+    provenanceKind: 'ai_citation' as const,
+  };
+
   it('keeps only candidates whose every URL is a citation', () => {
     const output = validateDiscoveryResult({
       citations: ['https://example.com/post?utm_source=x'],
@@ -23,6 +32,7 @@ describe('discovery citation validation', () => {
           reason: '近期讨论集中',
           sourceUrls: ['https://example.com/post'],
           publishedAt: null,
+          ...sourceMetadata,
         },
         {
           kind: 'quality',
@@ -31,6 +41,7 @@ describe('discovery citation validation', () => {
           reason: '内容深入',
           sourceUrls: ['https://invented.test/post'],
           publishedAt: null,
+          ...sourceMetadata,
         },
       ],
     });
@@ -55,6 +66,7 @@ describe('discovery citation validation', () => {
             reason: '热门',
             sourceUrls: ['https://invented.test'],
             publishedAt: null,
+            ...sourceMetadata,
           },
         ],
       }),

@@ -9,7 +9,11 @@ const postSchema = z.object({
   num_comments: z.number().finite().nonnegative().optional().default(0),
 });
 const searchSchema = z.object({ data: z.object({ children: z.array(z.object({ data: postSchema })).max(100) }) });
-export interface RedditConnectorConfig { clientId?: string; clientSecret?: string; queryBudget?: number }
+export interface RedditConnectorConfig {
+  clientId?: string | undefined;
+  clientSecret?: string | undefined;
+  queryBudget?: number;
+}
 
 export class RedditConnector implements SourceConnector {
   readonly id = 'reddit'; readonly label = 'Reddit'; readonly sourceType = 'community' as const;

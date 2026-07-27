@@ -8,7 +8,7 @@ const videoSchema = z.object({
   statistics: z.object({ viewCount: z.string().optional(), likeCount: z.string().optional(), commentCount: z.string().optional() }).optional(),
 });
 const videosSchema = z.object({ items: z.array(videoSchema).max(50) });
-export interface YouTubeConnectorConfig { apiKey?: string; queryBudget?: number }
+export interface YouTubeConnectorConfig { apiKey?: string | undefined; queryBudget?: number }
 const count = (value: string | undefined): number => { const parsed = Number(value ?? 0); return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0; };
 
 export class YouTubeConnector implements SourceConnector {

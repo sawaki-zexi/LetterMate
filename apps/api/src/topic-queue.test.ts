@@ -7,11 +7,11 @@ describe('BullTopicQueue', () => {
     const redis = { quit: vi.fn() };
     const topicQueue = new BullTopicQueue(queue as never, redis as never);
 
-    await topicQueue.enqueue({ topicId: 'topic-1', userId: 'user-a' });
+    await topicQueue.enqueue({ topicId: 'topic-1', userId: 'user-a', trigger: 'manual' });
 
     expect(queue.add).toHaveBeenCalledWith(
       'refresh',
-      { topicId: 'topic-1', userId: 'user-a' },
+      { topicId: 'topic-1', userId: 'user-a', trigger: 'manual' },
       expect.objectContaining({
         jobId: 'topic-topic-1',
         attempts: 3,

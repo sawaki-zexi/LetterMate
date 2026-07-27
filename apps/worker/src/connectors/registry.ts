@@ -1,12 +1,16 @@
 import {
   ConnectorError,
   type ConnectorFailure,
-  type ConnectorResult,
   type ConnectorSearchSummary,
   type SourceConnector,
   type SourceQueryPlan,
 } from './types.js';
 import { type ValidatedSourceCandidate, validateSourceCandidate } from '@lettermate/domain';
+
+interface ValidatedConnectorResult {
+  candidates: ValidatedSourceCandidate[];
+  requestCount?: number;
+}
 
 export interface ConnectorRegistryOptions {
   concurrency: number;
@@ -66,7 +70,7 @@ export class ConnectorRegistry {
   ): Promise<ConnectorSearchSummary> {
     const selected: Array<{ connector: SourceConnector; resultIndex: number }> = [];
     const skippedConnectorIds: string[] = [];
-    const results: Array<ConnectorResult | ConnectorFailure | undefined> = new Array(
+    const results: Array<ValidatedConnectorResult | ConnectorFailure | undefined> = new Array(
       this.connectors.length,
     );
     for (const [index, connector] of this.connectors.entries()) {

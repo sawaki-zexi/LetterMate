@@ -18,7 +18,7 @@ const defaultResolve = async (hostname: string): Promise<string[]> => (
 const unsafeHostname = new Set(['metadata.google.internal', 'metadata', 'instance-data']);
 const unsafeIp = (address: string): boolean => {
   if (isIP(address) === 4) {
-    const parts = address.split('.').map(Number); const [a, b] = parts;
+    const parts = address.split('.').map(Number); const a = parts[0]!; const b = parts[1]!;
     return a === 0 || a === 10 || a === 127 || a === 169 && b === 254 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31 || a === 100 && b >= 64 && b <= 127 || a >= 224;
   }
   const normalized = address.toLowerCase();

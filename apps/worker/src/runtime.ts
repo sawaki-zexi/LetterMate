@@ -24,7 +24,7 @@ export function createSourceConnectors(
       timeoutMs: config.AI_TIMEOUT_MS,
     }, fetcher),
     new TwitterApiIoConnector({ apiKey: config.TWITTERAPI_IO_API_KEY }, fetcher),
-    new RssConnector({ feedUrls: [] }, fetcher),
+    new RssConnector({ feedUrls: config.DISCOVERY_RSS_FEED_URLS }, fetcher),
     new HackerNewsConnector(fetcher),
     new ArxivConnector(fetcher),
     new GitHubConnector({ token: config.GITHUB_TOKEN }, fetcher),

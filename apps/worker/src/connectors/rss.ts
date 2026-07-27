@@ -147,7 +147,10 @@ export class RssConnector implements SourceConnector {
     return asArray(channel.item).slice(0, limit).map((item) => {
       const entry = asObject(item);
       if (entry === null) throw new ConnectorError('CONNECTOR_RESPONSE_INVALID', 'RSS entry is invalid', false);
-      const url = toHttpUrl(this.requiredString(entry.link, 'RSS entry link'), 'RSS entry link');
+      const url = toHttpUrl(
+        this.requiredString(asString(entry.link), 'RSS entry link'),
+        'RSS entry link',
+      );
       const externalId = asString(entry.guid) ?? url;
       const title = asString(entry.title);
       return {

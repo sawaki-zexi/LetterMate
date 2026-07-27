@@ -16,7 +16,7 @@ const releaseSchema = z.object({
 });
 const releasesSchema = z.array(releaseSchema).max(100);
 
-export interface GitHubConnectorConfig { token?: string; repositoryBudget?: number; releasesPerRepository?: number }
+export interface GitHubConnectorConfig { token?: string | undefined; repositoryBudget?: number; releasesPerRepository?: number }
 const iso = (value: string | null | undefined): string | null => value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
 
 export class GitHubConnector implements SourceConnector {

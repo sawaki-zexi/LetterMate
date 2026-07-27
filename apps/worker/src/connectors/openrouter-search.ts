@@ -10,7 +10,7 @@ const citationSchema = z.object({ type: z.literal('url_citation'), url_citation:
 const responseSchema = z.object({ choices: z.array(z.object({ message: z.object({
   content: z.string(), annotations: z.array(z.unknown()).optional().default([]),
 }) })).min(1) });
-export interface OpenRouterSearchConfig { apiKey?: string; model: string; webSearch: boolean; timeoutMs: number }
+export interface OpenRouterSearchConfig { apiKey?: string | undefined; model: string; webSearch: boolean; timeoutMs: number }
 
 export class OpenRouterSearchConnector implements SourceConnector {
   readonly id = 'openrouter-search'; readonly label = 'OpenRouter Web Search'; readonly sourceType = 'web' as const;

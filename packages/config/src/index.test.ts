@@ -70,6 +70,18 @@ describe('configuration', () => {
     });
   });
 
+  it('parses and validates configured RSS feed URLs', () => {
+    expect(parseConfig({
+      DISCOVERY_RSS_FEED_URLS: 'https://example.com/feed.xml, https://example.org/rss',
+    }).DISCOVERY_RSS_FEED_URLS).toEqual([
+      'https://example.com/feed.xml',
+      'https://example.org/rss',
+    ]);
+    expect(() => parseConfig({
+      DISCOVERY_RSS_FEED_URLS: 'https://example.com/feed.xml,not-a-url',
+    })).toThrow();
+  });
+
   it('treats empty optional connector configuration as absent', () => {
     expect(
       parseConfig({
