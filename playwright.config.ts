@@ -6,22 +6,22 @@ export default defineConfig({
   fullyParallel: false,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
-    baseURL: 'http://127.0.0.1:5174',
+    baseURL: 'http://127.0.0.1:5184',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
   webServer: [
     {
       command: 'npm run dev:e2e -w @lettermate/api',
-      url: 'http://127.0.0.1:3001/api/v1/health',
-      env: { PORT: '3001' },
+      url: 'http://127.0.0.1:3011/api/v1/health',
+      env: { PORT: '3011' },
       reuseExistingServer: false,
       timeout: 120_000,
     },
     {
-      command: 'npm run dev -w @lettermate/web -- --host 127.0.0.1 --port 5174',
-      url: 'http://127.0.0.1:5174',
-      env: { VITE_API_PROXY: 'http://127.0.0.1:3001' },
+      command: 'npm run dev -w @lettermate/web -- --host 127.0.0.1 --port 5184',
+      url: 'http://127.0.0.1:5184',
+      env: { VITE_API_PROXY: 'http://127.0.0.1:3011' },
       reuseExistingServer: false,
       timeout: 120_000,
     },
@@ -30,5 +30,6 @@ export default defineConfig({
     { name: 'desktop', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } } },
     { name: 'tablet', use: { ...devices['iPad (gen 7)'], browserName: 'chromium' } },
     { name: 'mobile', use: { ...devices['Pixel 7'] } },
+    { name: 'compact-mobile', use: { ...devices['Pixel 7'], viewport: { width: 320, height: 700 } } },
   ],
 });

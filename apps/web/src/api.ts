@@ -2,9 +2,12 @@ import {
   apiErrorSchema,
   discoveryItemSchema,
   discoveryKindSchema,
+  discoverySourceStatusSchema,
+  feedRangeSchema,
   topicInputSchema,
   topicSchema,
   type DiscoveryKind,
+  type FeedRange,
   type TopicInput,
 } from '@lettermate/contracts';
 import { z } from 'zod';
@@ -57,13 +60,18 @@ export const api = {
     body: JSON.stringify(topicInputSchema.parse(input)),
   }),
   refreshTopic: (id: string) => apiRequest(`/topics/${encodeURIComponent(id)}/refresh`, topicSchema, { method: 'POST' }),
-  feed: (filter: { topicId?: string; kind?: DiscoveryKind } = {}) => {
+  feed: (filter: { topicId?: string; kind?: DiscoveryKind; range?: FeedRange } = {}) => {
     const query = new URLSearchParams(compact({
       topicId: filter.topicId,
       kind: filter.kind && discoveryKindSchema.parse(filter.kind),
+      range: feedRangeSchema.parse(filter.range ?? 'recent'),
     }));
     const suffix = query.size ? `?${query.toString()}` : '';
     return apiRequest(`/feed${suffix}`, z.array(discoveryItemSchema));
   },
+  discoverySources: () => apiRequest(
+    '/discovery-sources',
+    z.array(discoverySourceStatusSchema),
+  ),
   item: (id: string) => apiRequest(`/items/${encodeURIComponent(id)}`, discoveryItemSchema),
 };
