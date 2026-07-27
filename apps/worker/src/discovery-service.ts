@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { AiGatewayError, type AiGateway } from './ai-gateway.js';
 import type { ConnectorSearchSummary, SourceQueryPlan } from './connectors/types.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
+import { SourceRouter } from './source-router.js';
 import {
   calculateFailureSchedule,
   calculateScheduleUpdate,
@@ -375,11 +376,21 @@ interface QualityPipelineLike {
   run(input: QualityPipelineInput): Promise<DiscoveryCandidate[]>;
 }
 
+interface SourceRouterLike {
+  route(input: {
+    keyword: string;
+    expanded: Awaited<ReturnType<AiGateway['expandTopic']>>;
+    windowStart: string;
+    windowEnd: string;
+  }): SourceQueryPlan;
+}
+
 export interface TopicDiscoveryServiceOptions {
   gateway: Pick<AiGateway, 'expandTopic'>;
   registry: ConnectorRegistryLike;
   qualityPipeline: QualityPipelineLike;
   repository: DiscoveryRepository;
+  router?: SourceRouterLike;
   now?: () => Date;
   timeoutMs?: number;
 }
@@ -388,21 +399,12 @@ export interface DiscoveryRunContext {
   finalAttempt: boolean;
 }
 
-const allSourceTypes: SourceQueryPlan['sourceTypes'] = [
-  'web',
-  'feed',
-  'social',
-  'video',
-  'community',
-  'code',
-  'paper',
-];
-
 export class TopicDiscoveryService {
   private readonly gateway: Pick<AiGateway, 'expandTopic'>;
   private readonly registry: ConnectorRegistryLike;
   private readonly qualityPipeline: QualityPipelineLike;
   private readonly repository: DiscoveryRepository;
+  private readonly router: SourceRouterLike;
   private readonly now: () => Date;
   private readonly timeoutMs: number;
 
@@ -411,6 +413,7 @@ export class TopicDiscoveryService {
     this.registry = options.registry;
     this.qualityPipeline = options.qualityPipeline;
     this.repository = options.repository;
+    this.router = options.router ?? new SourceRouter();
     this.now = options.now ?? (() => new Date());
     this.timeoutMs = options.timeoutMs ?? 600_000;
   }
@@ -440,15 +443,12 @@ export class TopicDiscoveryService {
       const expandedTerms = unique([...expanded.terms, ...expanded.searchQueries]);
       const windowEnd = this.now();
       const windowStart = new Date(windowEnd.getTime() - 7 * 24 * 60 * 60 * 1_000);
-      const plan: SourceQueryPlan = {
+      const plan = this.router.route({
         keyword: topic.keyword,
-        expandedTerms: unique(expanded.terms),
-        queries: unique(expanded.searchQueries),
-        sourceTypes: [...allSourceTypes],
         windowStart: windowStart.toISOString(),
         windowEnd: windowEnd.toISOString(),
-        maxCandidates: 100,
-      };
+        expanded,
+      });
       const [connectorResult, historyUrls] = await Promise.all([
         this.registry.search(plan, controller.signal),
         this.repository.listHistoryUrls(topicId),

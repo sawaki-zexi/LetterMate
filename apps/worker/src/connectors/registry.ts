@@ -35,6 +35,7 @@ const copyPlan = (plan: SourceQueryPlan): SourceQueryPlan => ({
   expandedTerms: [...plan.expandedTerms],
   queries: [...plan.queries],
   sourceTypes: [...plan.sourceTypes],
+  ...(plan.connectorIds ? { connectorIds: [...plan.connectorIds] } : {}),
 });
 
 export class ConnectorRegistry {
@@ -73,9 +74,12 @@ export class ConnectorRegistry {
     const results: Array<ValidatedConnectorResult | ConnectorFailure | undefined> = new Array(
       this.connectors.length,
     );
+    const routedConnectorIds = plan.connectorIds ? new Set(plan.connectorIds) : undefined;
     for (const [index, connector] of this.connectors.entries()) {
       try {
-        if (connector.isEnabled() && connector.supports(copyPlan(plan))) {
+        if (routedConnectorIds !== undefined && !routedConnectorIds.has(connector.id)) {
+          skippedConnectorIds.push(connector.id);
+        } else if (connector.isEnabled() && connector.supports(copyPlan(plan))) {
           selected.push({ connector, resultIndex: index });
         } else {
           skippedConnectorIds.push(connector.id);
@@ -84,6 +88,17 @@ export class ConnectorRegistry {
         results[index] = toFailure(connector.id, error);
       }
     }
+    const candidateLimit = Math.max(0, Math.floor(plan.maxCandidates));
+    const baseCandidateBudget = selected.length === 0
+      ? 0
+      : Math.floor(candidateLimit / selected.length);
+    const connectorPlans = selected.map((selectedConnector, index) => ({
+      ...selectedConnector,
+      plan: {
+        ...copyPlan(plan),
+        maxCandidates: baseCandidateBudget + (index < candidateLimit % selected.length ? 1 : 0),
+      },
+    }));
 
     let nextIndex = 0;
     let cancelled = parentSignal?.aborted ?? false;
@@ -92,12 +107,12 @@ export class ConnectorRegistry {
     };
     parentSignal?.addEventListener('abort', markCancelled, { once: true });
     const worker = async () => {
-      while (!cancelled && nextIndex < selected.length) {
+      while (!cancelled && nextIndex < connectorPlans.length) {
         const index = nextIndex;
         nextIndex += 1;
-        const selectedConnector = selected[index];
+        const selectedConnector = connectorPlans[index];
         if (selectedConnector === undefined) continue;
-        const { connector, resultIndex } = selectedConnector;
+        const { connector, resultIndex, plan: connectorPlan } = selectedConnector;
         const controller = new AbortController();
         let timeoutId: ReturnType<typeof setTimeout> | undefined;
         let cancelConnector: (() => void) | undefined;
@@ -130,7 +145,7 @@ export class ConnectorRegistry {
             else parentSignal.addEventListener('abort', cancelConnector, { once: true });
           });
           const result: unknown = await Promise.race(
-            [connector.search(copyPlan(plan), controller.signal), timeout, cancellation],
+            [connector.search(connectorPlan, controller.signal), timeout, cancellation],
           );
           if (!isPlainObject(result) || !Array.isArray(result.candidates)) {
             results[resultIndex] = {
@@ -179,7 +194,7 @@ export class ConnectorRegistry {
     try {
       await Promise.all(
         Array.from(
-          { length: Math.min(this.options.concurrency, selected.length) },
+          { length: Math.min(this.options.concurrency, connectorPlans.length) },
           worker,
         ),
       );
@@ -188,7 +203,7 @@ export class ConnectorRegistry {
     }
 
     if (cancelled) {
-      for (const { connector, resultIndex } of selected) {
+      for (const { connector, resultIndex } of connectorPlans) {
         results[resultIndex] ??= {
           connectorId: connector.id,
           code: 'CONNECTOR_ABORTED',
@@ -199,17 +214,29 @@ export class ConnectorRegistry {
     }
 
     const candidates: ConnectorSearchSummary['candidates'] = [];
+    const candidateLists: ValidatedSourceCandidate[][] = [];
     const successfulConnectorIds: string[] = [];
     const failures: ConnectorFailure[] = [];
     for (const [index, result] of results.entries()) {
       if (result === undefined) continue;
       if ('candidates' in result) {
-        candidates.push(...result.candidates);
+        candidateLists.push(result.candidates);
         const connector = this.connectors[index];
         if (connector !== undefined) successfulConnectorIds.push(connector.id);
       } else {
         failures.push(result);
       }
+    }
+    for (let candidateIndex = 0; candidates.length < candidateLimit; candidateIndex += 1) {
+      let added = false;
+      for (const candidateList of candidateLists) {
+        const candidate = candidateList[candidateIndex];
+        if (candidate === undefined) continue;
+        candidates.push(candidate);
+        added = true;
+        if (candidates.length === candidateLimit) break;
+      }
+      if (!added) break;
     }
 
     return {

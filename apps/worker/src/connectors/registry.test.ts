@@ -41,6 +41,16 @@ const candidate = (connectorId: string): SourceCandidate => ({
 
 const normalizedCandidate = (connectorId: string) => validateSourceCandidate(candidate(connectorId));
 
+const candidatesFor = (connectorId: string, count: number): SourceCandidate[] => (
+  Array.from({ length: count }, (_, index) => {
+    const value = candidate(connectorId);
+    value.url = `https://example.com/${connectorId}-${index}`;
+    value.title = `${connectorId}-${index}`;
+    if (value.proof.kind === 'ai_citation') value.proof.citationUrl = value.url;
+    return value;
+  })
+);
+
 const connector = (
   id: string,
   overrides: Partial<SourceConnector> = {},
@@ -125,6 +135,62 @@ describe('ConnectorRegistry', () => {
       failures: [],
     });
     expect(searched).toEqual(['selected']);
+  });
+
+  it('executes only the connector IDs selected by the topic route', async () => {
+    const searched: string[] = [];
+    const registry = new ConnectorRegistry([
+      connector('selected', { search: async () => { searched.push('selected'); return { candidates: [] }; } }),
+      connector('not-routed', { search: async () => { searched.push('not-routed'); return { candidates: [] }; } }),
+    ], { concurrency: 2, timeoutMs: 1_000 });
+
+    const result = await registry.search({ ...plan, connectorIds: ['selected'] });
+
+    expect(searched).toEqual(['selected']);
+    expect(result.successfulConnectorIds).toEqual(['selected']);
+    expect(result.skippedConnectorIds).toEqual(['not-routed']);
+  });
+
+  it('round-robins successful connector results within the total candidate budget', async () => {
+    const registry = new ConnectorRegistry([
+      connector('first', { search: async () => ({ candidates: candidatesFor('first', 3) }) }),
+      connector('second', { search: async () => ({ candidates: candidatesFor('second', 3) }) }),
+    ], { concurrency: 2, timeoutMs: 1_000 });
+
+    const result = await registry.search({
+      ...plan,
+      connectorIds: ['first', 'second'],
+      maxCandidates: 3,
+    });
+
+    expect(result.candidates.map(({ canonicalUrl }) => canonicalUrl)).toEqual([
+      'https://example.com/first-0',
+      'https://example.com/second-0',
+      'https://example.com/first-1',
+    ]);
+  });
+
+  it('splits the total candidate budget across routed connectors', async () => {
+    const receivedBudgets: number[] = [];
+    const registry = new ConnectorRegistry([
+      connector('first', { search: async (receivedPlan) => {
+        receivedBudgets.push(receivedPlan.maxCandidates);
+        return { candidates: [] };
+      } }),
+      connector('second', { search: async (receivedPlan) => {
+        receivedBudgets.push(receivedPlan.maxCandidates);
+        return { candidates: [] };
+      } }),
+    ], { concurrency: 2, timeoutMs: 1_000 });
+
+    await registry.search({
+      ...plan,
+      connectorIds: ['first', 'second'],
+      maxCandidates: 3,
+    });
+
+    expect(receivedBudgets).toEqual([2, 1]);
+    expect(receivedBudgets.reduce((total, budget) => total + budget, 0)).toBe(3);
   });
 
   it('isolates a connector that throws while checking support', async () => {

@@ -18,6 +18,7 @@ NestJS API ---------- PostgreSQL / Prisma
   v                         |
 Worker ---------------------+
   |-- TopicExpander (OpenRouter)
+  |-- SourceRouter
   |-- ConnectorRegistry
   |    |-- OpenRouter Search / Brave-compatible Search / RSS
   |    |-- TwitterAPI.io / Bluesky
@@ -66,6 +67,8 @@ interface SourceConnector {
 ```
 
 候选包含 `connectorId`、`sourceType`、`platform`、原始 URL、可选平台内容 ID、正文/摘要、作者、发布时间、互动信息和 `SourceProof`。Registry 在边界验证并复制候选；一个连接器异常、超时或返回非法结构时只产生脱敏失败，不污染其他结果。
+
+`SourceRouter` 根据扩展后的中英文主题语义选择有限的连接器集合和查询组合：技术主题优先 GitHub、Hacker News、arXiv 与 RSS；产品、商业或社会主题优先搜索、社交与视频连接器。路由结果包含总候选预算，Registry 只执行被选中的已启用连接器，并在连接器执行前确定性分配该预算；成功结果再按来源轮转聚合，避免任一来源耗尽一次运行的预算。路由不产生来源可信度、排序等级或用户可见评分。
 
 ### 3.1 来源与配置
 
@@ -157,7 +160,7 @@ DISCOVERY_RSS_FEED_URLS=
 | # | 验收点 | 主要证据 |
 | --- | --- | --- |
 | 1 | 单关键词创建 | `apps/api/src/app.test.ts`、`tests/e2e/ai-discovery.spec.ts` |
-| 2 | 至少四类来源及无 Key 降级 | `apps/worker/src/runtime.test.ts`、各 `connectors/*.test.ts` |
+| 2 | 至少四类来源、语义路由及无 Key 降级 | `apps/worker/src/source-router.test.ts`、`apps/worker/src/runtime.test.ts`、各 `connectors/*.test.ts` |
 | 3 | TwitterAPI.io 原创帖与线程 | `connectors/twitterapi-io.test.ts`、`twitterapi-io.live.test.ts`、`DiscoveryCard.test.tsx` |
 | 4 | 一手短帖保留、转载过滤 | `quality-pipeline.test.ts`、`connectors/twitterapi-io.test.ts` |
 | 5 | 各内容类型有实质正文 | `content-fetcher.test.ts`、`quality-pipeline.test.ts`、各平台连接器测试 |

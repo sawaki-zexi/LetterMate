@@ -8,6 +8,7 @@ import {
   TopicDiscoveryService,
   type DiscoveryRepository,
 } from './discovery-service.js';
+import type { SourceQueryPlan } from './connectors/types.js';
 
 const finishedAt = new Date('2026-07-27T10:00:00.000Z');
 
@@ -483,6 +484,23 @@ function createOrchestration() {
   const qualityPipeline = {
     run: vi.fn().mockResolvedValue([item]),
   };
+  const router = {
+    route: vi.fn((input: {
+      keyword: string;
+      expanded: { terms: string[]; searchQueries: string[] };
+      windowStart: string;
+      windowEnd: string;
+    }): SourceQueryPlan => ({
+      keyword: input.keyword,
+      expandedTerms: input.expanded.terms,
+      queries: input.expanded.searchQueries,
+      sourceTypes: ['code'],
+      connectorIds: ['github'],
+      windowStart: input.windowStart,
+      windowEnd: input.windowEnd,
+      maxCandidates: 12,
+    })),
+  };
   const now = vi.fn()
     .mockReturnValueOnce(new Date('2026-07-27T09:00:00.000Z'))
     .mockReturnValue(new Date('2026-07-27T10:00:00.000Z'));
@@ -491,15 +509,16 @@ function createOrchestration() {
     registry,
     qualityPipeline,
     repository: repository as unknown as DiscoveryRepository,
+    router,
     now,
     timeoutMs: 600_000,
   });
-  return { service, repository, gateway, registry, qualityPipeline };
+  return { service, repository, gateway, registry, qualityPipeline, router };
 }
 
 describe('TopicDiscoveryService multi-source orchestration', () => {
   it('routes expanded queries through connectors and the quality pipeline', async () => {
-    const { service, repository, gateway, registry, qualityPipeline } = createOrchestration();
+    const { service, repository, gateway, registry, qualityPipeline, router } = createOrchestration();
 
     await service.run('topic-1', 'user-1', 'scheduled');
 
@@ -512,12 +531,23 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
       keyword: 'AI Agent',
       signal: expect.any(AbortSignal),
     });
+    expect(router.route).toHaveBeenCalledWith({
+      keyword: 'AI Agent',
+      expanded: {
+        terms: ['intelligent agent'],
+        searchQueries: ['AI agent release', '智能体 发布'],
+      },
+      windowStart: '2026-07-20T10:00:00.000Z',
+      windowEnd: '2026-07-27T10:00:00.000Z',
+    });
     expect(registry.search).toHaveBeenCalledWith(
       expect.objectContaining({
         keyword: 'AI Agent',
         expandedTerms: ['intelligent agent'],
         queries: ['AI agent release', '智能体 发布'],
-        sourceTypes: ['web', 'feed', 'social', 'video', 'community', 'code', 'paper'],
+        sourceTypes: ['code'],
+        connectorIds: ['github'],
+        maxCandidates: 12,
         windowStart: '2026-07-20T10:00:00.000Z',
         windowEnd: '2026-07-27T10:00:00.000Z',
       }),

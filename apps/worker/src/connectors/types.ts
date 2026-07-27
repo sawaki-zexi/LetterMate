@@ -6,6 +6,7 @@ export interface SourceQueryPlan {
   expandedTerms: string[];
   queries: string[];
   sourceTypes: SourceType[];
+  connectorIds?: string[];
   windowStart: string;
   windowEnd: string;
   maxCandidates: number;
