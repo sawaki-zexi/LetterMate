@@ -204,7 +204,7 @@ export class OpenRouterAiGateway implements AiGateway {
     private readonly fetcher: typeof fetch = fetch,
   ) {}
 
-  async expandTopic(input: { keyword: string }): Promise<ExpandedTopic> {
+  async expandTopic(input: { keyword: string; signal?: AbortSignal }): Promise<ExpandedTopic> {
     const messages: ChatMessage[] = [
       {
         role: 'system',
@@ -225,6 +225,7 @@ export class OpenRouterAiGateway implements AiGateway {
         schema: expansionJsonSchema,
         maxTokens: 1_024,
       },
+      input.signal,
     );
     return {
       terms: unique(data.terms),
@@ -235,6 +236,7 @@ export class OpenRouterAiGateway implements AiGateway {
   async evaluateCandidates(input: {
     keyword: string;
     candidates: QualityAssessmentCandidate[];
+    signal?: AbortSignal;
   }): Promise<QualityAssessment[]> {
     const { data } = await this.completeStructured(
       [
@@ -248,6 +250,7 @@ export class OpenRouterAiGateway implements AiGateway {
       assessmentSchema,
       false,
       { name: 'candidate_assessment', schema: assessmentJsonSchema, maxTokens: 4_096 },
+      input.signal,
     );
     return data.decisions;
   }
@@ -255,6 +258,7 @@ export class OpenRouterAiGateway implements AiGateway {
   async composeItems(input: {
     keyword: string;
     candidates: CompositionCandidate[];
+    signal?: AbortSignal;
   }): Promise<z.infer<typeof discoveryCandidateSchema>[]> {
     const { data } = await this.completeStructured(
       [
@@ -268,6 +272,7 @@ export class OpenRouterAiGateway implements AiGateway {
       discoveryContentSchema,
       false,
       { name: 'discovery_composition', schema: discoveryJsonSchema, maxTokens: 8_192 },
+      input.signal,
     );
     return data.items;
   }
@@ -277,8 +282,9 @@ export class OpenRouterAiGateway implements AiGateway {
     schema: z.ZodType<T>,
     useWeb: boolean,
     output: StructuredOutput,
+    signal?: AbortSignal,
   ): Promise<{ data: T; message: OpenRouterMessage }> {
-    const first = await this.complete(messages, useWeb, output);
+    const first = await this.complete(messages, useWeb, output, signal);
     const firstData = parseStructured(first.content, schema);
     if (firstData !== null) return { data: firstData, message: first };
 
@@ -291,7 +297,7 @@ export class OpenRouterAiGateway implements AiGateway {
           'The previous response was invalid. Return only valid JSON matching the requested object shape, with every required field and no Markdown.',
       },
     ];
-    const second = await this.complete(correction, useWeb, output);
+    const second = await this.complete(correction, useWeb, output, signal);
     const secondData = parseStructured(second.content, schema);
     if (secondData !== null) return { data: secondData, message: second };
 
@@ -306,8 +312,12 @@ export class OpenRouterAiGateway implements AiGateway {
     messages: ChatMessage[],
     useWeb: boolean,
     output: StructuredOutput,
+    parentSignal?: AbortSignal,
   ): Promise<OpenRouterMessage> {
     const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (parentSignal?.aborted) controller.abort();
+    else parentSignal?.addEventListener('abort', abort, { once: true });
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       const response = await this.fetcher(OPENROUTER_URL, {
@@ -362,6 +372,7 @@ export class OpenRouterAiGateway implements AiGateway {
       throw new AiGatewayError('AI_UPSTREAM_UNAVAILABLE', 'OpenRouter 暂时不可用', true);
     } finally {
       clearTimeout(timeout);
+      parentSignal?.removeEventListener('abort', abort);
     }
   }
 }

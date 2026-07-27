@@ -84,4 +84,70 @@ describe('topic store multi-source mappings', () => {
       provenanceKind: 'ai_citation',
     });
   });
+
+  it('queues only one pending manual refresh without changing a running topic state', async () => {
+    const running = {
+      id: 'topic-1', userId: 'user-1', keyword: 'Agents', normalizedKeyword: 'agents',
+      expandedTerms: [], createdAt: new Date('2026-07-27T08:00:00.000Z'), lastRunAt: null,
+      nextRunAt: new Date('2026-07-27T20:00:00.000Z'), scheduleIntervalHours: 12,
+      productiveRunStreak: 0, emptyRunStreak: 0, runStatus: 'running', lastError: null,
+      activeRunId: 'run-active', runLeaseUntil: new Date('2026-07-27T08:15:00.000Z'),
+      manualRefreshPending: false,
+    } as const;
+    const pending = { ...running, manualRefreshPending: true };
+    const prisma = {
+      topic: {
+        findFirst: vi.fn()
+          .mockResolvedValueOnce(running)
+          .mockResolvedValueOnce(pending)
+          .mockResolvedValueOnce(pending)
+          .mockResolvedValueOnce(pending),
+        updateMany: vi.fn()
+          .mockResolvedValueOnce({ count: 1 })
+          .mockResolvedValueOnce({ count: 0 }),
+      },
+      $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
+    } as unknown as PrismaClient;
+    const store = new PrismaTopicStore(prisma);
+
+    const first = await store.queueRefresh('user-1', 'topic-1');
+    const second = await store.queueRefresh('user-1', 'topic-1');
+
+    expect(first).toMatchObject({ shouldEnqueue: true, topic: { runStatus: 'running' } });
+    expect(second).toMatchObject({ shouldEnqueue: false, topic: { runStatus: 'running' } });
+    expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenNthCalledWith(1, {
+      where: {
+        id: 'topic-1', userId: 'user-1', runStatus: 'running', manualRefreshPending: false,
+      },
+      data: { manualRefreshPending: true, lastError: expect.anything() },
+    });
+  });
+
+  it('does not lose a refresh when the active run finishes during pending registration', async () => {
+    const running = {
+      id: 'topic-1', userId: 'user-1', keyword: 'Agents', normalizedKeyword: 'agents',
+      expandedTerms: [], createdAt: new Date('2026-07-27T08:00:00.000Z'), lastRunAt: null,
+      nextRunAt: null, scheduleIntervalHours: 12, productiveRunStreak: 0, emptyRunStreak: 0,
+      runStatus: 'running', lastError: null, activeRunId: 'run-active',
+      runLeaseUntil: new Date('2026-07-27T08:15:00.000Z'), manualRefreshPending: false,
+    } as const;
+    const succeeded = { ...running, runStatus: 'succeeded' as const, activeRunId: null, runLeaseUntil: null };
+    const queued = { ...succeeded, runStatus: 'queued' as const };
+    const prisma = {
+      topic: {
+        findFirst: vi.fn()
+          .mockResolvedValueOnce(running)
+          .mockResolvedValueOnce(succeeded)
+          .mockResolvedValueOnce(queued),
+        updateMany: vi.fn()
+          .mockResolvedValueOnce({ count: 0 })
+          .mockResolvedValueOnce({ count: 1 }),
+      },
+      $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
+    } as unknown as PrismaClient;
+
+    const result = await new PrismaTopicStore(prisma).queueRefresh('user-1', 'topic-1');
+
+    expect(result).toMatchObject({ shouldEnqueue: true, topic: { runStatus: 'queued' } });
+  });
 });

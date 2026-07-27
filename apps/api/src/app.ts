@@ -135,12 +135,14 @@ class ApiController {
   ) {
     this.assertAiConfigured();
     const userId = authenticatedUser(header);
-    const topic = await this.store.queueRefresh(userId, id);
-    if (!topic) {
+    const refresh = await this.store.queueRefresh(userId, id);
+    if (!refresh) {
       throw new NotFoundException(errorBody('NOT_FOUND', '主题不存在'));
     }
-    await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
-    return topic;
+    if (refresh.shouldEnqueue) {
+      await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
+    }
+    return refresh.topic;
   }
 
   @Get('feed')

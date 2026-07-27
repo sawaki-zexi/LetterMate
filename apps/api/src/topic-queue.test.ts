@@ -8,16 +8,21 @@ describe('BullTopicQueue', () => {
     const topicQueue = new BullTopicQueue(queue as never, redis as never);
 
     await topicQueue.enqueue({ topicId: 'topic-1', userId: 'user-a', trigger: 'manual' });
+    await topicQueue.enqueue({ topicId: 'topic-1', userId: 'user-a', trigger: 'manual' });
 
-    expect(queue.add).toHaveBeenCalledWith(
+    expect(queue.add).toHaveBeenNthCalledWith(
+      1,
       'refresh',
       { topicId: 'topic-1', userId: 'user-a', trigger: 'manual' },
       expect.objectContaining({
-        jobId: 'topic-topic-1',
+        jobId: expect.stringMatching(/^manual-topic-1-/),
         attempts: 3,
         removeOnComplete: true,
         removeOnFail: true,
       }),
     );
+    const firstId = queue.add.mock.calls[0]![2].jobId;
+    const secondId = queue.add.mock.calls[1]![2].jobId;
+    expect(firstId).not.toBe(secondId);
   });
 });

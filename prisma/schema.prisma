@@ -77,6 +77,9 @@ model Topic {
   scheduleIntervalHours Int             @default(12)
   productiveRunStreak   Int             @default(0)
   emptyRunStreak        Int             @default(0)
+  activeRunId           String?
+  runLeaseUntil         DateTime?
+  manualRefreshPending  Boolean         @default(false)
   user                  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   items                 DiscoveryItem[]
   runs                  DiscoveryRun[]
@@ -84,6 +87,7 @@ model Topic {
   @@unique([userId, normalizedKeyword])
   @@index([userId, createdAt])
   @@index([nextRunAt, runStatus])
+  @@index([runStatus, runLeaseUntil])
 }
 
 model DiscoveryItem {

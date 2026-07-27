@@ -142,7 +142,7 @@ describe('TwitterApiIoConnector', () => {
       .toEqual([null, 'latest-page-2', null, 'top-page-2']);
   });
 
-  it('enriches only shortlisted original threads and stops after one context page', async () => {
+  it('enriches shortlisted original threads across cursor pages within the page budget', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(searchResponse([tweet({
         id: '400',
@@ -155,17 +155,24 @@ describe('TwitterApiIoConnector', () => {
         text: 'Thread: our agent runtime now supports reliable checkpoints.',
       })]))
       .mockResolvedValueOnce(threadResponse([
-          tweet({ id: '402', text: 'Third update with the migration guide.', createdAt: '2026-07-25T12:02:00.000Z' }),
-          tweet({ id: '401', text: 'Second update explains checkpoint recovery.', createdAt: '2026-07-25T12:01:00.000Z' }),
-          tweet({ id: '999', text: 'Unrelated reply', author: { name: 'Other', userName: 'other' } }),
-        ], 'must-not-be-used'));
+        tweet({ id: '401', text: 'Second update explains checkpoint recovery.', createdAt: '2026-07-25T12:01:00.000Z' }),
+        tweet({ id: '999', text: 'Unrelated reply', author: { name: 'Other', userName: 'other' } }),
+      ], 'thread-page-2'))
+      .mockResolvedValueOnce(threadResponse([
+        tweet({ id: '402', text: 'Third update with the migration guide.', createdAt: '2026-07-25T12:02:00.000Z' }),
+      ]));
 
-    const result = await makeConnector(fetcher as typeof fetch).search(plan, new AbortController().signal);
+    const result = await makeConnector(fetcher as typeof fetch, { pageBudget: 2 }).search(
+      plan,
+      new AbortController().signal,
+    );
 
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher).toHaveBeenCalledTimes(4);
     const threadUrl = String(fetcher.mock.calls[2]![0]);
     expect(threadUrl).toContain('/twitter/tweet/thread_context');
     expect(new URL(threadUrl).searchParams.get('tweetId')).toBe('400');
+    expect(new URL(String(fetcher.mock.calls[3]![0])).searchParams.get('cursor'))
+      .toBe('thread-page-2');
     expect(result.candidates).toHaveLength(1);
     expect(result.candidates[0]!.content).toContain('Second update explains checkpoint recovery.');
     expect(result.candidates[0]!.content).toContain('Third update with the migration guide.');

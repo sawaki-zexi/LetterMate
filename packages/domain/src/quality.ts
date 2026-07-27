@@ -133,6 +133,7 @@ const contentLength = (value: ValidatedSourceCandidate): number =>
 
 export function deduplicateCandidates(
   candidates: readonly ValidatedSourceCandidate[],
+  options: { includeFingerprint?: boolean } = {},
 ): ValidatedSourceCandidate[] {
   const parents = candidates.map((_, index) => index);
   const find = (index: number): number => {
@@ -162,7 +163,7 @@ export function deduplicateCandidates(
       );
     }
     const fingerprint = fingerprints[index];
-    if (fingerprint !== null && fingerprint !== undefined) {
+    if (options.includeFingerprint !== false && fingerprint !== null && fingerprint !== undefined) {
       keys.push(`fingerprint\u0000${fingerprint}`);
     }
     for (const key of keys) {

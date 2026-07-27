@@ -4,7 +4,6 @@ import { ConnectorError, type ConnectorResult, type SourceConnector, type Source
 
 const resultSchema = z.object({ results: z.array(z.object({
   url: z.url(), title: z.string().min(1), excerpt: z.string().optional().nullable(),
-  publishedAt: z.string().optional().nullable(),
 })).max(30) });
 const citationSchema = z.object({ type: z.literal('url_citation'), url_citation: z.object({ url: z.url(), title: z.string().optional() }) });
 const responseSchema = z.object({ choices: z.array(z.object({ message: z.object({
@@ -40,7 +39,7 @@ export class OpenRouterSearchConnector implements SourceConnector {
         connectorId: this.id, sourceType: this.sourceType, platform: 'Web', externalId: null,
         url, title: item.title.trim(), content: null, excerpt: item.excerpt?.trim() || null,
         authorName: null, authorHandle: null,
-        publishedAt: item.publishedAt && Number.isFinite(Date.parse(item.publishedAt)) ? new Date(item.publishedAt).toISOString() : null,
+        publishedAt: null,
         language: null, engagement: {}, proof: { kind: 'ai_citation', connectorId: this.id, citationUrl: url },
       });
     }
@@ -57,15 +56,14 @@ export class OpenRouterSearchConnector implements SourceConnector {
         body: JSON.stringify({
           model: this.config.model, temperature: 0.1, max_tokens: 4_096,
           messages: [
-            { role: 'system', content: 'Use web search to find substantive recent source pages. Return JSON only with a results array containing url, title, excerpt, and publishedAt. Copy URLs exactly from search sources.' },
+            { role: 'system', content: 'Use web search to find substantive recent source pages. Return JSON only with a results array containing url, title, and excerpt. Copy URLs exactly from search sources. Do not infer publication dates.' },
             { role: 'user', content: JSON.stringify({ keyword: plan.keyword, queries: plan.queries, windowStart: plan.windowStart, windowEnd: plan.windowEnd }) },
           ],
           plugins: [{ id: 'web' }], provider: { require_parameters: true },
           response_format: { type: 'json_schema', json_schema: { name: 'web_search_results', strict: true,
             schema: { type: 'object', properties: { results: { type: 'array', maxItems: 30, items: { type: 'object', properties: {
               url: { type: 'string', format: 'uri' }, title: { type: 'string' }, excerpt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-              publishedAt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-            }, required: ['url', 'title', 'excerpt', 'publishedAt'], additionalProperties: false } } }, required: ['results'], additionalProperties: false } } },
+            }, required: ['url', 'title', 'excerpt'], additionalProperties: false } } }, required: ['results'], additionalProperties: false } } },
         }),
       });
       if (response.status === 429) throw new ConnectorError('CONNECTOR_RATE_LIMITED', 'OpenRouter Web Search rate limit reached', true);

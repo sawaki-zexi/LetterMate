@@ -202,13 +202,21 @@ export class TwitterApiIoConnector implements SourceConnector {
     for (const draft of [...drafts.values()]
       .filter((item) => item.isOriginalThread)
       .slice(0, this.threadBudget)) {
-      const context = await this.fetchThreadContext(
-        draft.candidate.externalId!,
-        apiKey,
-        signal,
-      );
-      requestCount += 1;
-      const threadPosts = context.replies
+      const replies: unknown[] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < this.pageBudget; page += 1) {
+        const context = await this.fetchThreadContext(
+          draft.candidate.externalId!,
+          cursor,
+          apiKey,
+          signal,
+        );
+        requestCount += 1;
+        replies.push(...context.replies);
+        cursor = context.next_cursor ?? context.nextCursor ?? null;
+        if (!(context.has_next_page ?? context.hasNextPage) || cursor === null) break;
+      }
+      const threadPosts = replies
         .map((reply) => {
           const parsed = asTweet(reply);
           if (parsed === null) {
@@ -293,11 +301,13 @@ export class TwitterApiIoConnector implements SourceConnector {
 
   private async fetchThreadContext(
     tweetId: string,
+    cursor: string | null,
     apiKey: string,
     signal: AbortSignal,
   ): Promise<ThreadResponse> {
     const url = new URL('/twitter/tweet/thread_context', API_BASE_URL);
     url.searchParams.set('tweetId', tweetId);
+    if (cursor !== null) url.searchParams.set('cursor', cursor);
     const parsed = threadResponseSchema.safeParse(await this.request(url, apiKey, signal));
     if (!parsed.success) {
       throw new ConnectorError('CONNECTOR_RESPONSE_INVALID', 'TwitterAPI.io returned an invalid response', false);

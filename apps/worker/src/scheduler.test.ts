@@ -102,7 +102,46 @@ describe('PrismaTopicScheduleRepository', () => {
       where: {
         id: 'topic-1',
         nextRunAt: dueAt,
-        runStatus: { not: 'running' },
+        OR: [
+          { runStatus: { not: 'running' } },
+          { runLeaseUntil: null },
+          { runLeaseUntil: { lte: finishedAt } },
+        ],
+      },
+      data: {
+        nextRunAt: claimUntil,
+        runStatus: 'queued',
+      },
+    });
+  });
+
+  it('claims a stale initial run even when it has no next scheduled time', async () => {
+    const leaseExpiredAt = new Date('2026-07-27T09:55:00.000Z');
+    const prisma = {
+      topic: {
+        findMany: vi.fn().mockResolvedValue([{
+          id: 'topic-initial', userId: 'user-1', nextRunAt: null,
+          runStatus: 'running', runLeaseUntil: leaseExpiredAt,
+        }]),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+    } as unknown as PrismaClient;
+    const claimUntil = new Date('2026-07-27T10:10:00.000Z');
+
+    const claimed = await new PrismaTopicScheduleRepository(prisma).claimDueTopics(
+      finishedAt,
+      claimUntil,
+      50,
+    );
+
+    expect(claimed).toEqual([{
+      topicId: 'topic-initial', userId: 'user-1', dueAt: leaseExpiredAt,
+    }]);
+    expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith({
+      where: {
+        id: 'topic-initial',
+        runStatus: 'running',
+        runLeaseUntil: leaseExpiredAt,
       },
       data: { nextRunAt: claimUntil, runStatus: 'queued' },
     });

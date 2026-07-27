@@ -31,14 +31,16 @@ export interface CompositionCandidate {
 }
 
 export interface AiGateway {
-  expandTopic(input: { keyword: string }): Promise<ExpandedTopic>;
+  expandTopic(input: { keyword: string; signal?: AbortSignal }): Promise<ExpandedTopic>;
   evaluateCandidates(input: {
     keyword: string;
     candidates: QualityAssessmentCandidate[];
+    signal?: AbortSignal;
   }): Promise<QualityAssessment[]>;
   composeItems(input: {
     keyword: string;
     candidates: CompositionCandidate[];
+    signal?: AbortSignal;
   }): Promise<DiscoveryCandidate[]>;
 }
 

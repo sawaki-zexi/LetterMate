@@ -19,7 +19,7 @@ describe('ContentFetcher', () => {
 
   it.each([
     'http://127.0.0.1/admin', 'http://10.0.0.1/internal', 'http://169.254.169.254/latest/meta-data',
-    'http://[::1]/admin', 'http://[fe90::1]/internal',
+    'http://[::1]/admin', 'http://[fe90::1]/internal', 'http://[::ffff:127.0.0.1]/admin',
   ])('rejects unsafe literal address %s before fetching', async (url) => {
     const request = vi.fn();
     const fetcher = new ContentFetcher({ resolveHostname: publicResolver }, request as typeof fetch);
@@ -32,6 +32,53 @@ describe('ContentFetcher', () => {
     const fetcher = new ContentFetcher({ resolveHostname: async () => ['192.168.1.12'] }, request as typeof fetch);
     await expect(fetcher.fetchText('https://private.example/article')).rejects.toMatchObject({ code: 'UNSAFE_SOURCE_URL' });
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it('rejects a hostname resolving to an IPv4-mapped private IPv6 address', async () => {
+    const request = vi.fn();
+    const fetcher = new ContentFetcher({ resolveHostname: async () => ['::ffff:7f00:1'] }, request as typeof fetch);
+
+    await expect(fetcher.fetchText('https://private.example/article')).rejects.toMatchObject({ code: 'UNSAFE_SOURCE_URL' });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('pins the validated DNS address on the actual request', async () => {
+    const resolver = vi.fn(publicResolver);
+    const request = vi.fn().mockResolvedValue(makeResponse('Public body content.'));
+    const fetcher = new ContentFetcher({ resolveHostname: resolver }, request as typeof fetch);
+
+    await fetcher.fetchText('https://example.com/article');
+
+    expect(resolver).toHaveBeenCalledOnce();
+    expect(request.mock.calls[0]![1]).toHaveProperty('dispatcher');
+  });
+
+  it('keeps the timeout active while reading the response body', async () => {
+    vi.useFakeTimers();
+    try {
+      const request = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const signal = init?.signal;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('partial'));
+            signal?.addEventListener('abort', () => {
+              controller.error(new DOMException('Aborted', 'AbortError'));
+            }, { once: true });
+          },
+        });
+        return new Response(stream, { headers: { 'content-type': 'text/plain' } });
+      });
+      const fetcher = new ContentFetcher({ resolveHostname: publicResolver, timeoutMs: 20 }, request as typeof fetch);
+      const result = fetcher.fetchText('https://example.com/slow');
+      let rejection: unknown;
+      void result.catch((error: unknown) => { rejection = error; });
+
+      await vi.advanceTimersByTimeAsync(21);
+
+      expect(rejection).toMatchObject({ code: 'CONTENT_FETCH_TIMEOUT' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('validates redirects, redirect count, MIME type, and response size', async () => {

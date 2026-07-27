@@ -29,6 +29,7 @@ describe('OpenRouterSearchConnector', () => {
     expect(result).toMatchObject({ requestCount: 1, candidates: [expect.objectContaining({
       connectorId: 'openrouter-search', sourceType: 'web', platform: 'Web', externalId: null,
       url: 'https://example.com/release', title: 'Agent release', excerpt: 'Detailed release and migration notes.',
+      publishedAt: null,
       proof: { kind: 'ai_citation', connectorId: 'openrouter-search', citationUrl: 'https://example.com/release' },
     })] });
     expect(result.candidates).toHaveLength(1);

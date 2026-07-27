@@ -50,10 +50,17 @@ function createPrisma(existingUrls: string[] = []) {
     topic: {
       update: vi.fn().mockResolvedValue(topicRow),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      findFirst: vi.fn().mockResolvedValue({
+        ...topicRow,
+        activeRunId: null,
+        runLeaseUntil: null,
+        manualRefreshPending: false,
+      }),
     },
     discoveryRun: {
       create: vi.fn().mockResolvedValue({ id: 'run-1' }),
       update: vi.fn().mockResolvedValue({ id: 'run-1' }),
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
     discoveryItem: {
       findMany: vi.fn().mockResolvedValue(
@@ -101,6 +108,7 @@ describe('PrismaDiscoveryRepository', () => {
     expect(runId).toBe('run-1');
     expect(transaction.discoveryRun.create).toHaveBeenCalledWith({
       data: {
+        id: expect.any(String),
         topicId: 'topic-1',
         trigger: 'scheduled',
         status: 'running',
@@ -109,8 +117,21 @@ describe('PrismaDiscoveryRepository', () => {
       select: { id: true },
     });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
-      where: { id: 'topic-1', runStatus: { not: 'running' } },
-      data: { runStatus: 'running', lastError: expect.anything() },
+      where: {
+        id: 'topic-1',
+        activeRunId: null,
+        OR: [
+          { runStatus: { not: 'running' } },
+          { runLeaseUntil: null },
+          { runLeaseUntil: { lte: startedAt } },
+        ],
+      },
+      data: expect.objectContaining({
+        runStatus: 'running',
+        activeRunId: expect.any(String),
+        runLeaseUntil: new Date('2026-07-27T09:20:00.000Z'),
+        lastError: expect.anything(),
+      }),
     });
   });
 
@@ -126,6 +147,48 @@ describe('PrismaDiscoveryRepository', () => {
 
     expect(runId).toBeNull();
     expect(transaction.discoveryRun.create).not.toHaveBeenCalled();
+  });
+
+  it('reclaims a running topic only after its lease expires', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst = vi.fn().mockResolvedValue({
+      ...topicRow,
+      runStatus: 'running',
+      activeRunId: 'stale-run',
+      runLeaseUntil: new Date('2026-07-27T08:59:59.000Z'),
+      manualRefreshPending: false,
+    });
+    transaction.discoveryRun.updateMany = vi.fn().mockResolvedValue({ count: 1 });
+    const startedAt = new Date('2026-07-27T09:00:00.000Z');
+
+    const runId = await new PrismaDiscoveryRepository(prisma).beginRun(
+      'topic-1',
+      'manual',
+      startedAt,
+    );
+
+    expect(runId).toBe('run-1');
+    expect(transaction.topic.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'topic-1',
+        activeRunId: 'stale-run',
+        OR: [
+          { runStatus: { not: 'running' } },
+          { runLeaseUntil: null },
+          { runLeaseUntil: { lte: startedAt } },
+        ],
+      },
+      data: expect.objectContaining({
+        runStatus: 'running',
+        activeRunId: expect.any(String),
+        runLeaseUntil: new Date('2026-07-27T09:20:00.000Z'),
+        manualRefreshPending: false,
+      }),
+    });
+    expect(transaction.discoveryRun.updateMany).toHaveBeenCalledWith({
+      where: { id: 'stale-run', status: 'running' },
+      data: expect.objectContaining({ status: 'failed', finishedAt: startedAt }),
+    });
   });
 
   it('upserts source-aware items and completes a scheduled run', async () => {
@@ -150,6 +213,7 @@ describe('PrismaDiscoveryRepository', () => {
       candidateCount: 4,
       acceptedCount: 1,
       finishedAt,
+      persistenceTimeoutMs: 12_345,
       schedule: {
         nextRunAt: new Date('2026-07-27T16:00:00.000Z'),
         scheduleIntervalHours: 6,
@@ -158,7 +222,11 @@ describe('PrismaDiscoveryRepository', () => {
       },
     });
 
-    expect(result).toEqual({ newItemCount: 1 });
+    expect(result).toEqual({ newItemCount: 1, pendingManualRefresh: false });
+    expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      maxWait: 1_000,
+      timeout: 11_345,
+    });
     expect(transaction.discoveryItem.upsert).toHaveBeenCalledWith({
       where: {
         topicId_canonicalPrimaryUrl: {
@@ -236,9 +304,10 @@ describe('PrismaDiscoveryRepository', () => {
       candidateCount: 1,
       acceptedCount: 1,
       finishedAt,
+      persistenceTimeoutMs: 12_345,
     });
 
-    expect(result).toEqual({ newItemCount: 0 });
+    expect(result).toEqual({ newItemCount: 0, pendingManualRefresh: false });
     const topicUpdate = transaction.topic.update.mock.calls.at(-1)?.[0].data;
     expect(topicUpdate).not.toHaveProperty('nextRunAt');
     expect(topicUpdate).not.toHaveProperty('scheduleIntervalHours');
@@ -251,16 +320,27 @@ describe('PrismaDiscoveryRepository', () => {
       'https://example.com/old',
       'https://x.com/project/status/99',
     ]);
+    transaction.discoveryItem.findMany.mockResolvedValue([
+      {
+        canonicalPrimaryUrl: 'https://example.com/old',
+        sourceUrls: ['https://example.com/old', 'https://mirror.example/old'],
+      },
+      {
+        canonicalPrimaryUrl: 'https://x.com/project/status/99',
+        sourceUrls: ['https://x.com/project/status/99'],
+      },
+    ]);
 
     const urls = await new PrismaDiscoveryRepository(prisma).listHistoryUrls('topic-1');
 
     expect(urls).toEqual([
       'https://example.com/old',
+      'https://mirror.example/old',
       'https://x.com/project/status/99',
     ]);
     expect(transaction.discoveryItem.findMany).toHaveBeenCalledWith({
       where: { topicId: 'topic-1' },
-      select: { canonicalPrimaryUrl: true },
+      select: { sourceUrls: true },
     });
   });
 
@@ -314,6 +394,23 @@ describe('PrismaDiscoveryRepository', () => {
     });
     expect(transaction.discoveryItem.upsert).not.toHaveBeenCalled();
   });
+
+  it('does not overwrite a run that has already completed after ownership is lost', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.updateMany.mockResolvedValue({ count: 0 });
+
+    const result = await new PrismaDiscoveryRepository(prisma).saveFailure({
+      runId: 'run-1',
+      topicId: 'topic-1',
+      error: { code: 'DISCOVERY_RUN_TIMEOUT', message: 'Discovery run exceeded its time limit' },
+      finishedAt,
+      status: 'failed',
+    });
+
+    expect(result).toEqual({ pendingManualRefresh: false });
+    expect(transaction.discoveryRun.update).not.toHaveBeenCalled();
+    expect(transaction.topic.update).not.toHaveBeenCalled();
+  });
 });
 
 const sourceCandidate = validateSourceCandidate({
@@ -358,8 +455,11 @@ function createOrchestration() {
       productiveRunStreak: 1,
       emptyRunStreak: 0,
     }),
-    saveSuccess: vi.fn().mockResolvedValue({ newItemCount: 1 }),
-    saveFailure: vi.fn().mockResolvedValue(undefined),
+    saveSuccess: vi.fn().mockResolvedValue({
+      newItemCount: 1,
+      pendingManualRefresh: false,
+    }),
+    saveFailure: vi.fn().mockResolvedValue({ pendingManualRefresh: false }),
   };
   const gateway = {
     expandTopic: vi.fn().mockResolvedValue({
@@ -408,7 +508,10 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
       'scheduled',
       new Date('2026-07-27T09:00:00.000Z'),
     );
-    expect(gateway.expandTopic).toHaveBeenCalledWith({ keyword: 'AI Agent' });
+    expect(gateway.expandTopic).toHaveBeenCalledWith({
+      keyword: 'AI Agent',
+      signal: expect.any(AbortSignal),
+    });
     expect(registry.search).toHaveBeenCalledWith(
       expect.objectContaining({
         keyword: 'AI Agent',
@@ -478,6 +581,26 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     expect(repository.saveSuccess.mock.calls[0]?.[0]).not.toHaveProperty('schedule');
   });
 
+  it('continues with one persisted pending manual refresh after the active run', async () => {
+    const { service, repository, gateway } = createOrchestration();
+    repository.beginRun
+      .mockResolvedValueOnce('run-1')
+      .mockResolvedValueOnce('run-2');
+    repository.saveSuccess
+      .mockResolvedValueOnce({ newItemCount: 1, pendingManualRefresh: true })
+      .mockResolvedValueOnce({ newItemCount: 0, pendingManualRefresh: false });
+
+    await service.run('topic-1', 'user-1', 'scheduled');
+
+    expect(repository.beginRun).toHaveBeenNthCalledWith(
+      2,
+      'topic-1',
+      'manual',
+      expect.any(Date),
+    );
+    expect(gateway.expandTopic).toHaveBeenCalledTimes(2);
+  });
+
   it('fails safely when every selected connector fails', async () => {
     const { service, repository, registry } = createOrchestration();
     registry.search.mockResolvedValue({
@@ -543,5 +666,123 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
 
     expect(repository.beginRun).not.toHaveBeenCalled();
     expect(gateway.expandTopic).not.toHaveBeenCalled();
+  });
+
+  it('maps a Prisma transaction timeout to the discovery timeout contract', async () => {
+    const { service, repository } = createOrchestration();
+    repository.saveSuccess.mockRejectedValue(Object.assign(
+      new Error('Transaction API error'),
+      { code: 'P2028' },
+    ));
+
+    await expect(service.run('topic-1', 'user-1', 'scheduled'))
+      .rejects.toMatchObject({ code: 'DISCOVERY_RUN_TIMEOUT' });
+
+    expect(repository.saveFailure).toHaveBeenCalledWith(expect.objectContaining({
+      error: expect.objectContaining({ code: 'DISCOVERY_RUN_TIMEOUT' }),
+    }));
+  });
+
+  it('aborts AI work at the overall deadline and never saves success', async () => {
+    vi.useFakeTimers();
+    try {
+      const { repository, gateway, registry, qualityPipeline } = createOrchestration();
+      gateway.expandTopic.mockImplementation(({ signal }: { signal?: AbortSignal }) => (
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        })
+      ));
+      const service = new TopicDiscoveryService({
+        gateway,
+        registry,
+        qualityPipeline,
+        repository: repository as unknown as DiscoveryRepository,
+        timeoutMs: 20,
+      });
+
+      const pending = service.run('topic-1', 'user-1', 'scheduled');
+      const rejection = pending.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(21);
+
+      await expect(rejection).resolves.toMatchObject({ code: 'DISCOVERY_RUN_TIMEOUT' });
+      expect(repository.saveSuccess).not.toHaveBeenCalled();
+      expect(repository.saveFailure).toHaveBeenCalledWith(expect.objectContaining({
+        error: {
+          code: 'DISCOVERY_RUN_TIMEOUT',
+          message: 'Discovery run exceeded its time limit',
+        },
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('checks the overall deadline again after reading schedule state', async () => {
+    vi.useFakeTimers();
+    try {
+      const { repository, gateway, registry, qualityPipeline } = createOrchestration();
+      let releaseSchedule!: () => void;
+      repository.getScheduleState.mockImplementation(() => new Promise((resolve) => {
+        releaseSchedule = () => resolve({
+          scheduleIntervalHours: 12,
+          productiveRunStreak: 0,
+          emptyRunStreak: 0,
+        });
+      }));
+      const service = new TopicDiscoveryService({
+        gateway, registry, qualityPipeline,
+        repository: repository as unknown as DiscoveryRepository,
+        timeoutMs: 20,
+      });
+
+      const pending = service.run('topic-1', 'user-1', 'scheduled');
+      const rejection = expect(pending).rejects.toMatchObject({ code: 'DISCOVERY_RUN_TIMEOUT' });
+      await vi.waitFor(() => expect(repository.getScheduleState).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(21);
+      releaseSchedule();
+
+      await rejection;
+      expect(repository.saveSuccess).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not return success when the overall deadline expires during persistence', async () => {
+    vi.useFakeTimers();
+    try {
+      const { repository, gateway, registry, qualityPipeline } = createOrchestration();
+      let releaseSave!: () => void;
+      repository.saveSuccess.mockImplementation(() => new Promise((resolve) => {
+        releaseSave = () => resolve({ newItemCount: 1, pendingManualRefresh: false });
+      }));
+      const service = new TopicDiscoveryService({
+        gateway, registry, qualityPipeline,
+        repository: repository as unknown as DiscoveryRepository,
+        timeoutMs: 20,
+      });
+
+      const pending = service.run('topic-1', 'user-1', 'scheduled');
+      const rejection = pending.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      await vi.waitFor(() => expect(repository.saveSuccess).toHaveBeenCalledOnce());
+      expect(repository.saveSuccess).toHaveBeenCalledWith(expect.objectContaining({
+        persistenceTimeoutMs: expect.any(Number),
+      }));
+      await vi.advanceTimersByTimeAsync(21);
+      releaseSave();
+
+      await expect(rejection).resolves.toMatchObject({ code: 'DISCOVERY_RUN_TIMEOUT' });
+      expect(repository.saveFailure).toHaveBeenCalledWith(expect.objectContaining({
+        error: expect.objectContaining({ code: 'DISCOVERY_RUN_TIMEOUT' }),
+      }));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -27,32 +27,60 @@ export class QualityPipeline {
   constructor(private readonly contentFetcher: ContentFetcherLike, private readonly gateway: QualityAiGateway) {}
 
   async run(input: QualityPipelineInput): Promise<DiscoveryCandidate[]> {
-    const inWindow = input.candidates.filter((item) => !rejectCandidate(item, {
-      windowStart: input.windowStart, windowEnd: input.windowEnd,
-    }).rejected);
-    const deduplicated = deduplicateCandidates(inWindow);
+    const preliminarilyEligible = input.candidates.filter((item) => {
+      const rejection = rejectCandidate(item, {
+        windowStart: input.windowStart,
+        windowEnd: input.windowEnd,
+      });
+      return !rejection.rejected || rejection.reason === 'INSUFFICIENT_CONTENT';
+    });
+    const deduplicated = deduplicateCandidates(
+      preliminarilyEligible,
+      { includeFingerprint: false },
+    );
     const history = new Set(input.historyUrls.map((url) => canonicalizeUrl(url)));
     const unseen = deduplicated.filter((item) => !history.has(item.canonicalUrl));
     const enriched: ValidatedSourceCandidate[] = [];
     for (const item of unseen) {
-      const needsBody = (item.sourceType === 'web' || item.sourceType === 'feed') && item.content === null;
+      const needsBody = (
+        item.sourceType === 'web' || item.sourceType === 'feed'
+      ) && (item.content === null || item.content.trim().length < 40);
       if (!needsBody) { enriched.push(item); continue; }
       try {
         const fetched = await this.contentFetcher.fetchText(item.canonicalUrl, input.signal);
         const normalized = validateSourceCandidate({
           ...item, title: item.title ?? fetched.title, content: fetched.text,
         });
-        if (!rejectCandidate(normalized, { windowStart: input.windowStart, windowEnd: input.windowEnd }).rejected) enriched.push(normalized);
+        enriched.push(normalized);
       } catch {
         // High precision mode drops candidates whose required body cannot be fetched safely.
       }
     }
-    if (enriched.length === 0) return [];
+    const qualified = enriched.filter((item) => !rejectCandidate(item, {
+      windowStart: input.windowStart,
+      windowEnd: input.windowEnd,
+    }).rejected);
+    const finalCandidates = deduplicateCandidates(qualified);
+    if (finalCandidates.length === 0) return [];
 
-    const assessmentCandidates = this.toAssessmentCandidates(enriched);
-    const assessments = await this.gateway.evaluateCandidates({ keyword: input.keyword, candidates: assessmentCandidates });
-    const decisions = this.validateAssessments(assessments, new Set(assessmentCandidates.map((item) => item.id)));
-    const accepted = enriched.flatMap((candidate) => {
+    const decisions = new Map<string, QualityAssessment>();
+    for (let offset = 0; offset < finalCandidates.length; offset += 30) {
+      if (input.signal?.aborted) throw new Error('Quality pipeline was aborted');
+      const assessmentCandidates = this.toAssessmentCandidates(
+        finalCandidates.slice(offset, offset + 30),
+      );
+      const assessments = await this.gateway.evaluateCandidates({
+        keyword: input.keyword,
+        candidates: assessmentCandidates,
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      const batch = this.validateAssessments(
+        assessments,
+        new Set(assessmentCandidates.map((item) => item.id)),
+      );
+      for (const [id, assessment] of batch) decisions.set(id, assessment);
+    }
+    const accepted = finalCandidates.flatMap((candidate) => {
       const assessment = decisions.get(candidate.canonicalUrl);
       return assessment?.accepted ? [{ candidate, assessment }] : [];
     });
@@ -61,7 +89,12 @@ export class QualityPipeline {
     const selectedCandidates = selectDiverseCandidates(accepted.map(({ candidate }) => candidate), 8);
     const acceptedById = new Map(accepted.map((item) => [item.candidate.canonicalUrl, item]));
     const selected = selectedCandidates.map((candidate) => acceptedById.get(candidate.canonicalUrl)!).filter(Boolean);
-    const rawItems = await this.gateway.composeItems({ keyword: input.keyword, candidates: selected });
+    const compositionCandidates = this.toCompositionCandidates(selected);
+    const rawItems = await this.gateway.composeItems({
+      keyword: input.keyword,
+      candidates: compositionCandidates,
+      ...(input.signal ? { signal: input.signal } : {}),
+    });
     if (!Array.isArray(rawItems) || rawItems.length > 8) throw new QualityPipelineError();
     const allowed = new Map(selected.map(({ candidate }) => [candidate.canonicalUrl, candidate]));
     return rawItems.map((raw) => {
@@ -89,6 +122,33 @@ export class QualityPipeline {
         id: candidate.canonicalUrl, url: candidate.canonicalUrl, sourceType: candidate.sourceType,
         platform: candidate.platform, title: candidate.title, text, authorName: candidate.authorName,
         authorHandle: candidate.authorHandle, publishedAt: candidate.publishedAt,
+      };
+    });
+  }
+
+  private toCompositionCandidates(
+    selected: Array<{ candidate: ValidatedSourceCandidate; assessment: QualityAssessment }>,
+  ): Array<{ candidate: ValidatedSourceCandidate; assessment: QualityAssessment }> {
+    let totalRemaining = 60_000;
+    return selected.map(({ candidate, assessment }, index) => {
+      const remainingItems = selected.length - index;
+      let itemRemaining = Math.min(
+        12_000,
+        Math.floor(totalRemaining / remainingItems),
+      );
+      const take = (value: string | null): string | null => {
+        if (value === null) return null;
+        const result = value.slice(0, itemRemaining);
+        itemRemaining -= result.length;
+        totalRemaining -= result.length;
+        return result;
+      };
+      const title = take(candidate.title);
+      const content = take(candidate.content);
+      const excerpt = take(candidate.excerpt);
+      return {
+        candidate: { ...candidate, title, content, excerpt },
+        assessment,
       };
     });
   }

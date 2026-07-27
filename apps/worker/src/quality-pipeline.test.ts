@@ -49,6 +49,135 @@ describe('QualityPipeline', () => {
     expect(result).toHaveLength(2);
   });
 
+  it('fetches a body before rejecting a web candidate with no title or excerpt', async () => {
+    const web = candidate('bodyless', { title: null, content: null, excerpt: null });
+    const fetchText = vi.fn().mockResolvedValue({
+      finalUrl: web.canonicalUrl,
+      title: 'Recovered article',
+      contentType: 'text/html',
+      text: 'Recovered architecture details, migration steps, measurements, and limitations.',
+    });
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id, accepted: true, kind: 'quality' as const, reason: 'new',
+    })));
+
+    const result = await new QualityPipeline(
+      { fetchText } as never,
+      gateway({ evaluateCandidates }),
+    ).run({ keyword: 'agents', candidates: [web], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
+
+    expect(fetchText).toHaveBeenCalledOnce();
+    expect(evaluateCandidates).toHaveBeenCalledOnce();
+    expect(result).toHaveLength(1);
+  });
+
+  it('deduplicates matching fetched bodies before AI review', async () => {
+    const first = candidate('mirror-a', { content: null, excerpt: null, title: 'Shared release' });
+    const second = candidate('mirror-b', { content: null, excerpt: null, title: ' shared release ' });
+    const fetchText = vi.fn().mockResolvedValue({
+      finalUrl: first.canonicalUrl,
+      title: 'Shared release',
+      contentType: 'text/html',
+      text: 'The release adds offline support, deterministic synchronization, and a complete migration guide.',
+    });
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id, accepted: true, kind: 'quality' as const, reason: 'new',
+    })));
+
+    await new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates })).run({
+      keyword: 'agents', candidates: [first, second], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+
+    expect(fetchText).toHaveBeenCalledTimes(2);
+    expect(evaluateCandidates.mock.calls[0]![0].candidates).toHaveLength(1);
+  });
+
+  it('assesses large candidate sets in batches of at most thirty', async () => {
+    const candidates = Array.from({ length: 35 }, (_, index) => candidate(String(index), {
+      content: `Substantive candidate ${index} with architecture, measurements, migration details, and limitations.`,
+    }));
+    const evaluateCandidates = vi.fn(async ({ candidates: batch }) => batch.map(({ id }: { id: string }) => ({
+      id, accepted: true, kind: 'quality' as const, reason: 'new',
+    })));
+
+    await new QualityPipeline(
+      { fetchText: vi.fn() } as never,
+      gateway({ evaluateCandidates }),
+    ).run({ keyword: 'agents', candidates, historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
+
+    expect(evaluateCandidates).toHaveBeenCalledTimes(2);
+    expect(evaluateCandidates.mock.calls.map(([input]) => input.candidates.length)).toEqual([30, 5]);
+  });
+
+  it('limits the full text sent to final composition', async () => {
+    const source = candidate('large', { content: 'x'.repeat(100_000) });
+    const composeItems = vi.fn(async ({ candidates }) => candidates.map(
+      ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => composed(item),
+    ));
+
+    await new QualityPipeline(
+      { fetchText: vi.fn() } as never,
+      gateway({ composeItems }),
+    ).run({ keyword: 'agents', candidates: [source], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
+
+    const composedSource = composeItems.mock.calls[0]![0].candidates[0].candidate;
+    expect(composedSource.content?.length).toBeLessThanOrEqual(12_000);
+  });
+
+  it('reserves composition source text for every selected candidate', async () => {
+    const sources = Array.from({ length: 8 }, (_, index) => candidate(`budget-${index}`, {
+      content: `${index}`.repeat(20_000),
+    }));
+    const composeItems = vi.fn(async ({ candidates }) => candidates.map(
+      ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => composed(item),
+    ));
+
+    await new QualityPipeline(
+      { fetchText: vi.fn() } as never,
+      gateway({ composeItems }),
+    ).run({ keyword: 'agents', candidates: sources, historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
+
+    const compositionCandidates = composeItems.mock.calls[0]![0].candidates;
+    expect(compositionCandidates).toHaveLength(8);
+    expect(compositionCandidates.every(({
+      candidate: item,
+    }: { candidate: ValidatedSourceCandidate }) => (
+      (item.title?.length ?? 0) + (item.content?.length ?? 0) + (item.excerpt?.length ?? 0) > 0
+    ))).toBe(true);
+  });
+
+  it('fetches full content when a feed only provides a short description', async () => {
+    const feed = candidate('short-feed', {
+      connectorId: 'rss', sourceType: 'feed', platform: 'Project Feed',
+      content: 'Short description.', excerpt: null,
+      proof: {
+        kind: 'feed_entry', connectorId: 'rss',
+        feedUrl: 'https://example.com/feed.xml', entryId: 'short-feed',
+      },
+    });
+    const fetchText = vi.fn().mockResolvedValue({
+      finalUrl: feed.canonicalUrl, title: feed.title, contentType: 'text/html',
+      text: 'Complete release details with architecture, measurements, migration steps, and limitations.',
+    });
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id, accepted: true, kind: 'quality' as const, reason: 'new',
+    })));
+
+    await new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates })).run({
+      keyword: 'agents', candidates: [feed], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+
+    expect(fetchText).toHaveBeenCalledWith(feed.canonicalUrl, undefined);
+    expect(evaluateCandidates.mock.calls[0]![0].candidates[0].text)
+      .toContain('Complete release details');
+  });
+
   it('rejects low-value, duplicate, and historical candidates before AI review', async () => {
     const accepted = candidate('1', { content: 'A substantive article with detailed architecture, benchmarks, migration steps, and limitations.' });
     const lowValue = candidate('search', { url: 'https://low.example/search?q=agents', content: 'thin' });

@@ -76,24 +76,59 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
 
   async claimDueTopics(now: Date, claimUntil: Date, limit: number): Promise<ClaimedTopic[]> {
     const dueTopics = await this.prisma.topic.findMany({
-      where: { nextRunAt: { lte: now }, runStatus: { not: 'running' } },
+      where: {
+        OR: [
+          {
+            nextRunAt: { lte: now },
+            OR: [
+              { runStatus: { not: 'running' } },
+              { runLeaseUntil: null },
+              { runLeaseUntil: { lte: now } },
+            ],
+          },
+          { runStatus: 'running', runLeaseUntil: { lte: now } },
+        ],
+      },
       orderBy: [{ nextRunAt: 'asc' }, { id: 'asc' }],
       take: limit,
-      select: { id: true, userId: true, nextRunAt: true },
+      select: {
+        id: true,
+        userId: true,
+        nextRunAt: true,
+        runStatus: true,
+        runLeaseUntil: true,
+      },
     });
     const claimed: ClaimedTopic[] = [];
     for (const topic of dueTopics) {
-      if (!topic.nextRunAt) continue;
+      const staleRun = topic.runStatus === 'running' &&
+        topic.runLeaseUntil !== null &&
+        topic.runLeaseUntil <= now;
+      const dueAt = staleRun ? topic.runLeaseUntil : topic.nextRunAt;
+      if (!dueAt) continue;
       const result = await this.prisma.topic.updateMany({
-        where: {
-          id: topic.id,
-          nextRunAt: topic.nextRunAt,
-          runStatus: { not: 'running' },
+        where: staleRun
+          ? {
+              id: topic.id,
+              runStatus: 'running',
+              runLeaseUntil: topic.runLeaseUntil,
+            }
+          : {
+              id: topic.id,
+              nextRunAt: topic.nextRunAt,
+              OR: [
+                { runStatus: { not: 'running' } },
+                { runLeaseUntil: null },
+                { runLeaseUntil: { lte: now } },
+              ],
+            },
+        data: {
+          nextRunAt: claimUntil,
+          runStatus: 'queued',
         },
-        data: { nextRunAt: claimUntil, runStatus: 'queued' },
       });
       if (result.count === 1) {
-        claimed.push({ topicId: topic.id, userId: topic.userId, dueAt: topic.nextRunAt });
+        claimed.push({ topicId: topic.id, userId: topic.userId, dueAt });
       }
     }
     return claimed;

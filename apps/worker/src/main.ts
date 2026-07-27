@@ -43,7 +43,10 @@ if (!config.AI_API_KEY) {
     concurrency: config.DISCOVERY_CONNECTOR_CONCURRENCY,
     timeoutMs: Math.min(config.DISCOVERY_RUN_TIMEOUT_MS, 120_000),
   });
-  const repository = new PrismaDiscoveryRepository(prisma);
+  const repository = new PrismaDiscoveryRepository(
+    prisma,
+    config.DISCOVERY_RUN_TIMEOUT_MS + 5 * 60 * 1_000,
+  );
   const service = new TopicDiscoveryService({
     gateway,
     registry,

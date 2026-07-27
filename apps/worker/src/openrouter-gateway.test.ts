@@ -99,6 +99,21 @@ describe('OpenRouterAiGateway', () => {
     expect(body.messages.at(-1).content).toContain('AI Agent');
   });
 
+  it('propagates a parent abort signal to the active OpenRouter request', async () => {
+    const fetcher = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    }));
+    const parent = new AbortController();
+
+    const pending = makeGateway(fetcher as typeof fetch).expandTopic({ keyword: 'AI', signal: parent.signal });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const requestSignal = (fetcher.mock.calls[0]![1] as RequestInit).signal;
+    parent.abort();
+
+    expect(requestSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toMatchObject({ code: 'AI_UPSTREAM_UNAVAILABLE' });
+  });
+
   it('retries invalid JSON exactly once with a correction instruction', async () => {
     const fetcher = vi
       .fn()

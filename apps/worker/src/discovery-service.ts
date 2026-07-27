@@ -9,6 +9,7 @@ import {
 import { canonicalizeUrl } from '@lettermate/domain';
 import { Prisma, type Topic as PrismaTopic } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
 import { AiGatewayError, type AiGateway } from './ai-gateway.js';
 import type { ConnectorSearchSummary, SourceQueryPlan } from './connectors/types.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
@@ -35,6 +36,7 @@ export interface SaveSuccessInput {
   candidateCount: number;
   acceptedCount: number;
   finishedAt: Date;
+  persistenceTimeoutMs: number;
   schedule?: TopicScheduleUpdate;
 }
 
@@ -52,8 +54,11 @@ export interface DiscoveryRepository {
   beginRun(topicId: string, trigger: DiscoveryTrigger, startedAt: Date): Promise<string | null>;
   listHistoryUrls(topicId: string): Promise<string[]>;
   getScheduleState(topicId: string): Promise<TopicScheduleState>;
-  saveSuccess(input: SaveSuccessInput): Promise<{ newItemCount: number }>;
-  saveFailure(input: SaveFailureInput): Promise<void>;
+  saveSuccess(input: SaveSuccessInput): Promise<{
+    newItemCount: number;
+    pendingManualRefresh: boolean;
+  }>;
+  saveFailure(input: SaveFailureInput): Promise<{ pendingManualRefresh: boolean }>;
 }
 
 function mapTopic(topic: PrismaTopic): Topic {
@@ -86,8 +91,27 @@ const safeConnectorSummary = (summary: SafeConnectorRunSummary) => ({
   })),
 });
 
+function persistenceTransactionOptions(persistenceTimeoutMs: number) {
+  const budgetMs = Math.floor(persistenceTimeoutMs);
+  if (!Number.isFinite(budgetMs) || budgetMs <= 0) {
+    throw new Error('Persistence transaction requires a positive timeout budget');
+  }
+  const maxWait = Math.min(1_000, Math.floor(budgetMs / 4));
+  return {
+    maxWait,
+    timeout: Math.max(1, budgetMs - maxWait),
+  };
+}
+
+function isPrismaTransactionTimeout(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2028';
+}
+
 export class PrismaDiscoveryRepository implements DiscoveryRepository {
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly runLeaseMs = 20 * 60 * 1_000,
+  ) {}
 
   async findOwnedTopic(topicId: string, userId: string): Promise<Topic | null> {
     const topic = await this.prisma.topic.findFirst({ where: { id: topicId, userId } });
@@ -100,13 +124,50 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
     startedAt: Date,
   ): Promise<string | null> {
     return this.prisma.$transaction(async (transaction) => {
+      const previous = await transaction.topic.findFirst({
+        where: { id: topicId },
+        select: { activeRunId: true, runStatus: true, runLeaseUntil: true },
+      });
+      if (!previous) return null;
+      const runId = randomUUID();
       const claimed = await transaction.topic.updateMany({
-        where: { id: topicId, runStatus: { not: 'running' } },
-        data: { runStatus: 'running', lastError: Prisma.DbNull },
+        where: {
+          id: topicId,
+          activeRunId: previous.activeRunId,
+          OR: [
+            { runStatus: { not: 'running' } },
+            { runLeaseUntil: null },
+            { runLeaseUntil: { lte: startedAt } },
+          ],
+        },
+        data: {
+          runStatus: 'running',
+          activeRunId: runId,
+          runLeaseUntil: new Date(startedAt.getTime() + this.runLeaseMs),
+          lastError: Prisma.DbNull,
+          ...(trigger === 'manual' ? { manualRefreshPending: false } : {}),
+        },
       });
       if (claimed.count === 0) return null;
+      if (
+        previous.activeRunId &&
+        (
+          previous.runStatus === 'running' ||
+          previous.runLeaseUntil === null ||
+          previous.runLeaseUntil <= startedAt
+        )
+      ) {
+        await transaction.discoveryRun.updateMany({
+          where: { id: previous.activeRunId, status: 'running' },
+          data: {
+            status: 'failed',
+            finishedAt: startedAt,
+            error: { code: 'RUN_LEASE_EXPIRED', message: 'Discovery run lease expired' },
+          },
+        });
+      }
       const run = await transaction.discoveryRun.create({
-        data: { topicId, trigger, status: 'running', startedAt },
+        data: { id: runId, topicId, trigger, status: 'running', startedAt },
         select: { id: true },
       });
       return run.id;
@@ -116,9 +177,9 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
   async listHistoryUrls(topicId: string): Promise<string[]> {
     const items = await this.prisma.discoveryItem.findMany({
       where: { topicId },
-      select: { canonicalPrimaryUrl: true },
+      select: { sourceUrls: true },
     });
-    return items.map(({ canonicalPrimaryUrl }) => canonicalPrimaryUrl);
+    return unique(items.flatMap(({ sourceUrls }) => sourceUrls.map(canonicalizeUrl)));
   }
 
   async getScheduleState(topicId: string): Promise<TopicScheduleState> {
@@ -145,8 +206,34 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
     };
   }
 
-  async saveSuccess(input: SaveSuccessInput): Promise<{ newItemCount: number }> {
+  async saveSuccess(input: SaveSuccessInput): Promise<{
+    newItemCount: number;
+    pendingManualRefresh: boolean;
+  }> {
     return this.prisma.$transaction(async (transaction) => {
+      const ownership = await transaction.topic.updateMany({
+        where: {
+          id: input.topicId,
+          activeRunId: input.runId,
+          runLeaseUntil: { gt: input.finishedAt },
+        },
+        data: { activeRunId: input.runId },
+      });
+      if (ownership.count === 0) {
+        await transaction.discoveryRun.update({
+          where: { id: input.runId },
+          data: {
+            status: 'failed',
+            finishedAt: input.finishedAt,
+            error: { code: 'RUN_LEASE_LOST', message: 'Discovery run lease was lost' },
+          },
+        });
+        return { newItemCount: 0, pendingManualRefresh: false };
+      }
+      const topicState = await transaction.topic.findFirst({
+        where: { id: input.topicId },
+        select: { manualRefreshPending: true },
+      });
       const normalizedItems = input.items.flatMap((item) => {
         const sourceUrls = unique(item.sourceUrls.map(canonicalizeUrl));
         const canonicalPrimaryUrl = sourceUrls[0];
@@ -205,18 +292,32 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         where: { id: input.topicId },
         data: {
           expandedTerms: unique(input.expandedTerms),
-          runStatus: 'succeeded',
+          runStatus: topicState?.manualRefreshPending ? 'queued' : 'succeeded',
           lastRunAt: input.finishedAt,
           lastError: Prisma.DbNull,
+          activeRunId: null,
+          runLeaseUntil: null,
           ...(input.schedule ?? {}),
         },
       });
-      return { newItemCount };
-    });
+      return {
+        newItemCount,
+        pendingManualRefresh: topicState?.manualRefreshPending ?? false,
+      };
+    }, persistenceTransactionOptions(input.persistenceTimeoutMs));
   }
 
-  async saveFailure(input: SaveFailureInput): Promise<void> {
-    await this.prisma.$transaction(async (transaction) => {
+  async saveFailure(input: SaveFailureInput): Promise<{ pendingManualRefresh: boolean }> {
+    return this.prisma.$transaction(async (transaction) => {
+      const ownership = await transaction.topic.updateMany({
+        where: {
+          id: input.topicId,
+          activeRunId: input.runId,
+          runLeaseUntil: { gt: input.finishedAt },
+        },
+        data: { activeRunId: input.runId },
+      });
+      if (ownership.count === 0) return { pendingManualRefresh: false };
       await transaction.discoveryRun.update({
         where: { id: input.runId },
         data: {
@@ -225,15 +326,22 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
           error: input.error,
         },
       });
+      const topicState = await transaction.topic.findFirst({
+        where: { id: input.topicId },
+        select: { manualRefreshPending: true },
+      });
       await transaction.topic.update({
         where: { id: input.topicId },
         data: {
-          runStatus: input.status,
+          runStatus: topicState?.manualRefreshPending ? 'queued' : input.status,
           lastRunAt: input.finishedAt,
           lastError: input.error,
+          activeRunId: null,
+          runLeaseUntil: null,
           ...(input.schedule ?? {}),
         },
       });
+      return { pendingManualRefresh: topicState?.manualRefreshPending ?? false };
     });
   }
 }
@@ -320,9 +428,15 @@ export class TopicDiscoveryService {
     const runId = await this.repository.beginRun(topicId, trigger, startedAt);
     if (runId === null) return;
     const controller = new AbortController();
+    const deadlineAt = Date.now() + this.timeoutMs;
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    let pendingManualRefresh = false;
     try {
-      const expanded = await this.gateway.expandTopic({ keyword: topic.keyword });
+      const expanded = await this.gateway.expandTopic({
+        keyword: topic.keyword,
+        signal: controller.signal,
+      });
+      this.throwIfTimedOut(controller.signal, deadlineAt);
       const expandedTerms = unique([...expanded.terms, ...expanded.searchQueries]);
       const windowEnd = this.now();
       const windowStart = new Date(windowEnd.getTime() - 7 * 24 * 60 * 60 * 1_000);
@@ -339,6 +453,7 @@ export class TopicDiscoveryService {
         this.registry.search(plan, controller.signal),
         this.repository.listHistoryUrls(topicId),
       ]);
+      this.throwIfTimedOut(controller.signal, deadlineAt);
       if (
         connectorResult.successfulConnectorIds.length === 0 &&
         connectorResult.failures.length > 0
@@ -357,6 +472,11 @@ export class TopicDiscoveryService {
         windowEnd: plan.windowEnd,
         signal: controller.signal,
       });
+      this.throwIfTimedOut(controller.signal, deadlineAt);
+      const scheduleState = trigger === 'manual'
+        ? undefined
+        : await this.repository.getScheduleState(topicId);
+      this.throwIfTimedOut(controller.signal, deadlineAt);
       const finishedAt = this.now();
       const schedule = trigger === 'manual'
         ? undefined
@@ -364,10 +484,12 @@ export class TopicDiscoveryService {
             topicId,
             trigger,
             newItemCount: items.length,
-            state: await this.repository.getScheduleState(topicId),
+            state: scheduleState!,
             finishedAt,
           });
-      await this.repository.saveSuccess({
+      this.throwIfTimedOut(controller.signal, deadlineAt);
+      const persistenceTimeoutMs = this.remainingTimeMs(controller.signal, deadlineAt);
+      const saved = await this.repository.saveSuccess({
         runId,
         topicId,
         trigger,
@@ -385,23 +507,70 @@ export class TopicDiscoveryService {
         candidateCount: connectorResult.candidates.length,
         acceptedCount: items.length,
         finishedAt,
+        persistenceTimeoutMs,
         ...(schedule ? { schedule } : {}),
       });
+      this.throwIfTimedOut(controller.signal, deadlineAt);
+      pendingManualRefresh = saved.pendingManualRefresh;
     } catch (error) {
+      const failure = this.isTimedOut(error, controller.signal, deadlineAt)
+        ? new DiscoveryOrchestrationError(
+            'DISCOVERY_RUN_TIMEOUT',
+            'Discovery run exceeded its time limit',
+            true,
+          )
+        : error;
       const finishedAt = this.now();
-      await this.repository.saveFailure({
+      const saved = await this.repository.saveFailure({
         runId,
         topicId,
-        error: toSafeAiError(error),
+        error: toSafeAiError(failure),
         finishedAt,
         status: context.finalAttempt ? 'failed' : 'queued',
         ...(context.finalAttempt && trigger === 'scheduled'
           ? { schedule: calculateFailureSchedule(finishedAt) }
           : {}),
       });
-      throw error;
+      if (saved.pendingManualRefresh && context.finalAttempt) {
+        clearTimeout(timeout);
+        try {
+          await this.run(topicId, userId, 'manual', context);
+        } catch {
+          // The pending run persists its own safe failure state.
+        }
+      }
+      throw failure;
     } finally {
       clearTimeout(timeout);
+    }
+    if (pendingManualRefresh) {
+      await this.run(topicId, userId, 'manual', context);
+    }
+  }
+
+  private remainingTimeMs(signal: AbortSignal, deadlineAt: number): number {
+    const remaining = deadlineAt - Date.now();
+    if (signal.aborted || remaining <= 0) {
+      throw new DiscoveryOrchestrationError(
+        'DISCOVERY_RUN_TIMEOUT',
+        'Discovery run exceeded its time limit',
+        true,
+      );
+    }
+    return remaining;
+  }
+
+  private isTimedOut(error: unknown, signal: AbortSignal, deadlineAt: number): boolean {
+    return signal.aborted || Date.now() >= deadlineAt || isPrismaTransactionTimeout(error);
+  }
+
+  private throwIfTimedOut(signal: AbortSignal, deadlineAt: number): void {
+    if (signal.aborted || Date.now() >= deadlineAt) {
+      throw new DiscoveryOrchestrationError(
+        'DISCOVERY_RUN_TIMEOUT',
+        'Discovery run exceeded its time limit',
+        true,
+      );
     }
   }
 }
