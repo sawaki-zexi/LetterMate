@@ -434,7 +434,23 @@ describe('candidate diversity selection', () => {
     expect(Math.max(...counts)).toBe(Math.floor(6 * 0.4));
   });
 
-  it('returns fewer than the limit instead of breaking diversity after three results', () => {
+  it('keeps five results when bucket availability supports a 2/2/1 split', () => {
+    const candidates = [
+      makeSocialCandidate('Alpha', 'a1'),
+      makeSocialCandidate('Alpha', 'a2'),
+      makeSocialCandidate('Alpha', 'a3'),
+      makeSocialCandidate('Alpha', 'a4'),
+      makeSocialCandidate('Beta', 'b1'),
+      makeSocialCandidate('Beta', 'b2'),
+      makeSocialCandidate('Gamma', 'g1'),
+    ];
+
+    expect(
+      selectDiverseCandidates(candidates, 5).map((candidate) => candidate.externalId),
+    ).toEqual(['a1', 'a2', 'b1', 'b2', 'g1']);
+  });
+
+  it('computes the diversity cap from the feasible final result size', () => {
     const candidates = [
       makeSocialCandidate('Alpha', 'a1'),
       makeSocialCandidate('Alpha', 'a2'),
@@ -444,9 +460,15 @@ describe('candidate diversity selection', () => {
       makeSocialCandidate('Gamma', 'g1'),
     ];
 
+    const selected = selectDiverseCandidates(candidates, 5);
+
+    expect(selected.map((candidate) => candidate.externalId)).toEqual(['a1', 'b1', 'g1']);
+    expect(selected).toHaveLength(3);
     expect(
-      selectDiverseCandidates(candidates, 5).map((candidate) => candidate.externalId),
-    ).toEqual(['a1', 'a2', 'b1', 'g1']);
+      ['Alpha', 'Beta', 'Gamma'].map(
+        (platform) => selected.filter((candidate) => candidate.platform === platform).length,
+      ),
+    ).toEqual([1, 1, 1]);
   });
 
   it('returns an empty result for empty input', () => {

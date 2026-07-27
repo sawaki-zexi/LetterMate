@@ -201,29 +201,54 @@ export function selectDiverseCandidates(
   limit: number,
 ): ValidatedSourceCandidate[] {
   const normalizedLimit = Math.max(0, Math.floor(limit));
-  if (normalizedLimit === 0) return [];
-  const bucketCount = new Set(candidates.map(diversityBucket)).size;
-  if (normalizedLimit < 3 || bucketCount < 3) return candidates.slice(0, normalizedLimit);
-
-  const perBucketLimit = Math.max(1, Math.floor(normalizedLimit * 0.4));
-  const selectedIndices = new Set<number>();
-  const selectedPerBucket = new Map<string, number>();
-  for (const [index, candidate] of candidates.entries()) {
-    if (selectedIndices.size === normalizedLimit) break;
-    const bucket = diversityBucket(candidate);
-    const count = selectedPerBucket.get(bucket) ?? 0;
-    if (count >= perBucketLimit) continue;
-    selectedIndices.add(index);
-    selectedPerBucket.set(bucket, count + 1);
+  const maximumResultSize = Math.min(normalizedLimit, candidates.length);
+  if (maximumResultSize === 0) return [];
+  const buckets = candidates.map(diversityBucket);
+  const availablePerBucket = new Map<string, number>();
+  for (const bucket of buckets) {
+    availablePerBucket.set(bucket, (availablePerBucket.get(bucket) ?? 0) + 1);
   }
-  const minimumResultSize = Math.min(3, normalizedLimit);
-  if (selectedIndices.size < minimumResultSize) {
+  if (maximumResultSize < 3 || availablePerBucket.size < 3) {
+    return candidates.slice(0, maximumResultSize);
+  }
+
+  for (let targetSize = maximumResultSize; targetSize >= 3; targetSize -= 1) {
+    const perBucketLimit = Math.max(1, Math.floor(targetSize * 0.4));
+    const available = [...availablePerBucket.values()].reduce(
+      (total, count) => total + Math.min(count, perBucketLimit),
+      0,
+    );
+    if (available < targetSize) continue;
+
+    const selected: ValidatedSourceCandidate[] = [];
+    const selectedPerBucket = new Map<string, number>();
+    for (const [index, candidate] of candidates.entries()) {
+      if (selected.length === targetSize) break;
+      const bucket = buckets[index];
+      if (bucket === undefined) continue;
+      const count = selectedPerBucket.get(bucket) ?? 0;
+      if (count >= perBucketLimit) continue;
+      selected.push(candidate);
+      selectedPerBucket.set(bucket, count + 1);
+    }
+    return selected;
+  }
+
+  const fallbackSize = Math.min(3, maximumResultSize);
+  const fallbackIndices = new Set<number>();
+  const representedBuckets = new Set<string>();
+  buckets.forEach((bucket, index) => {
+    if (fallbackIndices.size === fallbackSize || representedBuckets.has(bucket)) return;
+    fallbackIndices.add(index);
+    representedBuckets.add(bucket);
+  });
+  if (fallbackIndices.size < fallbackSize) {
     for (const [index] of candidates.entries()) {
-      if (selectedIndices.size === minimumResultSize) break;
-      selectedIndices.add(index);
+      if (fallbackIndices.size === fallbackSize) break;
+      fallbackIndices.add(index);
     }
   }
-  return [...selectedIndices]
+  return [...fallbackIndices]
     .sort((left, right) => left - right)
     .map((index) => candidates[index])
     .filter((candidate): candidate is ValidatedSourceCandidate => candidate !== undefined);
