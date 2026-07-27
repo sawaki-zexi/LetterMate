@@ -1,181 +1,284 @@
-import type {
-  DiscoveryCandidate,
-  SafeError,
-  Topic,
-} from '@lettermate/contracts';
+import type { DiscoveryCandidate } from '@lettermate/contracts';
+import type { PrismaClient } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
-import { AiGatewayError, type AiGateway } from './ai-gateway.js';
-import {
-  TopicDiscoveryService,
-  type DiscoveryRepository,
-} from './discovery-service.js';
+import { PrismaDiscoveryRepository } from './discovery-service.js';
 
-const existingItem: DiscoveryCandidate = {
-  kind: 'quality',
-  title: 'Existing',
-  summary: '旧摘要',
-  reason: '旧理由',
-  sourceUrls: ['https://example.com/existing'],
-  publishedAt: null,
+const finishedAt = new Date('2026-07-27T10:00:00.000Z');
+
+const topicRow = {
+  id: 'topic-1',
+  userId: 'user-1',
+  keyword: 'AI Agent',
+  normalizedKeyword: 'ai agent',
+  expandedTerms: ['agent'],
+  createdAt: new Date('2026-07-24T07:00:00.000Z'),
+  lastRunAt: new Date('2026-07-27T07:00:00.000Z'),
+  nextRunAt: new Date('2026-07-27T19:00:00.000Z'),
+  scheduleIntervalHours: 12,
+  productiveRunStreak: 1,
+  emptyRunStreak: 0,
+  runStatus: 'succeeded' as const,
+  lastError: null,
 };
 
-class FakeDiscoveryRepository implements DiscoveryRepository {
-  currentTopic: Topic = {
-    id: 'topic-1',
-    userId: 'user-a',
-    keyword: 'AI Agent',
-    expandedTerms: [],
-    createdAt: '2026-07-24T07:00:00.000Z',
-    lastRunAt: null,
-    runStatus: 'queued',
-    lastError: null,
+const item: DiscoveryCandidate = {
+  kind: 'quality',
+  title: 'A useful release analysis',
+  summary: 'A concise Chinese summary.',
+  reason: 'It explains the release with concrete implementation details.',
+  sourceUrls: [
+    'https://twitter.com/project/status/100?ref_src=twsrc',
+    'https://example.com/release?utm_source=x',
+  ],
+  publishedAt: '2026-07-27T08:00:00.000Z',
+  sourceType: 'social',
+  platform: 'X',
+  authorName: 'Project Team',
+  authorHandle: 'project',
+  externalId: '100',
+  provenanceKind: 'api_record',
+};
+
+function createPrisma(existingUrls: string[] = []) {
+  const transaction = {
+    topic: {
+      update: vi.fn().mockResolvedValue(topicRow),
+    },
+    discoveryRun: {
+      create: vi.fn().mockResolvedValue({ id: 'run-1' }),
+      update: vi.fn().mockResolvedValue({ id: 'run-1' }),
+    },
+    discoveryItem: {
+      findMany: vi.fn().mockResolvedValue(
+        existingUrls.map((canonicalPrimaryUrl) => ({ canonicalPrimaryUrl })),
+      ),
+      upsert: vi.fn().mockResolvedValue({ id: 'item-1' }),
+    },
   };
-
-  savedItems: DiscoveryCandidate[] = [];
-
-  async findOwnedTopic(topicId: string, userId: string) {
-    return this.currentTopic.id === topicId && this.currentTopic.userId === userId
-      ? this.currentTopic
-      : null;
-  }
-
-  async markRunning() {
-    this.currentTopic = { ...this.currentTopic, runStatus: 'running', lastError: null };
-  }
-
-  async saveSuccess(
-    _topicId: string,
-    expandedTerms: string[],
-    items: DiscoveryCandidate[],
-    finishedAt: Date,
-  ) {
-    this.savedItems = items;
-    this.currentTopic = {
-      ...this.currentTopic,
-      expandedTerms,
-      runStatus: 'succeeded',
-      lastRunAt: finishedAt.toISOString(),
-      lastError: null,
-    };
-  }
-
-  async saveFailure(
-    _topicId: string,
-    error: SafeError,
-    finishedAt: Date,
-    status: 'queued' | 'failed',
-  ) {
-    this.currentTopic = {
-      ...this.currentTopic,
-      runStatus: status,
-      lastRunAt: finishedAt.toISOString(),
-      lastError: error,
-    };
-  }
+  const prisma = {
+    topic: {
+      findFirst: vi.fn().mockResolvedValue(topicRow),
+      update: transaction.topic.update,
+    },
+    discoveryRun: transaction.discoveryRun,
+    discoveryItem: transaction.discoveryItem,
+    $transaction: vi.fn(async (callback: (client: typeof transaction) => unknown) => (
+      callback(transaction)
+    )),
+  };
+  return { prisma: prisma as unknown as PrismaClient, transaction };
 }
 
-describe('TopicDiscoveryService', () => {
-  it('expands, validates and saves citation-backed discoveries', async () => {
-    const gateway: AiGateway = {
-      expandTopic: vi.fn().mockResolvedValue({
-        terms: ['智能体'],
-        searchQueries: ['AI agent latest'],
-      }),
-      discover: vi.fn().mockResolvedValue({
-        citations: ['https://example.com/post'],
-        items: [
-          {
-            kind: 'quality',
-            title: 'Deep guide',
-            summary: '中文摘要',
-            reason: '内容深入',
-            sourceUrls: ['https://example.com/post'],
-            publishedAt: null,
-          },
-        ],
-      }),
-    };
-    const repository = new FakeDiscoveryRepository();
+describe('PrismaDiscoveryRepository', () => {
+  it('maps persisted topic scheduling state', async () => {
+    const { prisma } = createPrisma();
 
-    await new TopicDiscoveryService(
-      gateway,
-      repository,
-      () => new Date('2026-07-24T08:00:00.000Z'),
-    ).run('topic-1', 'user-a');
-
-    expect(repository.savedItems).toHaveLength(1);
-    expect(repository.currentTopic).toMatchObject({
-      expandedTerms: ['智能体', 'AI agent latest'],
-      runStatus: 'succeeded',
-      lastError: null,
-    });
-    expect(gateway.discover).toHaveBeenCalledWith(
-      expect.objectContaining({
-        keyword: 'AI Agent',
-        expandedTerms: ['智能体', 'AI agent latest'],
-        lookbackDays: 7,
-      }),
-    );
-  });
-
-  it('does nothing when the topic does not belong to the job user', async () => {
-    const gateway: AiGateway = {
-      expandTopic: vi.fn(),
-      discover: vi.fn(),
-    };
-
-    await new TopicDiscoveryService(gateway, new FakeDiscoveryRepository()).run(
+    const topic = await new PrismaDiscoveryRepository(prisma).findOwnedTopic(
       'topic-1',
-      'user-b',
+      'user-1',
     );
 
-    expect(gateway.expandTopic).not.toHaveBeenCalled();
-  });
-
-  it('preserves previous items and records a safe gateway failure', async () => {
-    const repository = new FakeDiscoveryRepository();
-    repository.savedItems = [existingItem];
-    const gateway: AiGateway = {
-      expandTopic: vi
-        .fn()
-        .mockRejectedValue(new AiGatewayError('AI_AUTH_FAILED', 'OpenRouter Key 无效', false)),
-      discover: vi.fn(),
-    };
-
-    await expect(
-      new TopicDiscoveryService(gateway, repository).run('topic-1', 'user-a'),
-    ).rejects.toMatchObject({ code: 'AI_AUTH_FAILED' });
-
-    expect(repository.savedItems).toEqual([existingItem]);
-    expect(repository.currentTopic).toMatchObject({
-      runStatus: 'failed',
-      lastError: { code: 'AI_AUTH_FAILED', message: 'OpenRouter Key 无效' },
+    expect(topic).toMatchObject({
+      nextRunAt: '2026-07-27T19:00:00.000Z',
+      scheduleIntervalHours: 12,
     });
   });
 
-  it('fails when model items have no matching citations', async () => {
-    const repository = new FakeDiscoveryRepository();
-    const gateway: AiGateway = {
-      expandTopic: vi.fn().mockResolvedValue({ terms: ['agent'], searchQueries: ['agent news'] }),
-      discover: vi.fn().mockResolvedValue({
-        citations: [],
-        items: [
-          {
-            kind: 'hot',
-            title: 'Invented',
-            summary: '中文摘要',
-            reason: '热门',
-            sourceUrls: ['https://invented.test/post'],
-            publishedAt: null,
-          },
-        ],
-      }),
-    };
+  it('creates a durable running record when a run begins', async () => {
+    const { prisma, transaction } = createPrisma();
+    const repository = new PrismaDiscoveryRepository(prisma);
+    const startedAt = new Date('2026-07-27T09:00:00.000Z');
 
-    await expect(
-      new TopicDiscoveryService(gateway, repository).run('topic-1', 'user-a'),
-    ).rejects.toMatchObject({ code: 'AI_CITATIONS_MISSING' });
-    expect(repository.savedItems).toEqual([]);
-    expect(repository.currentTopic.lastError?.code).toBe('AI_CITATIONS_MISSING');
+    const runId = await repository.beginRun('topic-1', 'scheduled', startedAt);
+
+    expect(runId).toBe('run-1');
+    expect(transaction.discoveryRun.create).toHaveBeenCalledWith({
+      data: {
+        topicId: 'topic-1',
+        trigger: 'scheduled',
+        status: 'running',
+        startedAt,
+      },
+      select: { id: true },
+    });
+    expect(transaction.topic.update).toHaveBeenCalledWith({
+      where: { id: 'topic-1' },
+      data: { runStatus: 'running', lastError: expect.anything() },
+    });
+  });
+
+  it('upserts source-aware items and completes a scheduled run', async () => {
+    const { prisma, transaction } = createPrisma();
+    const repository = new PrismaDiscoveryRepository(prisma);
+
+    const result = await repository.saveSuccess({
+      runId: 'run-1',
+      topicId: 'topic-1',
+      trigger: 'scheduled',
+      expandedTerms: ['agent', 'agent'],
+      items: [item],
+      connectorSummary: {
+        successfulConnectorIds: ['twitterapi-io'],
+        skippedConnectorIds: ['youtube'],
+        failures: [{
+          connectorId: 'reddit',
+          code: 'CONNECTOR_RATE_LIMITED',
+          retryable: true,
+        }],
+      },
+      candidateCount: 4,
+      acceptedCount: 1,
+      finishedAt,
+      schedule: {
+        nextRunAt: new Date('2026-07-27T16:00:00.000Z'),
+        scheduleIntervalHours: 6,
+        productiveRunStreak: 0,
+        emptyRunStreak: 0,
+      },
+    });
+
+    expect(result).toEqual({ newItemCount: 1 });
+    expect(transaction.discoveryItem.upsert).toHaveBeenCalledWith({
+      where: {
+        topicId_canonicalPrimaryUrl: {
+          topicId: 'topic-1',
+          canonicalPrimaryUrl: 'https://x.com/project/status/100',
+        },
+      },
+      create: expect.objectContaining({
+        topicId: 'topic-1',
+        sourceType: 'social',
+        platform: 'X',
+        authorName: 'Project Team',
+        authorHandle: 'project',
+        externalId: '100',
+        provenanceKind: 'api_record',
+      }),
+      update: expect.objectContaining({
+        sourceType: 'social',
+        platform: 'X',
+        externalId: '100',
+        provenanceKind: 'api_record',
+      }),
+    });
+    expect(transaction.discoveryRun.update).toHaveBeenCalledWith({
+      where: { id: 'run-1' },
+      data: expect.objectContaining({
+        status: 'succeeded',
+        finishedAt,
+        connectorSummary: {
+          successfulConnectorIds: ['twitterapi-io'],
+          skippedConnectorIds: ['youtube'],
+          failures: [{
+            connectorId: 'reddit',
+            code: 'CONNECTOR_RATE_LIMITED',
+            retryable: true,
+          }],
+        },
+        candidateCount: 4,
+        acceptedCount: 1,
+        newItemCount: 1,
+        error: expect.anything(),
+      }),
+    });
+    expect(transaction.topic.update).toHaveBeenCalledWith({
+      where: { id: 'topic-1' },
+      data: expect.objectContaining({
+        expandedTerms: ['agent'],
+        runStatus: 'succeeded',
+        lastRunAt: finishedAt,
+        nextRunAt: new Date('2026-07-27T16:00:00.000Z'),
+        scheduleIntervalHours: 6,
+        productiveRunStreak: 0,
+        emptyRunStreak: 0,
+      }),
+    });
+  });
+
+  it('does not change the automatic schedule after a manual run', async () => {
+    const { prisma, transaction } = createPrisma([
+      'https://x.com/project/status/100',
+    ]);
+    const repository = new PrismaDiscoveryRepository(prisma);
+
+    const result = await repository.saveSuccess({
+      runId: 'run-1',
+      topicId: 'topic-1',
+      trigger: 'manual',
+      expandedTerms: [],
+      items: [item],
+      connectorSummary: {
+        successfulConnectorIds: ['twitterapi-io'],
+        skippedConnectorIds: [],
+        failures: [],
+      },
+      candidateCount: 1,
+      acceptedCount: 1,
+      finishedAt,
+    });
+
+    expect(result).toEqual({ newItemCount: 0 });
+    const topicUpdate = transaction.topic.update.mock.calls.at(-1)?.[0].data;
+    expect(topicUpdate).not.toHaveProperty('nextRunAt');
+    expect(topicUpdate).not.toHaveProperty('scheduleIntervalHours');
+    expect(topicUpdate).not.toHaveProperty('productiveRunStreak');
+    expect(topicUpdate).not.toHaveProperty('emptyRunStreak');
+  });
+
+  it('returns canonical URLs for permanent history deduplication', async () => {
+    const { prisma, transaction } = createPrisma([
+      'https://example.com/old',
+      'https://x.com/project/status/99',
+    ]);
+
+    const urls = await new PrismaDiscoveryRepository(prisma).listHistoryUrls('topic-1');
+
+    expect(urls).toEqual([
+      'https://example.com/old',
+      'https://x.com/project/status/99',
+    ]);
+    expect(transaction.discoveryItem.findMany).toHaveBeenCalledWith({
+      where: { topicId: 'topic-1' },
+      select: { canonicalPrimaryUrl: true },
+    });
+  });
+
+  it('records a safe failure without deleting previous items', async () => {
+    const { prisma, transaction } = createPrisma();
+    const repository = new PrismaDiscoveryRepository(prisma);
+    const error = { code: 'AI_AUTH_FAILED', message: 'OpenRouter key is invalid' };
+
+    await repository.saveFailure({
+      runId: 'run-1',
+      topicId: 'topic-1',
+      error,
+      finishedAt,
+      status: 'failed',
+      schedule: {
+        nextRunAt: new Date('2026-07-28T10:00:00.000Z'),
+        scheduleIntervalHours: 24,
+        productiveRunStreak: 0,
+        emptyRunStreak: 0,
+      },
+    });
+
+    expect(transaction.discoveryRun.update).toHaveBeenCalledWith({
+      where: { id: 'run-1' },
+      data: {
+        status: 'failed',
+        finishedAt,
+        error,
+      },
+    });
+    expect(transaction.topic.update).toHaveBeenCalledWith({
+      where: { id: 'topic-1' },
+      data: expect.objectContaining({
+        runStatus: 'failed',
+        lastRunAt: finishedAt,
+        lastError: error,
+        scheduleIntervalHours: 24,
+      }),
+    });
+    expect(transaction.discoveryItem.upsert).not.toHaveBeenCalled();
   });
 });

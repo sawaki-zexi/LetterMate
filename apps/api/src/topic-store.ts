@@ -45,6 +45,8 @@ function mapTopic(topic: PrismaTopic): Topic {
     expandedTerms: topic.expandedTerms,
     createdAt: topic.createdAt.toISOString(),
     lastRunAt: topic.lastRunAt?.toISOString() ?? null,
+    nextRunAt: topic.nextRunAt?.toISOString() ?? null,
+    scheduleIntervalHours: topic.scheduleIntervalHours,
     runStatus: topic.runStatus,
     lastError: error.success ? error.data : null,
   });
@@ -61,6 +63,12 @@ function mapItem(item: PrismaDiscoveryItem): DiscoveryItem {
     sourceUrls: item.sourceUrls,
     publishedAt: item.publishedAt?.toISOString() ?? null,
     discoveredAt: item.discoveredAt.toISOString(),
+    sourceType: item.sourceType,
+    platform: item.platform,
+    authorName: item.authorName,
+    authorHandle: item.authorHandle,
+    externalId: item.externalId,
+    provenanceKind: item.provenanceKind,
   });
 }
 
@@ -178,6 +186,8 @@ export class MemoryTopicStore implements TopicStore {
       expandedTerms: [],
       createdAt: new Date().toISOString(),
       lastRunAt: null,
+      nextRunAt: null,
+      scheduleIntervalHours: 12,
       runStatus: 'queued',
       lastError: null,
     };
@@ -243,6 +253,8 @@ export class MemoryTopicStore implements TopicStore {
       expandedTerms: [],
       createdAt: new Date().toISOString(),
       lastRunAt: null,
+      nextRunAt: null,
+      scheduleIntervalHours: 12,
       runStatus: 'succeeded',
       lastError: null,
     };
@@ -262,6 +274,12 @@ export class MemoryTopicStore implements TopicStore {
       sourceUrls: [`https://example.com/${id}`],
       publishedAt: null,
       discoveredAt: new Date().toISOString(),
+      sourceType: 'web',
+      platform: 'Web',
+      authorName: null,
+      authorHandle: null,
+      externalId: null,
+      provenanceKind: 'ai_citation',
     };
     this.items.push(item);
     return structuredClone(item);
