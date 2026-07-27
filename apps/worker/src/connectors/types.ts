@@ -1,5 +1,5 @@
 import type { SourceType } from '@lettermate/contracts';
-import type { SourceCandidate } from '@lettermate/domain';
+import type { SourceCandidate, ValidatedSourceCandidate } from '@lettermate/domain';
 
 export interface SourceQueryPlan {
   keyword: string;
@@ -33,7 +33,7 @@ export interface ConnectorFailure {
 }
 
 export interface ConnectorSearchSummary {
-  candidates: SourceCandidate[];
+  candidates: ValidatedSourceCandidate[];
   successfulConnectorIds: string[];
   skippedConnectorIds: string[];
   failures: ConnectorFailure[];

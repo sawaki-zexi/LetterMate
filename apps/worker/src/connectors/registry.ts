@@ -6,6 +6,7 @@ import {
   type SourceConnector,
   type SourceQueryPlan,
 } from './types.js';
+import { type ValidatedSourceCandidate, validateSourceCandidate } from '@lettermate/domain';
 
 export interface ConnectorRegistryOptions {
   concurrency: number;
@@ -23,6 +24,13 @@ const toFailure = (connectorId: string, error: unknown): ConnectorFailure => ({
   code: error instanceof ConnectorError ? error.code : 'CONNECTOR_UPSTREAM_UNAVAILABLE',
   message: error instanceof ConnectorError ? error.message : 'Connector is temporarily unavailable',
   retryable: error instanceof ConnectorError ? error.retryable : true,
+});
+
+const copyPlan = (plan: SourceQueryPlan): SourceQueryPlan => ({
+  ...plan,
+  expandedTerms: [...plan.expandedTerms],
+  queries: [...plan.queries],
+  sourceTypes: [...plan.sourceTypes],
 });
 
 export class ConnectorRegistry {
@@ -63,7 +71,7 @@ export class ConnectorRegistry {
     );
     for (const [index, connector] of this.connectors.entries()) {
       try {
-        if (connector.isEnabled() && connector.supports(plan)) {
+        if (connector.isEnabled() && connector.supports(copyPlan(plan))) {
           selected.push({ connector, resultIndex: index });
         } else {
           skippedConnectorIds.push(connector.id);
@@ -118,7 +126,7 @@ export class ConnectorRegistry {
             else parentSignal.addEventListener('abort', cancelConnector, { once: true });
           });
           const result: unknown = await Promise.race(
-            [connector.search(plan, controller.signal), timeout, cancellation],
+            [connector.search(copyPlan(plan), controller.signal), timeout, cancellation],
           );
           if (!isPlainObject(result) || !Array.isArray(result.candidates)) {
             results[resultIndex] = {
@@ -129,8 +137,26 @@ export class ConnectorRegistry {
             };
             continue;
           }
+          let candidates: ValidatedSourceCandidate[];
+          try {
+            candidates = result.candidates.map((item) => {
+              const candidate = validateSourceCandidate(item);
+              if (candidate.connectorId !== connector.id) {
+                throw new Error('Candidate connector ID does not match connector');
+              }
+              return candidate;
+            });
+          } catch {
+            results[resultIndex] = {
+              connectorId: connector.id,
+              code: 'CONNECTOR_RESPONSE_INVALID',
+              message: 'Connector returned an invalid response',
+              retryable: false,
+            };
+            continue;
+          }
           results[resultIndex] = {
-            candidates: [...result.candidates] as ConnectorResult['candidates'],
+            candidates,
             requestCount: typeof result.requestCount === 'number' &&
               Number.isInteger(result.requestCount) && result.requestCount >= 0
               ? result.requestCount

@@ -1,4 +1,4 @@
-import type { SourceCandidate } from '@lettermate/domain';
+import { type SourceCandidate, validateSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ConnectorError,
@@ -38,6 +38,8 @@ const candidate = (connectorId: string): SourceCandidate => ({
     citationUrl: `https://example.com/${connectorId}`,
   },
 });
+
+const normalizedCandidate = (connectorId: string) => validateSourceCandidate(candidate(connectorId));
 
 const connector = (
   id: string,
@@ -117,7 +119,7 @@ describe('ConnectorRegistry', () => {
     ], { concurrency: 2, timeoutMs: 1_000 });
 
     await expect(registry.search(plan)).resolves.toEqual({
-      candidates: [candidate('selected')],
+      candidates: [normalizedCandidate('selected')],
       successfulConnectorIds: ['selected'],
       skippedConnectorIds: ['disabled', 'unsupported'],
       failures: [],
@@ -138,7 +140,7 @@ describe('ConnectorRegistry', () => {
     ], { concurrency: 2, timeoutMs: 1_000 });
 
     await expect(registry.search(plan)).resolves.toEqual({
-      candidates: [candidate('working')],
+      candidates: [normalizedCandidate('working')],
       successfulConnectorIds: ['working'],
       skippedConnectorIds: [],
       failures: [{
@@ -200,7 +202,7 @@ describe('ConnectorRegistry', () => {
     ], { concurrency: 2, timeoutMs: 1_000 });
 
     await expect(registry.search(plan)).resolves.toEqual({
-      candidates: [candidate('working')],
+      candidates: [normalizedCandidate('working')],
       successfulConnectorIds: ['working'],
       skippedConnectorIds: [],
       failures: [{
@@ -252,6 +254,28 @@ describe('ConnectorRegistry', () => {
       successfulConnectorIds: [],
       failures: [{
         connectorId: 'malformed',
+        code: 'CONNECTOR_RESPONSE_INVALID',
+        message: 'Connector returned an invalid response',
+        retryable: false,
+      }],
+    });
+  });
+
+  it('isolates a connector whose candidate fails source-proof validation', async () => {
+    const invalid = candidate('invalid');
+    invalid.url = 'not a URL';
+    const registry = new ConnectorRegistry([
+      connector('invalid', {
+        search: async () => ({ candidates: [invalid] }),
+      }),
+    ], { concurrency: 1, timeoutMs: 1_000 });
+
+    await expect(registry.search(plan)).resolves.toEqual({
+      candidates: [],
+      successfulConnectorIds: [],
+      skippedConnectorIds: [],
+      failures: [{
+        connectorId: 'invalid',
         code: 'CONNECTOR_RESPONSE_INVALID',
         message: 'Connector returned an invalid response',
         retryable: false,
@@ -389,7 +413,7 @@ describe('ConnectorRegistry', () => {
     for (const id of ['four', 'three', 'two', 'one']) release.get(id)?.();
 
     await expect(pending).resolves.toEqual({
-      candidates: [candidate('one'), candidate('three')],
+      candidates: [normalizedCandidate('one'), normalizedCandidate('three')],
       successfulConnectorIds: ['one', 'three'],
       skippedConnectorIds: [],
       failures: [
@@ -433,7 +457,45 @@ describe('ConnectorRegistry', () => {
     const summary = await registry.search(plan);
     connectorCandidates.push(candidate('later'));
 
-    expect(summary.candidates).toEqual([candidate('copied')]);
+    expect(summary.candidates).toEqual([normalizedCandidate('copied')]);
     expect(summary.candidates).not.toBe(connectorCandidates);
+  });
+
+  it('returns normalized candidate objects that cannot be mutated by a connector later', async () => {
+    const connectorCandidate = candidate('isolated');
+    const registry = new ConnectorRegistry([
+      connector('isolated', {
+        search: async () => ({ candidates: [connectorCandidate] }),
+      }),
+    ], { concurrency: 1, timeoutMs: 1_000 });
+
+    const summary = await registry.search(plan);
+    connectorCandidate.engagement.likes = 99;
+    connectorCandidate.proof.connectorId = 'changed';
+
+    expect(summary.candidates).toEqual([normalizedCandidate('isolated')]);
+  });
+
+  it('gives each connector an isolated query plan', async () => {
+    const observedQueries: string[] = [];
+    const registry = new ConnectorRegistry([
+      connector('mutating', {
+        search: async (queryPlan) => {
+          queryPlan.queries.push('poisoned query');
+          return { candidates: [] };
+        },
+      }),
+      connector('observing', {
+        search: async (queryPlan) => {
+          observedQueries.push(...queryPlan.queries);
+          return { candidates: [] };
+        },
+      }),
+    ], { concurrency: 1, timeoutMs: 1_000 });
+
+    await registry.search(plan);
+
+    expect(observedQueries).toEqual(['AI agents latest']);
+    expect(plan.queries).toEqual(['AI agents latest']);
   });
 });
