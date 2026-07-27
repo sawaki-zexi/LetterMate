@@ -9,11 +9,7 @@ import {
   type Job,
 } from 'bullmq';
 import { AiGatewayError } from './ai-gateway.js';
-import {
-  toSafeAiError,
-  type DiscoveryRepository,
-  type TopicDiscoveryService,
-} from './discovery-service.js';
+import type { TopicDiscoveryService } from './discovery-service.js';
 
 export const backoffStrategy: BackoffStrategy = (attemptsMade, _type, error) => {
   if (error instanceof AiGatewayError && error.retryAfterMs !== undefined) {
@@ -24,35 +20,26 @@ export const backoffStrategy: BackoffStrategy = (attemptsMade, _type, error) => 
 
 export function createDiscoveryJobHandler(
   service: Pick<TopicDiscoveryService, 'run'>,
-  repository: Pick<DiscoveryRepository, 'saveFailure'>,
 ) {
   return async (job: Job<DiscoveryJobData>): Promise<void> => {
-    try {
-      await service.run(job.data.topicId, job.data.userId);
-    } catch (error) {
-      const attempts = job.opts.attempts ?? 1;
-      const hasAnotherAttempt = job.attemptsMade + 1 < attempts;
-      if (error instanceof AiGatewayError && error.retryable && hasAnotherAttempt) {
-        await repository.saveFailure(
-          job.data.topicId,
-          toSafeAiError(error),
-          new Date(),
-          'queued',
-        );
-      }
-      throw error;
-    }
+    const attempts = job.opts.attempts ?? 1;
+    const finalAttempt = job.attemptsMade + 1 >= attempts;
+    await service.run(
+      job.data.topicId,
+      job.data.userId,
+      job.data.trigger,
+      { finalAttempt },
+    );
   };
 }
 
 export function createDiscoveryWorker(
   connection: ConnectionOptions,
   service: Pick<TopicDiscoveryService, 'run'>,
-  repository: Pick<DiscoveryRepository, 'saveFailure'>,
 ): Worker<DiscoveryJobData> {
   return new Worker<DiscoveryJobData>(
     discoveryQueueName,
-    createDiscoveryJobHandler(service, repository),
+    createDiscoveryJobHandler(service),
     { connection, settings: { backoffStrategy } },
   );
 }
