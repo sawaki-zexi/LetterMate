@@ -1,19 +1,17 @@
-import { discoveryCandidateSchema, type DiscoveryCandidate, type DiscoveryKind, type SourceType } from '@lettermate/contracts';
+import { discoveryCandidateSchema, type DiscoveryCandidate } from '@lettermate/contracts';
 import {
   canonicalizeUrl, deduplicateCandidates, rejectCandidate, selectDiverseCandidates,
   validateSourceCandidate, type ValidatedSourceCandidate,
 } from '@lettermate/domain';
 import type { FetchedText } from './content-fetcher.js';
+import type {
+  AiGateway,
+  QualityAssessment,
+  QualityAssessmentCandidate,
+} from './ai-gateway.js';
 
-export interface QualityAssessmentCandidate {
-  id: string; url: string; sourceType: SourceType; platform: string; title: string | null;
-  text: string; authorName: string | null; authorHandle: string | null; publishedAt: string | null;
-}
-export interface QualityAssessment { id: string; accepted: boolean; kind: DiscoveryKind | null; reason: string }
-export interface QualityAiGateway {
-  evaluateCandidates(input: { keyword: string; candidates: QualityAssessmentCandidate[] }): Promise<QualityAssessment[]>;
-  composeItems(input: { keyword: string; candidates: Array<{ candidate: ValidatedSourceCandidate; assessment: QualityAssessment }> }): Promise<unknown[]>;
-}
+export type QualityAiGateway = Pick<AiGateway, 'evaluateCandidates' | 'composeItems'>;
+export type { QualityAssessment, QualityAssessmentCandidate } from './ai-gateway.js';
 export interface QualityPipelineInput {
   keyword: string; candidates: ValidatedSourceCandidate[]; historyUrls: string[];
   windowStart: string; windowEnd: string; signal?: AbortSignal;
