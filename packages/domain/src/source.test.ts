@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SourceCandidate } from './source.js';
-import { validateSourceCandidate } from './source.js';
+import { SourceValidationError, validateSourceCandidate } from './source.js';
 
 const makeCandidate = (overrides: Partial<SourceCandidate> = {}): SourceCandidate => ({
   connectorId: 'web-search',
@@ -277,5 +277,113 @@ describe('source candidate validation', () => {
     ['platform', makeCandidate({ platform: '   ' }), 'Platform must not be empty'],
   ])('rejects a blank required %s', (_label, candidate, message) => {
     expect(() => validateSourceCandidate(candidate)).toThrow(message);
+  });
+
+  it('rejects a non-object candidate with a stable validation error', () => {
+    expect(SourceValidationError).toBeTypeOf('function');
+    expect(() => validateSourceCandidate(null)).toThrow(SourceValidationError);
+  });
+
+  it.each([null, []])('rejects a non-object engagement record: %j', (engagement) => {
+    expect(() => validateSourceCandidate({ ...makeCandidate(), engagement })).toThrow(
+      SourceValidationError,
+    );
+  });
+
+  it('rejects an unknown proof kind with a stable validation error', () => {
+    expect(() =>
+      validateSourceCandidate({
+        ...makeCandidate(),
+        proof: { kind: 'unknown', connectorId: 'web-search' },
+      }),
+    ).toThrow(SourceValidationError);
+  });
+
+  it.each([
+    ['connectorId', { ...makeCandidate(), connectorId: 1 }],
+    ['sourceType', { ...makeCandidate(), sourceType: 1 }],
+    ['platform', { ...makeCandidate(), platform: false }],
+    ['externalId', { ...makeCandidate(), externalId: 1 }],
+    ['url', { ...makeCandidate(), url: 1 }],
+    ['title', { ...makeCandidate(), title: 1 }],
+    ['content', { ...makeCandidate(), content: false }],
+    ['excerpt', { ...makeCandidate(), excerpt: {} }],
+    ['authorName', { ...makeCandidate(), authorName: 1 }],
+    ['authorHandle', { ...makeCandidate(), authorHandle: [] }],
+    ['publishedAt', { ...makeCandidate(), publishedAt: 1 }],
+    ['language', { ...makeCandidate(), language: false }],
+    ['engagement value', { ...makeCandidate(), engagement: { likes: '1' } }],
+  ])('rejects the wrong runtime type for %s', (_label, candidate) => {
+    expect(() => validateSourceCandidate(candidate)).toThrow(SourceValidationError);
+  });
+
+  it.each([
+    [
+      'proof connector ID',
+      { kind: 'ai_citation', connectorId: 1, citationUrl: 'https://example.com/article' },
+    ],
+    ['citation URL', { kind: 'ai_citation', connectorId: 'web-search', citationUrl: 1 }],
+    ['API external ID', { kind: 'api_record', connectorId: 'web-search', externalId: 1 }],
+    [
+      'feed URL',
+      { kind: 'feed_entry', connectorId: 'web-search', feedUrl: 1, entryId: 'article' },
+    ],
+    [
+      'feed entry ID',
+      {
+        kind: 'feed_entry',
+        connectorId: 'web-search',
+        feedUrl: 'https://example.com/feed.xml',
+        entryId: 1,
+      },
+    ],
+    ['parent URL', { kind: 'fetched_page', connectorId: 'web-search', parentUrl: 1 }],
+  ])('rejects the wrong runtime type for %s', (_label, proof) => {
+    expect(() => validateSourceCandidate({ ...makeCandidate(), proof })).toThrow(
+      SourceValidationError,
+    );
+  });
+
+  it('copies mutable input structures into the validated candidate', () => {
+    const input = makeCandidate({ engagement: { likes: 1 } });
+    const validated = validateSourceCandidate(input);
+
+    input.engagement.likes = 99;
+    if (input.proof.kind === 'ai_citation') {
+      input.proof.citationUrl = 'https://example.com/changed';
+    }
+
+    expect(validated.engagement).not.toBe(input.engagement);
+    expect(validated.engagement).toEqual({ likes: 1 });
+    expect(validated.proof).not.toBe(input.proof);
+    expect(validated.proof).toMatchObject({ citationUrl: 'https://example.com/article' });
+  });
+
+  it('rejects impossible calendar datetimes while accepting Z and offsets', () => {
+    expect(() =>
+      validateSourceCandidate(makeCandidate({ publishedAt: '2026-02-30T00:00:00Z' })),
+    ).toThrow(SourceValidationError);
+    expect(
+      validateSourceCandidate(makeCandidate({ publishedAt: '2024-02-29T23:59:59Z' })).publishedAt,
+    ).toBe('2024-02-29T23:59:59Z');
+    expect(
+      validateSourceCandidate(makeCandidate({ publishedAt: '2026-07-27T08:30:00+08:00' }))
+        .publishedAt,
+    ).toBe('2026-07-27T08:30:00+08:00');
+  });
+
+  it('lowercases Twitter handles for canonical equivalence', () => {
+    const validated = validateSourceCandidate(
+      makeCandidate({
+        url: 'https://twitter.com/Project/status/123',
+        proof: {
+          kind: 'ai_citation',
+          connectorId: 'web-search',
+          citationUrl: 'https://x.com/project/status/123',
+        },
+      }),
+    );
+
+    expect(validated.canonicalUrl).toBe('https://x.com/project/status/123');
   });
 });

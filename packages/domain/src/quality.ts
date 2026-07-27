@@ -21,11 +21,37 @@ const englishReleaseAction =
 const chineseReleaseAction = /发布|上线|推出|更新|开源|宣布/u;
 const numberedVersion =
   /\b(?:v|version)\s*\d+(?:\.\d+)*\b|\d+(?:\.\d+)*\s*版本/iu;
-const concreteDate = /\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b/u;
-const concreteLink = /https?:\/\//iu;
+
+function hasValidConcreteDate(text: string): boolean {
+  const matches = text.matchAll(/\b(\d{4})([-/.])(\d{1,2})\2(\d{1,2})\b/gu);
+  for (const match of matches) {
+    const year = Number(match[1]);
+    const month = Number(match[3]);
+    const day = Number(match[4]);
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (month >= 1 && month <= 12 && day >= 1 && day <= (daysInMonth[month - 1] ?? 0)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasValidHttpLink(text: string): boolean {
+  const candidates = text.match(/https?:\/\/[^\s]*/giu) ?? [];
+  return candidates.some((candidate) => {
+    const trimmed = candidate.replace(/[),.!?;，。！？；]+$/u, '');
+    try {
+      const url = new URL(trimmed);
+      return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname.length > 0;
+    } catch {
+      return false;
+    }
+  });
+}
 
 function hasConcreteSocialSignal(text: string): boolean {
-  if (numberedVersion.test(text) || concreteDate.test(text) || concreteLink.test(text)) {
+  if (numberedVersion.test(text) || hasValidConcreteDate(text) || hasValidHttpLink(text)) {
     return true;
   }
   if (!englishReleaseAction.test(text) && !chineseReleaseAction.test(text)) return false;
@@ -90,7 +116,7 @@ export function rejectCandidate(
 }
 
 const normalizeFingerprintText = (value: string): string =>
-  value.normalize('NFKC').toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
+  value.normalize('NFKC').toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, '');
 
 function candidateFingerprint(candidate: ValidatedSourceCandidate): string | null {
   const title = normalizeFingerprintText(candidate.title ?? '');
@@ -108,35 +134,66 @@ const contentLength = (value: ValidatedSourceCandidate): number =>
 export function deduplicateCandidates(
   candidates: readonly ValidatedSourceCandidate[],
 ): ValidatedSourceCandidate[] {
-  const unique: ValidatedSourceCandidate[] = [];
-  for (const candidate of candidates) {
-    const fingerprint = candidateFingerprint(candidate);
-    const duplicateIndex = unique.findIndex(
-      (existing) =>
-        existing.canonicalUrl === candidate.canonicalUrl ||
-        (candidate.externalId !== null &&
-          existing.externalId === candidate.externalId &&
-          existing.connectorId === candidate.connectorId &&
-          existing.platform.toLocaleLowerCase() === candidate.platform.toLocaleLowerCase()) ||
-        (fingerprint !== null && candidateFingerprint(existing) === fingerprint),
-    );
-    if (duplicateIndex === -1) {
-      unique.push(candidate);
-      continue;
+  const parents = candidates.map((_, index) => index);
+  const find = (index: number): number => {
+    let root = index;
+    while (parents[root] !== root) root = parents[root] ?? root;
+    while (parents[index] !== index) {
+      const next = parents[index] ?? root;
+      parents[index] = root;
+      index = next;
     }
+    return root;
+  };
+  const union = (left: number, right: number): void => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parents[rightRoot] = leftRoot;
+  };
 
-    const existing = unique[duplicateIndex];
-    if (existing === undefined) continue;
-    if (contentLength(candidate) > contentLength(existing)) unique[duplicateIndex] = candidate;
-  }
-  return unique;
+  const keyOwner = new Map<string, number>();
+  const fingerprints = candidates.map(candidateFingerprint);
+  const lengths = candidates.map(contentLength);
+  candidates.forEach((candidate, index) => {
+    const keys = [`url\u0000${candidate.canonicalUrl}`];
+    if (candidate.externalId !== null) {
+      keys.push(
+        `external\u0000${candidate.connectorId}\u0000${candidate.platform.toLowerCase()}\u0000${candidate.externalId}`,
+      );
+    }
+    const fingerprint = fingerprints[index];
+    if (fingerprint !== null && fingerprint !== undefined) {
+      keys.push(`fingerprint\u0000${fingerprint}`);
+    }
+    for (const key of keys) {
+      const owner = keyOwner.get(key);
+      if (owner === undefined) keyOwner.set(key, index);
+      else union(index, owner);
+    }
+  });
+
+  const groups = new Map<number, { firstIndex: number; bestIndex: number }>();
+  candidates.forEach((_, index) => {
+    const root = find(index);
+    const group = groups.get(root);
+    if (group === undefined) {
+      groups.set(root, { firstIndex: index, bestIndex: index });
+      return;
+    }
+    if ((lengths[index] ?? 0) > (lengths[group.bestIndex] ?? 0)) group.bestIndex = index;
+  });
+
+  return [...groups.values()]
+    .sort((left, right) => left.firstIndex - right.firstIndex)
+    .map(({ bestIndex }) => candidates[bestIndex])
+    .filter((candidate): candidate is ValidatedSourceCandidate => candidate !== undefined);
 }
 
 function diversityBucket(candidate: ValidatedSourceCandidate): string {
   if (candidate.sourceType === 'web' || candidate.sourceType === 'feed') {
-    return new URL(candidate.canonicalUrl).hostname.toLocaleLowerCase();
+    return new URL(candidate.canonicalUrl).hostname.toLowerCase();
   }
-  return candidate.platform.toLocaleLowerCase();
+  return candidate.platform.toLowerCase();
 }
 
 export function selectDiverseCandidates(
@@ -159,9 +216,10 @@ export function selectDiverseCandidates(
     selectedIndices.add(index);
     selectedPerBucket.set(bucket, count + 1);
   }
-  if (selectedIndices.size < normalizedLimit) {
+  const minimumResultSize = Math.min(3, normalizedLimit);
+  if (selectedIndices.size < minimumResultSize) {
     for (const [index] of candidates.entries()) {
-      if (selectedIndices.size === normalizedLimit) break;
+      if (selectedIndices.size === minimumResultSize) break;
       selectedIndices.add(index);
     }
   }

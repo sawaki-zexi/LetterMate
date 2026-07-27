@@ -129,6 +129,63 @@ describe('deterministic candidate rejection', () => {
     },
   );
 
+  it.each(['http://', 'See https://?'])('rejects a malformed short-post link: %s', (content) => {
+    const candidate = makeCandidate({
+      connectorId: 'social-api',
+      sourceType: 'social',
+      platform: 'Social',
+      externalId: `post-${content}`,
+      title: null,
+      content,
+      excerpt: null,
+      authorName: 'Project Team',
+      authorHandle: '@project',
+      proof: {
+        kind: 'api_record',
+        connectorId: 'social-api',
+        externalId: `post-${content}`,
+      },
+    });
+
+    expect(rejectCandidate(candidate)).toEqual({
+      rejected: true,
+      reason: 'INSUFFICIENT_CONTENT',
+    });
+  });
+
+  it('requires a real calendar date for a short-post date signal', () => {
+    const makeDatedPost = (content: string) =>
+      makeCandidate({
+        connectorId: 'social-api',
+        sourceType: 'social',
+        platform: 'Social',
+        externalId: `post-${content}`,
+        title: null,
+        content,
+        excerpt: null,
+        authorName: 'Project Team',
+        authorHandle: '@project',
+        proof: {
+          kind: 'api_record',
+          connectorId: 'social-api',
+          externalId: `post-${content}`,
+        },
+      });
+
+    expect(rejectCandidate(makeDatedPost('2026-99-99'))).toEqual({
+      rejected: true,
+      reason: 'INSUFFICIENT_CONTENT',
+    });
+    expect(rejectCandidate(makeDatedPost('2026-02-30'))).toEqual({
+      rejected: true,
+      reason: 'INSUFFICIENT_CONTENT',
+    });
+    expect(rejectCandidate(makeDatedPost('2026-08-01'))).toEqual({
+      rejected: false,
+      reason: null,
+    });
+  });
+
   it.each(['2026-07-19T23:59:59.000Z', '2026-07-28T00:00:00.001Z'])(
     'rejects a candidate outside the requested time window: %s',
     (publishedAt) => {
@@ -259,20 +316,73 @@ describe('candidate deduplication', () => {
 
     expect(deduplicateCandidates([first, second])).toHaveLength(2);
   });
+
+  it('deduplicates transitive equivalence chains independently of input order', () => {
+    const sharedUrl = 'https://example.com/releases/aurora';
+    const fingerprintTitle = 'Aurora version two release notes';
+    const fingerprintContent =
+      'Aurora version two adds offline support and deterministic synchronization for distributed teams.';
+    const a = makeCandidate({
+      url: sharedUrl,
+      title: fingerprintTitle,
+      content: fingerprintContent,
+      proof: { kind: 'ai_citation', connectorId: 'web-search', citationUrl: sharedUrl },
+    });
+    const richest = makeCandidate({
+      connectorId: 'rss',
+      sourceType: 'feed',
+      url: sharedUrl,
+      title: 'Aurora release with complete migration details',
+      content:
+        'Aurora version two adds offline support, deterministic synchronization, a migration guide, compatibility notes, and rollback instructions for distributed teams.',
+      proof: {
+        kind: 'feed_entry',
+        connectorId: 'rss',
+        feedUrl: 'https://example.com/feed.xml',
+        entryId: 'aurora-v2',
+      },
+    });
+    const c = makeCandidate({
+      connectorId: 'mirror-feed',
+      sourceType: 'feed',
+      platform: 'Mirror',
+      url: 'https://mirror.example.net/aurora-v2',
+      title: `${fingerprintTitle}!`,
+      content: fingerprintContent.toUpperCase(),
+      proof: {
+        kind: 'feed_entry',
+        connectorId: 'mirror-feed',
+        feedUrl: 'https://mirror.example.net/feed.xml',
+        entryId: 'aurora-v2-copy',
+      },
+    });
+    const permutations = [
+      [a, richest, c],
+      [a, c, richest],
+      [richest, a, c],
+      [richest, c, a],
+      [c, a, richest],
+      [c, richest, a],
+    ];
+
+    for (const candidates of permutations) {
+      expect(deduplicateCandidates(candidates)).toEqual([richest]);
+    }
+  });
 });
 
 describe('candidate diversity selection', () => {
   const makeSocialCandidate = (platform: string, id: string) =>
     makeCandidate({
-      connectorId: `${platform.toLocaleLowerCase()}-api`,
+      connectorId: `${platform.toLowerCase()}-api`,
       sourceType: 'social',
       platform,
       externalId: id,
-      url: `https://${platform.toLocaleLowerCase()}.example/posts/${id}`,
-      authorHandle: `@${platform.toLocaleLowerCase()}`,
+      url: `https://${platform.toLowerCase()}.example/posts/${id}`,
+      authorHandle: `@${platform.toLowerCase()}`,
       proof: {
         kind: 'api_record',
-        connectorId: `${platform.toLocaleLowerCase()}-api`,
+        connectorId: `${platform.toLowerCase()}-api`,
         externalId: id,
       },
     });
@@ -310,7 +420,7 @@ describe('candidate diversity selection', () => {
   it('uses a floor-based 40 percent cap for six diverse results', () => {
     const candidates = ['Alpha', 'Beta', 'Gamma'].flatMap((platform) =>
       ['1', '2', '3', '4'].map((id) =>
-        makeSocialCandidate(platform, `${platform.toLocaleLowerCase()}${id}`),
+        makeSocialCandidate(platform, `${platform.toLowerCase()}${id}`),
       ),
     );
 
@@ -324,7 +434,7 @@ describe('candidate diversity selection', () => {
     expect(Math.max(...counts)).toBe(Math.floor(6 * 0.4));
   });
 
-  it('relaxes the cap only to fill a result shortage while retaining order', () => {
+  it('returns fewer than the limit instead of breaking diversity after three results', () => {
     const candidates = [
       makeSocialCandidate('Alpha', 'a1'),
       makeSocialCandidate('Alpha', 'a2'),
@@ -336,7 +446,7 @@ describe('candidate diversity selection', () => {
 
     expect(
       selectDiverseCandidates(candidates, 5).map((candidate) => candidate.externalId),
-    ).toEqual(['a1', 'a2', 'a3', 'b1', 'g1']);
+    ).toEqual(['a1', 'a2', 'b1', 'g1']);
   });
 
   it('returns an empty result for empty input', () => {

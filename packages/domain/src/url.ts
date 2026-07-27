@@ -9,7 +9,7 @@ const trackingParameters = new Set([
 export function canonicalizeUrl(input: string): string {
   const url = new URL(input);
   url.hash = '';
-  url.hostname = url.hostname.toLocaleLowerCase();
+  url.hostname = url.hostname.toLowerCase();
 
   const twitterHosts = new Set([
     'twitter.com',
@@ -20,12 +20,15 @@ export function canonicalizeUrl(input: string): string {
   ]);
   const tweetMatch = url.pathname.match(/^\/([^/]+)\/status\/(\d+)\/?$/i);
   if (twitterHosts.has(url.hostname) && tweetMatch) {
-    const [, handle, tweetId] = tweetMatch;
-    return `https://x.com/${handle}/status/${tweetId}`;
+    const handle = tweetMatch[1];
+    const tweetId = tweetMatch[2];
+    if (handle !== undefined && tweetId !== undefined) {
+      return `https://x.com/${handle.toLowerCase()}/status/${tweetId}`;
+    }
   }
 
   for (const key of [...url.searchParams.keys()]) {
-    if (key.toLocaleLowerCase().startsWith('utm_') || trackingParameters.has(key.toLocaleLowerCase())) {
+    if (key.toLowerCase().startsWith('utm_') || trackingParameters.has(key.toLowerCase())) {
       url.searchParams.delete(key);
     }
   }
