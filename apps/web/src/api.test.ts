@@ -36,14 +36,24 @@ describe('web API client', () => {
     const fetchMock = vi.fn(async () => Response.json([feedItem]));
     vi.stubGlobal('fetch', fetchMock);
 
-    await expect(api.feed({ origin: 'trend', kind: 'hot', topicId: 'topic/a' }))
+    await expect(api.feed({ origin: 'topic', kind: 'hot', topicId: 'topic/a' }))
       .resolves.toEqual([feedItem]);
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/feed?topicId=topic%2Fa&kind=hot&range=30d&origin=trend',
+      '/api/v1/feed?topicId=topic%2Fa&kind=hot&range=30d&origin=topic',
       expect.any(Object),
     );
     expect(() => api.feed({ range: 'recent' as FeedRange })).toThrow();
     expect(() => api.feed({ origin: 'keyword' as FeedOrigin })).toThrow();
+  });
+
+  it('rejects invalid Topic Feed filters before fetching', () => {
+    const fetchMock = vi.fn(async () => Response.json([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect(() => api.feed({ topicId: 'topic-1', origin: 'trend' })).toThrow();
+    expect(() => api.feed({ topicId: '' })).toThrow();
+    expect(() => api.feed({ topicId: '   ' })).toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('rejects legacy item shapes without an origin', async () => {

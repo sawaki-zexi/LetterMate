@@ -8,14 +8,28 @@ import {
   topicInputSchema,
   topicSchema,
   trendStatusSchema,
-  type DiscoveryKind,
-  type FeedOrigin,
-  type FeedRange,
   type TopicInput,
 } from '@lettermate/contracts';
 import { z } from 'zod';
 
 const headers = { 'content-type': 'application/json', 'x-user-id': 'user-a' };
+
+const feedFilterSchema = z.strictObject({
+  topicId: z.string().trim().min(1).optional(),
+  kind: discoveryKindSchema.optional(),
+  range: feedRangeSchema.default('30d'),
+  origin: feedOriginSchema.optional(),
+}).superRefine((filter, context) => {
+  if (filter.topicId && filter.origin === 'trend') {
+    context.addIssue({
+      code: 'custom',
+      path: ['origin'],
+      message: 'topicId cannot be combined with trend origin',
+    });
+  }
+});
+
+type FeedFilter = z.input<typeof feedFilterSchema>;
 
 export class ApiError extends Error {
   constructor(
@@ -63,17 +77,13 @@ export const api = {
     body: JSON.stringify(topicInputSchema.parse(input)),
   }),
   refreshTopic: (id: string) => apiRequest(`/topics/${encodeURIComponent(id)}/refresh`, topicSchema, { method: 'POST' }),
-  feed: (filter: {
-    topicId?: string;
-    kind?: DiscoveryKind;
-    range?: FeedRange;
-    origin?: FeedOrigin;
-  } = {}) => {
+  feed: (filter: FeedFilter = {}) => {
+    const parsed = feedFilterSchema.parse(filter);
     const query = new URLSearchParams(compact({
-      topicId: filter.topicId,
-      kind: filter.kind && discoveryKindSchema.parse(filter.kind),
-      range: feedRangeSchema.parse(filter.range ?? '30d'),
-      origin: filter.origin && feedOriginSchema.parse(filter.origin),
+      topicId: parsed.topicId,
+      kind: parsed.kind,
+      range: parsed.range,
+      origin: parsed.origin,
     }));
     const suffix = query.size ? `?${query.toString()}` : '';
     return apiRequest(`/feed${suffix}`, z.array(feedItemSchema));
