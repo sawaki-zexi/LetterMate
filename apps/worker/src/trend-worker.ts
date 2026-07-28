@@ -29,7 +29,7 @@ export const manualTrendFollowUpJobId = (userId: string, parentJobId: string): s
   `manual-trend-follow-up-${userId}-${parentJobId}`;
 
 export function createTrendJobHandler(
-  service: Pick<TrendDiscoveryService, 'run'>,
+  service: Pick<TrendDiscoveryService, 'run' | 'acknowledgeManualFollowUp'>,
   queue: TrendWorkerQueue,
 ) {
   return async (job: Job<TrendJobData>): Promise<void> => {
@@ -46,16 +46,17 @@ export function createTrendJobHandler(
         jobId: manualTrendFollowUpJobId(data.userId, parentJobId),
         attempts: 3,
         backoff: { type: 'custom' },
-        removeOnComplete: true,
+        removeOnComplete: false,
         removeOnFail: true,
       },
     );
+    await service.acknowledgeManualFollowUp(data.userId);
   };
 }
 
 export function createTrendWorker(
   connection: ConnectionOptions,
-  service: Pick<TrendDiscoveryService, 'run'>,
+  service: Pick<TrendDiscoveryService, 'run' | 'acknowledgeManualFollowUp'>,
   queue: TrendWorkerQueue,
 ): Worker<TrendJobData> {
   return new Worker<TrendJobData>(

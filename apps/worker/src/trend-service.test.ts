@@ -28,9 +28,11 @@ const repository = (overrides: Partial<TrendRepository> = {}): TrendRepository =
   }),
   listRecentFingerprints: vi.fn().mockResolvedValue(new Set()),
   saveSeeds: vi.fn().mockResolvedValue(undefined),
+  updateSeedQueries: vi.fn().mockResolvedValue(undefined),
   listHistoryUrls: vi.fn().mockResolvedValue([]),
   completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 1, followUpManual: false }),
   completeFailure: vi.fn().mockResolvedValue({ followUpManual: false }),
+  acknowledgeManualFollowUp: vi.fn().mockResolvedValue(true),
   ...overrides,
 });
 const sourceSummary = (overrides = {}) => ({
@@ -141,10 +143,17 @@ describe('TrendDiscoveryService', () => {
     const saved = vi.mocked(repo.saveSeeds).mock.calls[0]![0];
     expect(saved.seeds).toHaveLength(30);
     expect(saved.seeds[0]).toEqual(expect.objectContaining({
-      sourceId: 'hacker-news-trends', normalizedQuery: expect.stringContaining('version-1.1'),
+      sourceId: 'hacker-news-trends', normalizedQuery: null,
     }));
     expect(saved.seeds[0]).not.toHaveProperty('rank');
     expect(saved.seeds[0]).not.toHaveProperty('payload');
+    expect(repo.updateSeedQueries).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1',
+      userId: 'user-1',
+      decisions: expect.arrayContaining([
+        expect.objectContaining({ normalizedQuery: expect.stringContaining('version-1.1') }),
+      ]),
+    }));
   });
 
   it('persists rejected technical-filter decisions with a null query', async () => {
@@ -164,7 +173,7 @@ describe('TrendDiscoveryService', () => {
     }));
   });
 
-  it('rejects malformed AI decisions and completes the run as failed without radar items', async () => {
+  it('persists sanitized seeds before AI classification and keeps them after invalid output', async () => {
     const repo = repository();
     const { service } = makeService({
       repository: repo,
@@ -174,7 +183,19 @@ describe('TrendDiscoveryService', () => {
     });
 
     await expect(service.run('user-1', 'scheduled')).rejects.toBeInstanceOf(TrendOrchestrationError);
-    expect(repo.saveSeeds).not.toHaveBeenCalled();
+    expect(repo.saveSeeds).toHaveBeenCalledWith({
+      runId: 'run-1',
+      userId: 'user-1',
+      seeds: [expect.objectContaining({
+        sourceId: 'hacker-news-trends',
+        platform: 'Hacker News',
+        externalId: '42',
+        sourceUrl: 'https://news.ycombinator.com/item?id=42',
+        fingerprint: expect.any(String),
+        normalizedQuery: null,
+      })],
+    });
+    expect(repo.updateSeedQueries).not.toHaveBeenCalled();
     expect(repo.completeSuccess).not.toHaveBeenCalled();
     expect(repo.completeFailure).toHaveBeenCalledOnce();
   });
@@ -243,6 +264,33 @@ describe('PrismaTrendRepository', () => {
       state: 'active', followUpManualRegistered: false,
     });
     expect(transaction.trendMonitor.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes the same queued manual run without clearing a pending follow-up', async () => {
+    const transaction = {
+      trendMonitor: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: 'monitor-1', userId: 'user-1', runStatus: 'queued', activeRunId: 'run-1',
+          runLeaseUntil: new Date('2026-07-28T12:05:00.000Z'), intervalHours: 4,
+          nextRunAt: new Date('2026-07-28T16:00:00.000Z'), manualRefreshPending: true,
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+      trendRun: {
+        findUnique: vi.fn().mockResolvedValue({ trigger: 'manual', status: 'queued' }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+    const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
+
+    await expect(repo.claimRun('user-1', 'manual', now)).resolves.toMatchObject({
+      state: 'claimed', runId: 'run-1', monitorId: 'monitor-1',
+    });
+
+    expect(transaction.trendMonitor.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.not.objectContaining({ manualRefreshPending: false }),
+    }));
   });
 
   it('does not complete failure after its run lease has been lost', async () => {
@@ -326,5 +374,58 @@ describe('PrismaTrendRepository', () => {
         nextRunAt: new Date('2026-07-28T18:00:00.000Z'),
       }),
     }));
+  });
+
+  it('keeps the active lease and pending manual flag across a non-final failure', async () => {
+    const transaction = {
+      trendMonitor: {
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        findUnique: vi.fn().mockResolvedValue({ manualRefreshPending: true, intervalHours: 4 }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      trendRun: { update: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+    const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
+
+    await expect(repo.completeFailure({
+      runId: 'run-1', monitorId: 'monitor-1', userId: 'user-1', trigger: 'scheduled',
+      error: { code: 'FAILED', message: 'Safe failure' }, finishedAt: now, status: 'queued',
+    })).resolves.toEqual({ followUpManual: false });
+
+    expect(transaction.trendMonitor.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        runStatus: 'queued', activeRunId: 'run-1',
+        manualRefreshPending: true,
+      }),
+    }));
+    expect(transaction.trendMonitor.update.mock.calls[0]![0].data)
+      .not.toHaveProperty('runLeaseUntil');
+  });
+
+  it('scopes seed query updates and manual acknowledgements to their owner and run state', async () => {
+    const prisma = {
+      trendSeed: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+      trendMonitor: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    };
+    const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
+
+    await repo.updateSeedQueries({
+      runId: 'run-1', userId: 'user-1',
+      decisions: [{ fingerprint: 'fingerprint-1', normalizedQuery: 'OpenAI gpt-5.7' }],
+    });
+    await expect(repo.acknowledgeManualFollowUp('user-1')).resolves.toBe(true);
+
+    expect(prisma.trendSeed.updateMany).toHaveBeenCalledWith({
+      where: { runId: 'run-1', userId: 'user-1', fingerprint: 'fingerprint-1' },
+      data: { normalizedQuery: 'OpenAI gpt-5.7' },
+    });
+    expect(prisma.trendMonitor.updateMany).toHaveBeenCalledWith({
+      where: {
+        userId: 'user-1', runStatus: 'queued', activeRunId: null,
+        manualRefreshPending: true,
+      },
+      data: { manualRefreshPending: false },
+    });
   });
 });

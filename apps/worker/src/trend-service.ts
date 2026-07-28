@@ -65,8 +65,14 @@ export interface TrendRepository {
     userId: string,
     fingerprints: string[],
     discoveredSince: Date,
+    excludeRunId: string,
   ): Promise<Set<string>>;
   saveSeeds(input: { runId: string; userId: string; seeds: SanitizedTrendSeed[] }): Promise<void>;
+  updateSeedQueries(input: {
+    runId: string;
+    userId: string;
+    decisions: Array<{ fingerprint: string; normalizedQuery: string | null }>;
+  }): Promise<void>;
   listHistoryUrls(userId: string): Promise<string[]>;
   completeSuccess(input: CompleteTrendRunInput): Promise<{
     newItemCount: number;
@@ -81,6 +87,7 @@ export interface TrendRepository {
     finishedAt: Date;
     status: 'queued' | 'failed';
   }): Promise<{ followUpManual: boolean }>;
+  acknowledgeManualFollowUp(userId: string): Promise<boolean>;
 }
 
 const safeError = (error: unknown): SafeError => {
@@ -221,27 +228,40 @@ export class PrismaTrendRepository implements TrendRepository {
       const active = monitor.activeRunId !== null &&
         monitor.runLeaseUntil !== null && monitor.runLeaseUntil > startedAt;
       if (active) {
-        if (trigger === 'scheduled' && monitor.runStatus === 'queued') {
-          const leaseUntil = new Date(startedAt.getTime() + this.runLeaseMs);
-          const claimed = await transaction.trendMonitor.updateMany({
-            where: {
-              id: monitor.id,
-              userId,
-              activeRunId: monitor.activeRunId,
-              runStatus: 'queued',
-              runLeaseUntil: monitor.runLeaseUntil,
-            },
-            data: { runStatus: 'running', runLeaseUntil: leaseUntil, lastError: Prisma.DbNull },
+        const activeRunId = monitor.activeRunId!;
+        if (monitor.runStatus === 'queued') {
+          const queuedRun = await transaction.trendRun.findUnique({
+            where: { id_userId: { id: activeRunId, userId } },
+            select: { trigger: true, status: true },
           });
-          if (claimed.count === 1) {
-            await transaction.trendRun.updateMany({
-              where: { id: monitor.activeRunId!, userId, status: 'queued' },
-              data: { status: 'running', startedAt },
+          const resumesSameRun = queuedRun?.trigger === trigger &&
+            (queuedRun.status === 'queued' || queuedRun.status === 'running');
+          if (!resumesSameRun) {
+            if (trigger !== 'manual' || monitor.manualRefreshPending) {
+              return { state: 'active', followUpManualRegistered: false } as const;
+            }
+          } else {
+            const leaseUntil = new Date(startedAt.getTime() + this.runLeaseMs);
+            const claimed = await transaction.trendMonitor.updateMany({
+              where: {
+                id: monitor.id,
+                userId,
+                activeRunId,
+                runStatus: 'queued',
+                runLeaseUntil: monitor.runLeaseUntil,
+              },
+              data: { runStatus: 'running', runLeaseUntil: leaseUntil, lastError: Prisma.DbNull },
             });
-            return {
-              state: 'claimed', runId: monitor.activeRunId!, monitorId: monitor.id,
-              intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
-            } as const;
+            if (claimed.count === 1) {
+              await transaction.trendRun.updateMany({
+                where: { id: activeRunId, userId, status: { in: ['queued', 'running'] } },
+                data: { status: 'running', startedAt },
+              });
+              return {
+                state: 'claimed', runId: activeRunId, monitorId: monitor.id,
+                intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
+              } as const;
+            }
           }
         }
         if (trigger !== 'manual' || monitor.manualRefreshPending) {
@@ -249,7 +269,7 @@ export class PrismaTrendRepository implements TrendRepository {
         }
         const pending = await transaction.trendMonitor.updateMany({
           where: {
-            id: monitor.id, userId, activeRunId: monitor.activeRunId,
+            id: monitor.id, userId, activeRunId,
             runLeaseUntil: { gt: startedAt }, manualRefreshPending: false,
           },
           data: { manualRefreshPending: true },
@@ -279,7 +299,8 @@ export class PrismaTrendRepository implements TrendRepository {
         },
         data: {
           activeRunId: runId, runStatus: 'running', runLeaseUntil: leaseUntil,
-          manualRefreshPending: false, lastError: Prisma.DbNull,
+          lastError: Prisma.DbNull,
+          ...(trigger === 'manual' ? { manualRefreshPending: false } : {}),
         },
       });
       if (claimed.count !== 1) return { state: 'active', followUpManualRegistered: false } as const;
@@ -297,10 +318,16 @@ export class PrismaTrendRepository implements TrendRepository {
     userId: string,
     fingerprints: string[],
     discoveredSince: Date,
+    excludeRunId: string,
   ): Promise<Set<string>> {
     if (fingerprints.length === 0) return new Set();
     const rows = await this.prisma.trendSeed.findMany({
-      where: { userId, fingerprint: { in: fingerprints }, discoveredAt: { gte: discoveredSince } },
+      where: {
+        userId,
+        fingerprint: { in: fingerprints },
+        discoveredAt: { gte: discoveredSince },
+        runId: { not: excludeRunId },
+      },
       select: { fingerprint: true },
     });
     return new Set(rows.map(({ fingerprint }) => fingerprint));
@@ -308,14 +335,39 @@ export class PrismaTrendRepository implements TrendRepository {
 
   async saveSeeds(input: { runId: string; userId: string; seeds: SanitizedTrendSeed[] }): Promise<void> {
     if (input.seeds.length === 0) return;
+    const fingerprints = input.seeds.map(({ fingerprint }) => fingerprint);
+    const existing = await this.prisma.trendSeed.findMany({
+      where: { runId: input.runId, userId: input.userId, fingerprint: { in: fingerprints } },
+      select: { fingerprint: true },
+    });
+    const existingFingerprints = new Set(existing.map(({ fingerprint }) => fingerprint));
+    const newSeeds = input.seeds.filter(({ fingerprint }) => !existingFingerprints.has(fingerprint));
+    if (newSeeds.length === 0) return;
     await this.prisma.trendSeed.createMany({
-      data: input.seeds.map((seed) => ({
+      data: newSeeds.map((seed) => ({
         userId: input.userId, runId: input.runId, sourceId: seed.sourceId,
         platform: seed.platform, externalId: seed.externalId, title: seed.title,
         sourceUrl: seed.sourceUrl, fingerprint: seed.fingerprint,
         publishedAt: seed.publishedAt, normalizedQuery: seed.normalizedQuery,
       })),
     });
+  }
+
+  async updateSeedQueries(input: {
+    runId: string;
+    userId: string;
+    decisions: Array<{ fingerprint: string; normalizedQuery: string | null }>;
+  }): Promise<void> {
+    for (const decision of input.decisions) {
+      await this.prisma.trendSeed.updateMany({
+        where: {
+          runId: input.runId,
+          userId: input.userId,
+          fingerprint: decision.fingerprint,
+        },
+        data: { normalizedQuery: decision.normalizedQuery },
+      });
+    }
   }
 
   async listHistoryUrls(userId: string): Promise<string[]> {
@@ -380,7 +432,7 @@ export class PrismaTrendRepository implements TrendRepository {
         where: { id_userId: { id: input.monitorId, userId: input.userId } },
         data: {
           runStatus: followUpManual ? 'queued' : 'succeeded', activeRunId: null,
-          runLeaseUntil: null, manualRefreshPending: false, lastError: Prisma.DbNull,
+          runLeaseUntil: null, manualRefreshPending: followUpManual, lastError: Prisma.DbNull,
           ...(input.trigger === 'manual'
             ? {}
             : { nextRunAt: nextAutomaticRun(input.finishedAt, monitor.intervalHours) }),
@@ -422,18 +474,39 @@ export class PrismaTrendRepository implements TrendRepository {
       const followUpManual = input.status === 'failed' && monitor.manualRefreshPending;
       await transaction.trendMonitor.update({
         where: { id_userId: { id: input.monitorId, userId: input.userId } },
-        data: {
-          runStatus: followUpManual ? 'queued' : input.status,
-          activeRunId: null, runLeaseUntil: null,
-          manualRefreshPending: input.status === 'queued' ? monitor.manualRefreshPending : false,
-          lastError: input.error,
-          ...(input.status === 'failed' && input.trigger !== 'manual'
-            ? { nextRunAt: nextAutomaticRun(input.finishedAt, monitor.intervalHours) }
-            : {}),
-        },
+        data: input.status === 'queued'
+          ? {
+              runStatus: 'queued',
+              activeRunId: input.runId,
+              manualRefreshPending: monitor.manualRefreshPending,
+              lastError: input.error,
+            }
+          : {
+              runStatus: followUpManual ? 'queued' : 'failed',
+              activeRunId: null,
+              runLeaseUntil: null,
+              manualRefreshPending: followUpManual,
+              lastError: input.error,
+              ...(input.trigger !== 'manual'
+                ? { nextRunAt: nextAutomaticRun(input.finishedAt, monitor.intervalHours) }
+                : {}),
+            },
       });
       return { followUpManual };
     });
+  }
+
+  async acknowledgeManualFollowUp(userId: string): Promise<boolean> {
+    const updated = await this.prisma.trendMonitor.updateMany({
+      where: {
+        userId,
+        runStatus: 'queued',
+        activeRunId: null,
+        manualRefreshPending: true,
+      },
+      data: { manualRefreshPending: false },
+    });
+    return updated.count === 1;
   }
 }
 
@@ -515,9 +588,14 @@ export class TrendDiscoveryService {
       }
       const sanitized = collection.candidates.map(sanitizeSeed);
       const recent = await this.options.repository.listRecentFingerprints(
-        userId, sanitized.map(({ fingerprint }) => fingerprint), windowStart,
+        userId, sanitized.map(({ fingerprint }) => fingerprint), windowStart, claim.runId,
       );
       const unseen = sanitized.filter(({ fingerprint }) => !recent.has(fingerprint));
+      const seeds: SanitizedTrendSeed[] = unseen.map((candidate) => ({
+        ...candidate,
+        normalizedQuery: null,
+      }));
+      await this.options.repository.saveSeeds({ runId: claim.runId, userId, seeds });
       const classificationInputs: TrendSeedClassificationInput[] = unseen.map((candidate) => ({
         id: candidate.fingerprint, title: candidate.title,
         platform: candidate.platform, sourceUrl: candidate.sourceUrl,
@@ -530,11 +608,14 @@ export class TrendDiscoveryService {
         decisions.push(...validateDecisions(batch, raw));
       }
       const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
-      const seeds: SanitizedTrendSeed[] = unseen.map((candidate) => ({
-        ...candidate,
-        normalizedQuery: decisionById.get(candidate.fingerprint)?.query?.trim() ?? null,
-      }));
-      await this.options.repository.saveSeeds({ runId: claim.runId, userId, seeds });
+      await this.options.repository.updateSeedQueries({
+        runId: claim.runId,
+        userId,
+        decisions: unseen.map((candidate) => ({
+          fingerprint: candidate.fingerprint,
+          normalizedQuery: decisionById.get(candidate.fingerprint)?.query?.trim() ?? null,
+        })),
+      });
 
       const accepted = decisions.filter((decision) => decision.accepted);
       const historyUrls = await this.options.repository.listHistoryUrls(userId);
@@ -596,5 +677,9 @@ export class TrendDiscoveryService {
     if (signal.aborted) {
       throw new TrendOrchestrationError('TREND_RUN_TIMEOUT', 'Trend run exceeded its time limit', true);
     }
+  }
+
+  async acknowledgeManualFollowUp(userId: string): Promise<boolean> {
+    return this.options.repository.acknowledgeManualFollowUp(userId);
   }
 }
