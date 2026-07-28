@@ -101,6 +101,54 @@ describe('QualityPipeline', () => {
     expect(evaluateCandidates.mock.calls[0]![0].candidates).toHaveLength(1);
   });
 
+  it('prefers an existing precise match over a richer generic URL duplicate', async () => {
+    const precise = candidate('precise-lean', {
+      title: 'gpt-5.7 release notes',
+      content: null,
+      excerpt: null,
+    });
+    const generic = candidate('generic-rich', {
+      url: precise.canonicalUrl,
+      title: 'Model release roundup',
+      content: 'A much longer generic article covering many current models, architecture details, measurements, compatibility notes, migration advice, and limitations.',
+      excerpt: null,
+    });
+    const fetchText = vi.fn().mockResolvedValue({
+      finalUrl: precise.canonicalUrl,
+      title: precise.title,
+      contentType: 'text/html',
+      text: 'The gpt-5.7 release adds migration details, measurements, compatibility notes, and documented limitations.',
+    });
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id,
+      accepted: true,
+      kind: 'quality' as const,
+      reason: 'supported release notes',
+      claimSupport: 'supported' as const,
+    })));
+
+    const result = await new QualityPipeline(
+      { fetchText },
+      gateway({ evaluateCandidates }),
+    ).run({
+      keyword: 'gpt-5.7',
+      matchPolicy: buildKeywordPolicy('gpt-5.7'),
+      candidates: [precise, generic],
+      historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z',
+      windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+
+    expect(fetchText).toHaveBeenCalledWith(precise.canonicalUrl, undefined);
+    expect(evaluateCandidates).toHaveBeenCalledOnce();
+    expect(result).toEqual([
+      expect.objectContaining({
+        externalId: precise.externalId,
+        sourceUrls: [precise.canonicalUrl],
+      }),
+    ]);
+  });
+
   it('assesses large candidate sets in batches of at most thirty', async () => {
     const candidates = Array.from({ length: 35 }, (_, index) => candidate(String(index), {
       content: `Substantive candidate ${index} with architecture, measurements, migration details, and limitations.`,

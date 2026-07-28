@@ -22,6 +22,32 @@ export interface QualityPipelineInput {
 }
 interface ContentFetcherLike { fetchText(url: string, signal?: AbortSignal): Promise<FetchedText> }
 
+const preferPolicyMatchingUrlDuplicates = (
+  candidates: readonly ValidatedSourceCandidate[],
+  matchPolicy: KeywordPolicy,
+): ValidatedSourceCandidate[] => {
+  const selectedByUrl = new Map<string, ValidatedSourceCandidate>();
+  for (const candidate of candidates) {
+    const existing = selectedByUrl.get(candidate.canonicalUrl);
+    if (existing === undefined) {
+      selectedByUrl.set(candidate.canonicalUrl, candidate);
+      continue;
+    }
+    const existingMatches = candidateMatchesKeyword(existing, matchPolicy);
+    const candidateMatches = candidateMatchesKeyword(candidate, matchPolicy);
+    if (existingMatches !== candidateMatches) {
+      selectedByUrl.set(candidate.canonicalUrl, candidateMatches ? candidate : existing);
+      continue;
+    }
+    const richer = deduplicateCandidates(
+      [existing, candidate],
+      { includeFingerprint: false },
+    )[0];
+    if (richer !== undefined) selectedByUrl.set(candidate.canonicalUrl, richer);
+  }
+  return [...selectedByUrl.values()];
+};
+
 export class QualityPipelineError extends Error {
   readonly code = 'QUALITY_RESPONSE_INVALID';
   constructor(message = 'AI quality response is invalid') { super(message); this.name = 'QualityPipelineError'; }
@@ -38,8 +64,12 @@ export class QualityPipeline {
       });
       return !rejection.rejected || rejection.reason === 'INSUFFICIENT_CONTENT';
     });
-    const deduplicated = deduplicateCandidates(
+    const preferredUrlDuplicates = preferPolicyMatchingUrlDuplicates(
       preliminarilyEligible,
+      input.matchPolicy,
+    );
+    const deduplicated = deduplicateCandidates(
+      preferredUrlDuplicates,
       { includeFingerprint: false },
     );
     const history = new Set(input.historyUrls.map((url) => canonicalizeUrl(url)));
