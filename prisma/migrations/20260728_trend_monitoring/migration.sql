@@ -100,6 +100,9 @@ CREATE INDEX "TrendSeed_userId_fingerprint_discoveredAt_idx" ON "TrendSeed"("use
 CREATE INDEX "TrendSeed_runId_discoveredAt_idx" ON "TrendSeed"("runId", "discoveredAt");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "TrendSeed_runId_fingerprint_key" ON "TrendSeed"("runId", "fingerprint");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "RadarItem_userId_canonicalPrimaryUrl_key" ON "RadarItem"("userId", "canonicalPrimaryUrl");
 
 -- CreateIndex

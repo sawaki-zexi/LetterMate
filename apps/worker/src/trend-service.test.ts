@@ -117,7 +117,7 @@ describe('TrendDiscoveryService', () => {
   });
 
   it('deduplicates recent seeds, classifies in bounded batches, and persists sanitized decisions', async () => {
-    const candidates = Array.from({ length: 31 }, (_, index) => seed({
+    const candidates = Array.from({ length: 8 }, (_, index) => seed({
       externalId: String(index), title: `Project-${index} version-${index}.1 software release`,
       url: `https://example.com/trend/${index}`,
     }));
@@ -138,10 +138,10 @@ describe('TrendDiscoveryService', () => {
 
     await service.run('user-1', 'scheduled');
 
-    expect(classify).toHaveBeenCalledTimes(2);
-    expect(classify.mock.calls.map(([input]) => input.seeds.length)).toEqual([20, 10]);
+    expect(classify).toHaveBeenCalledTimes(3);
+    expect(classify.mock.calls.map(([input]) => input.seeds.length)).toEqual([3, 3, 1]);
     const saved = vi.mocked(repo.saveSeeds).mock.calls[0]![0];
-    expect(saved.seeds).toHaveLength(30);
+    expect(saved.seeds).toHaveLength(7);
     expect(saved.seeds[0]).toEqual(expect.objectContaining({
       sourceId: 'hacker-news-trends', normalizedQuery: null,
     }));
@@ -237,6 +237,36 @@ describe('TrendDiscoveryService', () => {
 });
 
 describe('PrismaTrendRepository', () => {
+  it('provisions a missing monitor with the configured default interval for manual discovery', async () => {
+    const provisioned = {
+      id: 'monitor-new', userId: 'user-1', runStatus: 'queued', activeRunId: null,
+      runLeaseUntil: null, intervalHours: 8,
+      nextRunAt: now, manualRefreshPending: false,
+    };
+    const transaction = {
+      trendMonitor: {
+        findUnique: vi.fn().mockResolvedValue(null),
+        upsert: vi.fn().mockResolvedValue(provisioned),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+      trendRun: { create: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+    const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000, 8);
+
+    await expect(repo.claimRun('user-1', 'manual', now)).resolves.toMatchObject({
+      state: 'claimed', monitorId: 'monitor-new', intervalHours: 8,
+    });
+
+    expect(transaction.trendMonitor.upsert).toHaveBeenCalledWith({
+      where: { userId: 'user-1' },
+      create: {
+        userId: 'user-1', intervalHours: 8, nextRunAt: now, runStatus: 'queued',
+      },
+      update: {},
+    });
+  });
+
   it('registers exactly one pending manual refresh while an active lease exists', async () => {
     const transaction = {
       trendMonitor: {
@@ -355,7 +385,7 @@ describe('PrismaTrendRepository', () => {
     const transaction = {
       trendMonitor: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-        findUnique: vi.fn().mockResolvedValue({ manualRefreshPending: false, intervalHours: 6 }),
+        findUnique: vi.fn().mockResolvedValue({ manualRefreshPending: false, intervalHours: 8 }),
         update: vi.fn().mockResolvedValue({}),
       },
       trendRun: { update: vi.fn().mockResolvedValue({}) },
@@ -371,7 +401,7 @@ describe('PrismaTrendRepository', () => {
     expect(transaction.trendMonitor.update).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
         runStatus: 'failed',
-        nextRunAt: new Date('2026-07-28T18:00:00.000Z'),
+        nextRunAt: new Date('2026-07-28T20:00:00.000Z'),
       }),
     }));
   });
@@ -427,5 +457,33 @@ describe('PrismaTrendRepository', () => {
       },
       data: { manualRefreshPending: false },
     });
+  });
+
+  it('relies on the database run fingerprint key for race-safe idempotent seed inserts', async () => {
+    const prisma = {
+      trendSeed: {
+        findMany: vi.fn().mockResolvedValue([]),
+        createMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
+
+    await repo.saveSeeds({
+      runId: 'run-1',
+      userId: 'user-1',
+      seeds: [{
+        fingerprint: 'fingerprint-1', sourceId: 'hacker-news-trends',
+        platform: 'Hacker News', externalId: '42', title: 'React 19.1 release',
+        sourceUrl: 'https://example.com/react', publishedAt: now, normalizedQuery: null,
+      }],
+    });
+
+    expect(prisma.trendSeed.findMany).not.toHaveBeenCalled();
+    expect(prisma.trendSeed.createMany).toHaveBeenCalledWith(expect.objectContaining({
+      skipDuplicates: true,
+      data: [expect.objectContaining({
+        runId: 'run-1', userId: 'user-1', fingerprint: 'fingerprint-1',
+      })],
+    }));
   });
 });

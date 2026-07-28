@@ -194,6 +194,7 @@ model TrendSeed {
 
   @@index([userId, fingerprint, discoveredAt])
   @@index([runId, discoveredAt])
+  @@unique([runId, fingerprint])
 }
 
 model RadarItem {

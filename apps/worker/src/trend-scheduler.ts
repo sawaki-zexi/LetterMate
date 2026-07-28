@@ -5,20 +5,42 @@ export interface ClaimedTrendMonitor {
   monitorId: string;
   userId: string;
   dueAt: Date;
+  claimUntil: Date;
 }
 
 export interface TrendScheduleRepository {
   claimDueMonitors(now: Date, claimUntil: Date, limit: number): Promise<ClaimedTrendMonitor[]>;
+  releaseClaim(claim: ClaimedTrendMonitor): Promise<boolean>;
 }
 
 export class PrismaTrendScheduleRepository implements TrendScheduleRepository {
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly defaultIntervalHours = 4,
+  ) {}
 
   async claimDueMonitors(
     now: Date,
     claimUntil: Date,
     limit: number,
   ): Promise<ClaimedTrendMonitor[]> {
+    const missing = await this.prisma.user.findMany({
+      where: { trendMonitor: { is: null } },
+      orderBy: { id: 'asc' },
+      take: limit,
+      select: { id: true },
+    });
+    if (missing.length > 0) {
+      await this.prisma.trendMonitor.createMany({
+        data: missing.map(({ id: userId }) => ({
+          userId,
+          intervalHours: this.defaultIntervalHours,
+          nextRunAt: now,
+          runStatus: 'queued' as const,
+        })),
+        skipDuplicates: true,
+      });
+    }
     const monitors = await this.prisma.trendMonitor.findMany({
       where: {
         OR: [
@@ -53,15 +75,44 @@ export class PrismaTrendScheduleRepository implements TrendScheduleRepository {
       const stale = monitor.activeRunId !== null &&
         (monitor.runLeaseUntil === null || monitor.runLeaseUntil <= now);
       const dueAt = stale ? (monitor.runLeaseUntil ?? monitor.nextRunAt) : monitor.nextRunAt;
-      const result = await this.prisma.trendMonitor.updateMany({
-        where: stale
-          ? {
-              id: monitor.id,
-              activeRunId: monitor.activeRunId,
-              runStatus: monitor.runStatus,
-              runLeaseUntil: monitor.runLeaseUntil,
-            }
-          : {
+      const acquired = stale
+        ? await this.prisma.$transaction(async (transaction) => {
+            const oldRunId = monitor.activeRunId!;
+            const result = await transaction.trendMonitor.updateMany({
+              where: {
+                id: monitor.id,
+                userId: monitor.userId,
+                activeRunId: oldRunId,
+                runStatus: monitor.runStatus,
+                runLeaseUntil: monitor.runLeaseUntil,
+              },
+              data: {
+                nextRunAt: claimUntil,
+                runStatus: 'queued',
+                activeRunId: null,
+                runLeaseUntil: claimUntil,
+              },
+            });
+            if (result.count !== 1) return false;
+            await transaction.trendRun.updateMany({
+              where: {
+                id: oldRunId,
+                userId: monitor.userId,
+                status: { in: ['queued', 'running'] },
+              },
+              data: {
+                status: 'failed',
+                finishedAt: now,
+                error: {
+                  code: 'TREND_RUN_LEASE_EXPIRED',
+                  message: 'Trend run lease expired',
+                },
+              },
+            });
+            return true;
+          })
+        : (await this.prisma.trendMonitor.updateMany({
+            where: {
               id: monitor.id,
               nextRunAt: monitor.nextRunAt,
               activeRunId: null,
@@ -71,13 +122,41 @@ export class PrismaTrendScheduleRepository implements TrendScheduleRepository {
                 { runLeaseUntil: { lte: now } },
               ],
             },
-        data: { nextRunAt: claimUntil, runStatus: 'queued', runLeaseUntil: claimUntil },
-      });
-      if (result.count === 1) {
-        claimed.push({ monitorId: monitor.id, userId: monitor.userId, dueAt });
+            data: { nextRunAt: claimUntil, runStatus: 'queued', runLeaseUntil: claimUntil },
+          })).count === 1;
+      if (acquired) {
+        claimed.push({
+          monitorId: monitor.id,
+          userId: monitor.userId,
+          dueAt,
+          claimUntil,
+        });
       }
     }
     return claimed;
+  }
+
+  async releaseClaim(claim: ClaimedTrendMonitor): Promise<boolean> {
+    const released = await this.prisma.trendMonitor.updateMany({
+      where: {
+        id: claim.monitorId,
+        userId: claim.userId,
+        runStatus: 'queued',
+        activeRunId: null,
+        nextRunAt: claim.claimUntil,
+        runLeaseUntil: claim.claimUntil,
+      },
+      data: {
+        nextRunAt: claim.dueAt,
+        runStatus: 'failed',
+        runLeaseUntil: null,
+        lastError: {
+          code: 'TREND_QUEUE_UNAVAILABLE',
+          message: 'Trend discovery could not be queued',
+        },
+      },
+    });
+    return released.count === 1;
   }
 }
 
@@ -98,11 +177,13 @@ interface TrendScheduleQueue {
 export interface TrendScheduleServiceOptions {
   claimLeaseMs: number;
   limit: number;
+  logger: { error(message: string): void };
 }
 
 const defaultOptions: TrendScheduleServiceOptions = {
   claimLeaseMs: 10 * 60_000,
   limit: 50,
+  logger: console,
 };
 
 export const scheduledTrendJobId = (monitorId: string, dueAt: Date): string =>
@@ -122,29 +203,70 @@ export class TrendScheduleService {
   async scan(now = new Date()): Promise<number> {
     const claimUntil = new Date(now.getTime() + this.options.claimLeaseMs);
     const monitors = await this.repository.claimDueMonitors(now, claimUntil, this.options.limit);
-    await Promise.all(monitors.map((monitor) => this.queue.add(
-      'scheduled-refresh',
-      { userId: monitor.userId, trigger: 'scheduled' },
-      {
-        jobId: scheduledTrendJobId(monitor.monitorId, monitor.dueAt),
-        attempts: 3,
-        backoff: { type: 'custom' },
-        removeOnComplete: true,
-        removeOnFail: true,
-      },
-    )));
-    return monitors.length;
+    const results = await Promise.all(monitors.map(async (monitor) => {
+      try {
+        await this.queue.add(
+          'scheduled-refresh',
+          { userId: monitor.userId, trigger: 'scheduled' },
+          {
+            jobId: scheduledTrendJobId(monitor.monitorId, monitor.dueAt),
+            attempts: 3,
+            backoff: { type: 'custom' },
+            removeOnComplete: true,
+            removeOnFail: true,
+          },
+        );
+        return true;
+      } catch {
+        let released = false;
+        try {
+          released = await this.repository.releaseClaim(monitor);
+        } catch {
+          // The conditional reservation remains recoverable after its lease expires.
+        }
+        this.options.logger.error(released
+          ? 'Trend scheduler enqueue failed; claim released'
+          : 'Trend scheduler enqueue failed; claim release was not applied');
+        return false;
+      }
+    }));
+    return results.filter(Boolean).length;
   }
 }
 
 export function startTrendScheduler(
   service: Pick<TrendScheduleService, 'scan'>,
-  options: { enabled?: boolean; intervalMs?: number } = {},
-): { close(): void } {
-  if (options.enabled === false) return { close: () => undefined };
-  const scan = () => void service.scan().catch(() => undefined);
+  options: {
+    enabled?: boolean;
+    intervalMs?: number;
+    logger?: { error(message: string): void };
+  } = {},
+): { close(): Promise<void> } {
+  if (options.enabled === false) return { close: () => Promise.resolve() };
+  const logger = options.logger ?? console;
+  let closing = false;
+  let inFlight: Promise<void> | null = null;
+  const scan = () => {
+    if (closing || inFlight !== null) return;
+    const run = Promise.resolve()
+      .then(() => service.scan())
+      .then(() => undefined)
+      .catch(() => {
+        logger.error('Trend scheduler scan failed');
+      });
+    const tracked = run.finally(() => {
+      if (inFlight === tracked) inFlight = null;
+    });
+    inFlight = tracked;
+  };
   scan();
   const timer = setInterval(scan, options.intervalMs ?? 10 * 60_000);
   timer.unref();
-  return { close: () => clearInterval(timer) };
+  return {
+    close: () => {
+      closing = true;
+      clearInterval(timer);
+      return inFlight ?? Promise.resolve();
+    },
+  };
 }

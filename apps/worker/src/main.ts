@@ -15,6 +15,7 @@ import {
   TopicDiscoveryService,
 } from './discovery-service.js';
 import { OpenRouterAiGateway } from './openrouter-gateway.js';
+import { createWorkerShutdown } from './lifecycle.js';
 import { QualityPipeline } from './quality-pipeline.js';
 import { createSourceConnectors, createTrendSources } from './runtime.js';
 import {
@@ -77,6 +78,7 @@ if (!config.AI_API_KEY) {
     repository: new PrismaTrendRepository(
       prisma,
       config.DISCOVERY_RUN_TIMEOUT_MS + 5 * 60_000,
+      config.TREND_INTERVAL_HOURS,
     ),
     trendSources: trendRegistry,
     gateway,
@@ -93,21 +95,20 @@ if (!config.AI_API_KEY) {
     : null;
   const trendScheduler = config.TREND_MONITOR_ENABLED
     ? startTrendScheduler(new TrendScheduleService(
-        new PrismaTrendScheduleRepository(prisma),
+        new PrismaTrendScheduleRepository(prisma, config.TREND_INTERVAL_HOURS),
         trendQueue,
       ))
     : null;
 
-  const shutdown = async () => {
-    scheduler?.close();
-    trendScheduler?.close();
-    await worker.close();
-    await trendWorker.close();
-    await queue.close();
-    await trendQueue.close();
-    await redis.quit();
-    await prisma.$disconnect();
-  };
+  const shutdown = createWorkerShutdown({
+    schedulers: [scheduler, trendScheduler].filter(
+      (value): value is NonNullable<typeof value> => value !== null,
+    ),
+    workers: [worker, trendWorker],
+    queues: [queue, trendQueue],
+    redis,
+    prisma,
+  });
   process.once('SIGINT', () => void shutdown());
   process.once('SIGTERM', () => void shutdown());
 }

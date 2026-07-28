@@ -92,6 +92,7 @@ describe('multi-source Prisma schema', () => {
       relationOnDelete: 'Cascade',
     });
     expect(relation('TrendSeed', 'normalizedQuery')).toMatchObject({ isRequired: false });
+    expect(uniqueConstraints('TrendSeed')).toContainEqual(['runId', 'fingerprint']);
   });
 
   it('stores user-visible radar discovery fields with per-user URL deduplication', () => {
@@ -118,17 +119,19 @@ describe('multi-source Prisma schema', () => {
     for (const tableName of ['TrendMonitor', 'TrendRun', 'TrendSeed', 'RadarItem']) {
       expect(normalizedMigration).toContain(`CREATE TABLE "${tableName}"`);
     }
-    for (const [indexName, tableName, columns] of [
+    const expectedUniqueIndexes: Array<[string, string, string[]]> = [
       ['TrendMonitor_userId_key', 'TrendMonitor', ['userId']],
       ['TrendMonitor_id_userId_key', 'TrendMonitor', ['id', 'userId']],
       ['TrendRun_id_userId_key', 'TrendRun', ['id', 'userId']],
+      ['TrendSeed_runId_fingerprint_key', 'TrendSeed', ['runId', 'fingerprint']],
       ['RadarItem_userId_canonicalPrimaryUrl_key', 'RadarItem', ['userId', 'canonicalPrimaryUrl']],
-    ]) {
+    ];
+    for (const [indexName, tableName, columns] of expectedUniqueIndexes) {
       expect(normalizedMigration).toMatch(new RegExp(
         `CREATE UNIQUE INDEX "${indexName}" ON "${tableName}"\\("${columns.join('", "')}"\\);`,
       ));
     }
-    for (const [indexName, tableName, columns] of [
+    const expectedIndexes: Array<[string, string, string[]]> = [
       ['TrendMonitor_nextRunAt_runStatus_idx', 'TrendMonitor', ['nextRunAt', 'runStatus']],
       ['TrendMonitor_runStatus_runLeaseUntil_idx', 'TrendMonitor', ['runStatus', 'runLeaseUntil']],
       ['TrendRun_userId_status_startedAt_idx', 'TrendRun', ['userId', 'status', 'startedAt']],
@@ -137,7 +140,8 @@ describe('multi-source Prisma schema', () => {
       ['TrendSeed_runId_discoveredAt_idx', 'TrendSeed', ['runId', 'discoveredAt']],
       ['RadarItem_userId_publishedAt_discoveredAt_idx', 'RadarItem', ['userId', 'publishedAt', 'discoveredAt']],
       ['RadarItem_runId_discoveredAt_idx', 'RadarItem', ['runId', 'discoveredAt']],
-    ]) {
+    ];
+    for (const [indexName, tableName, columns] of expectedIndexes) {
       expect(normalizedMigration).toMatch(new RegExp(
         `CREATE INDEX "${indexName}" ON "${tableName}"\\("${columns.join('", "')}"\\);`,
       ));
@@ -152,11 +156,17 @@ describe('multi-source Prisma schema', () => {
         `ALTER TABLE "${tableName}" ADD CONSTRAINT "${constraintName}" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;`,
       );
     }
-    for (const [tableName, constraintName, childColumns, parentTable] of [
+    const expectedCompositeRelations: Array<[string, string, string[], string]> = [
       ['TrendRun', 'TrendRun_monitorId_userId_fkey', ['monitorId', 'userId'], 'TrendMonitor'],
       ['TrendSeed', 'TrendSeed_runId_userId_fkey', ['runId', 'userId'], 'TrendRun'],
       ['RadarItem', 'RadarItem_runId_userId_fkey', ['runId', 'userId'], 'TrendRun'],
-    ]) {
+    ];
+    for (const [
+      tableName,
+      constraintName,
+      childColumns,
+      parentTable,
+    ] of expectedCompositeRelations) {
       expect(normalizedMigration).toContain(
         `ALTER TABLE "${tableName}" ADD CONSTRAINT "${constraintName}" FOREIGN KEY ("${childColumns.join('", "')}") REFERENCES "${parentTable}"("id", "userId") ON DELETE CASCADE ON UPDATE CASCADE;`,
       );

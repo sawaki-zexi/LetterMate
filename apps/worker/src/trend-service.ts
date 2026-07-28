@@ -12,6 +12,7 @@ import type {
   TrendSeedClassificationInput,
   TrendSeedDecision,
 } from './ai-gateway.js';
+import { TREND_CLASSIFICATION_MAX_SEEDS } from './ai-gateway.js';
 import type { ConnectorSearchSummary, SourceQueryPlan } from './connectors/types.js';
 import {
   buildRequiredKeywordPolicy,
@@ -22,7 +23,6 @@ import type { TrendCollectionSummary, TrendSeedCandidate, TrendWindow } from './
 
 const HOUR_MS = 60 * 60 * 1_000;
 const RECENT_SEED_MS = 24 * HOUR_MS;
-const CLASSIFICATION_BATCH_SIZE = 20;
 
 export interface SanitizedTrendSeed {
   fingerprint: string;
@@ -215,6 +215,7 @@ export class PrismaTrendRepository implements TrendRepository {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly runLeaseMs: number,
+    private readonly defaultIntervalHours = 4,
   ) {}
 
   async claimRun(
@@ -223,8 +224,19 @@ export class PrismaTrendRepository implements TrendRepository {
     startedAt: Date,
   ): Promise<TrendRunClaim> {
     return this.prisma.$transaction(async (transaction) => {
-      const monitor = await transaction.trendMonitor.findUnique({ where: { userId } });
-      if (!monitor) return { state: 'missing' } as const;
+      let monitor = await transaction.trendMonitor.findUnique({ where: { userId } });
+      if (!monitor) {
+        monitor = await transaction.trendMonitor.upsert({
+          where: { userId },
+          create: {
+            userId,
+            intervalHours: this.defaultIntervalHours,
+            nextRunAt: startedAt,
+            runStatus: 'queued',
+          },
+          update: {},
+        });
+      }
       const active = monitor.activeRunId !== null &&
         monitor.runLeaseUntil !== null && monitor.runLeaseUntil > startedAt;
       if (active) {
@@ -335,21 +347,14 @@ export class PrismaTrendRepository implements TrendRepository {
 
   async saveSeeds(input: { runId: string; userId: string; seeds: SanitizedTrendSeed[] }): Promise<void> {
     if (input.seeds.length === 0) return;
-    const fingerprints = input.seeds.map(({ fingerprint }) => fingerprint);
-    const existing = await this.prisma.trendSeed.findMany({
-      where: { runId: input.runId, userId: input.userId, fingerprint: { in: fingerprints } },
-      select: { fingerprint: true },
-    });
-    const existingFingerprints = new Set(existing.map(({ fingerprint }) => fingerprint));
-    const newSeeds = input.seeds.filter(({ fingerprint }) => !existingFingerprints.has(fingerprint));
-    if (newSeeds.length === 0) return;
     await this.prisma.trendSeed.createMany({
-      data: newSeeds.map((seed) => ({
+      data: input.seeds.map((seed) => ({
         userId: input.userId, runId: input.runId, sourceId: seed.sourceId,
         platform: seed.platform, externalId: seed.externalId, title: seed.title,
         sourceUrl: seed.sourceUrl, fingerprint: seed.fingerprint,
         publishedAt: seed.publishedAt, normalizedQuery: seed.normalizedQuery,
       })),
+      skipDuplicates: true,
     });
   }
 
@@ -601,9 +606,13 @@ export class TrendDiscoveryService {
         platform: candidate.platform, sourceUrl: candidate.sourceUrl,
       }));
       const decisions: TrendSeedDecision[] = [];
-      for (let offset = 0; offset < classificationInputs.length; offset += CLASSIFICATION_BATCH_SIZE) {
+      for (
+        let offset = 0;
+        offset < classificationInputs.length;
+        offset += TREND_CLASSIFICATION_MAX_SEEDS
+      ) {
         this.throwIfAborted(controller.signal);
-        const batch = classificationInputs.slice(offset, offset + CLASSIFICATION_BATCH_SIZE);
+        const batch = classificationInputs.slice(offset, offset + TREND_CLASSIFICATION_MAX_SEEDS);
         const raw = await this.options.gateway.classifyTrendSeeds({ seeds: batch, signal: controller.signal });
         decisions.push(...validateDecisions(batch, raw));
       }
