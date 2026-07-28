@@ -31,10 +31,7 @@ export class QualityPipeline {
   constructor(private readonly contentFetcher: ContentFetcherLike, private readonly gateway: QualityAiGateway) {}
 
   async run(input: QualityPipelineInput): Promise<DiscoveryCandidate[]> {
-    const policyMatched = input.candidates.filter(
-      (item) => candidateMatchesKeyword(item, input.matchPolicy),
-    );
-    const preliminarilyEligible = policyMatched.filter((item) => {
+    const preliminarilyEligible = input.candidates.filter((item) => {
       const rejection = rejectCandidate(item, {
         windowStart: input.windowStart,
         windowEnd: input.windowEnd,
@@ -63,7 +60,10 @@ export class QualityPipeline {
         // High precision mode drops candidates whose required body cannot be fetched safely.
       }
     }
-    const qualified = enriched.filter((item) => !rejectCandidate(item, {
+    const policyMatched = enriched.filter(
+      (item) => candidateMatchesKeyword(item, input.matchPolicy),
+    );
+    const qualified = policyMatched.filter((item) => !rejectCandidate(item, {
       windowStart: input.windowStart,
       windowEnd: input.windowEnd,
     }).rejected);

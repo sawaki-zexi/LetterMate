@@ -436,12 +436,12 @@ const sourceCandidate = validateSourceCandidate({
   },
 });
 
-function createOrchestration() {
+function createOrchestration(keyword = 'AI Agent') {
   const repository = {
     findOwnedTopic: vi.fn().mockResolvedValue({
       id: 'topic-1',
       userId: 'user-1',
-      keyword: 'AI Agent',
+      keyword,
       expandedTerms: [],
       createdAt: '2026-07-24T07:00:00.000Z',
       lastRunAt: null,
@@ -519,6 +519,18 @@ function createOrchestration() {
 }
 
 describe('TopicDiscoveryService multi-source orchestration', () => {
+  it('rejects a degenerate persisted keyword before calling AI', async () => {
+    const { service, gateway, registry, qualityPipeline, router } = createOrchestration('---');
+
+    await expect(service.run('topic-1', 'user-1', 'scheduled'))
+      .rejects.toThrow(/letter or number/i);
+
+    expect(gateway.expandTopic).not.toHaveBeenCalled();
+    expect(router.route).not.toHaveBeenCalled();
+    expect(registry.search).not.toHaveBeenCalled();
+    expect(qualityPipeline.run).not.toHaveBeenCalled();
+  });
+
   it('routes expanded queries through connectors and the quality pipeline', async () => {
     const { service, repository, gateway, registry, qualityPipeline, router } = createOrchestration();
 

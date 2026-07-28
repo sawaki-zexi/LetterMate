@@ -29,6 +29,16 @@ describe('keyword policy', () => {
     ], policy)).toEqual(['gpt-5.7 release notes']);
   });
 
+  it('rejects generated queries for a more specific version continuation', () => {
+    const policy = buildKeywordPolicy('gpt-5.7');
+
+    expect(filterQueriesForPolicy([
+      'gpt-5.7 release notes',
+      'gpt-5.7.1 release notes',
+      'GPT-5.7．1 changelog',
+    ], policy)).toEqual(['gpt-5.7 release notes']);
+  });
+
   it('matches exact phrases and approved aliases in candidate title or content', () => {
     const policy = buildKeywordPolicy('gpt-5.7');
 
@@ -53,13 +63,29 @@ describe('keyword policy', () => {
       title: 'GPT-5.70 preview',
       content: 'A different version identifier.',
     }, policy)).toBe(false);
+    expect(candidateMatchesKeyword({
+      title: 'GPT-5.7.1 release notes',
+      content: 'A more specific patch version.',
+    }, policy)).toBe(false);
+    expect(candidateMatchesKeyword({
+      title: 'GPT-5.7．1 release notes',
+      content: 'A fullwidth-dot patch version.',
+    }, policy)).toBe(false);
+    expect(candidateMatchesKeyword({
+      title: 'GPT-5.7. Release notes',
+      content: 'Sentence punctuation is not a version continuation.',
+    }, policy)).toBe(true);
   });
 
-  it('does not match anything for an empty or degenerate keyword', () => {
-    const policy = buildKeywordPolicy('  －  ');
+  it('fails fast for empty or degenerate keywords', () => {
+    expect(() => buildKeywordPolicy('  －  ')).toThrow(/letter or number/i);
+    expect(() => buildKeywordPolicy('---')).toThrow(/letter or number/i);
+  });
 
-    expect(policy.aliases).toEqual([]);
-    expect(filterQueriesForPolicy(['latest model'], policy)).toEqual([]);
-    expect(candidateMatchesKeyword({ title: 'Any title', content: 'Any body' }, policy)).toBe(false);
+  it('preserves valid CJK keywords', () => {
+    expect(buildKeywordPolicy('  智能体  ')).toEqual({
+      exactPhrase: '智能体',
+      aliases: ['智能体'],
+    });
   });
 });

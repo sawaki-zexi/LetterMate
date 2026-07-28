@@ -233,6 +233,74 @@ describe('QualityPipeline', () => {
     expect(evaluateCandidates).not.toHaveBeenCalled();
   });
 
+  it('matches fetched web content before AI review', async () => {
+    const source = candidate('fetched-match', {
+      title: 'Release notes',
+      content: null,
+      excerpt: null,
+    });
+    const fetchText = vi.fn().mockResolvedValue({
+      finalUrl: source.canonicalUrl,
+      title: source.title,
+      contentType: 'text/html',
+      text: 'The gpt-5.7 release includes migration details, measurements, compatibility notes, and limitations.',
+    });
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id,
+      accepted: true,
+      kind: 'quality' as const,
+      reason: 'supported release notes',
+      claimSupport: 'supported' as const,
+    })));
+
+    const result = await new QualityPipeline(
+      { fetchText },
+      gateway({ evaluateCandidates }),
+    ).run({
+      keyword: 'gpt-5.7',
+      matchPolicy: buildKeywordPolicy('gpt-5.7'),
+      candidates: [source],
+      historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z',
+      windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+
+    expect(fetchText).toHaveBeenCalledOnce();
+    expect(evaluateCandidates).toHaveBeenCalledOnce();
+    expect(result).toHaveLength(1);
+  });
+
+  it('rejects fetched content that remains unmatched without AI review', async () => {
+    const source = candidate('fetched-generic', {
+      title: 'Release notes',
+      content: null,
+      excerpt: null,
+    });
+    const fetchText = vi.fn().mockResolvedValue({
+      finalUrl: source.canonicalUrl,
+      title: source.title,
+      contentType: 'text/html',
+      text: 'Generic model release details with measurements, compatibility notes, and limitations.',
+    });
+    const evaluateCandidates = vi.fn();
+
+    const result = await new QualityPipeline(
+      { fetchText },
+      gateway({ evaluateCandidates }),
+    ).run({
+      keyword: 'gpt-5.7',
+      matchPolicy: buildKeywordPolicy('gpt-5.7'),
+      candidates: [source],
+      historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z',
+      windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+
+    expect(fetchText).toHaveBeenCalledOnce();
+    expect(evaluateCandidates).not.toHaveBeenCalled();
+    expect(result).toEqual([]);
+  });
+
   it.each(['unsupported', 'conflicting'] as const)(
     'rejects otherwise accepted %s claims',
     async (claimSupport) => {

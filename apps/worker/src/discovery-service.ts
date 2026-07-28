@@ -12,6 +12,7 @@ import type { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { AiGatewayError, type AiGateway } from './ai-gateway.js';
 import type { ConnectorSearchSummary, SourceQueryPlan } from './connectors/types.js';
+import { buildKeywordPolicy } from './keyword-policy.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
 import { SourceRouter } from './source-router.js';
 import {
@@ -435,6 +436,7 @@ export class TopicDiscoveryService {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     let pendingManualRefresh = false;
     try {
+      buildKeywordPolicy(topic.keyword);
       const expanded = await this.gateway.expandTopic({
         keyword: topic.keyword,
         signal: controller.signal,

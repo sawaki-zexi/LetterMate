@@ -27,7 +27,11 @@ const containsAlias = (value: string, alias: string): boolean => {
     const startsWithAsciiWord = /^[a-z0-9]/u.test(alias);
     const endsWithAsciiWord = /[a-z0-9]$/u.test(alias);
     const hasLeadingBoundary = !startsWithAsciiWord || before === undefined || !/[a-z0-9]/u.test(before);
-    const hasTrailingBoundary = !endsWithAsciiWord || after === undefined || !/[a-z0-9]/u.test(after);
+    const hasVersionContinuation = /\d$/u.test(alias)
+      && after === '.'
+      && /\d/u.test(value[offset + alias.length + 1] ?? '');
+    const hasTrailingBoundary = !hasVersionContinuation
+      && (!endsWithAsciiWord || after === undefined || !/[a-z0-9]/u.test(after));
     if (hasLeadingBoundary && hasTrailingBoundary) return true;
     offset = value.indexOf(alias, offset + 1);
   }
@@ -43,7 +47,7 @@ const textMatchesPolicy = (value: string, policy: KeywordPolicy): boolean => {
 export const buildKeywordPolicy = (keyword: string): KeywordPolicy => {
   const exactPhrase = normalizeText(keyword);
   if (!/[\p{L}\p{N}]/u.test(exactPhrase)) {
-    return { exactPhrase: '', aliases: [] };
+    throw new Error('Keyword must contain at least one Unicode letter or number');
   }
   const parts = exactPhrase.split(/[\s-]+/u).filter(Boolean);
   const aliases = unique([

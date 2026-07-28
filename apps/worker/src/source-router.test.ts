@@ -12,6 +12,10 @@ const route = (keyword: string, terms: string[] = [], searchQueries: string[] = 
 );
 
 describe('SourceRouter', () => {
+  it('fails fast instead of emitting queries for a degenerate keyword', () => {
+    expect(() => route('---', [], ['latest model'])).toThrow(/letter or number/i);
+  });
+
   it('keeps versioned topic queries precise and carries the match policy', () => {
     const plan = route('gpt-5.7', ['GPT', 'latest model'], [
       'gpt-5.7 release notes',
