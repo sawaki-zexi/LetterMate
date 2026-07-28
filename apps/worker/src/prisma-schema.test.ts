@@ -123,7 +123,6 @@ describe('multi-source Prisma schema', () => {
       ['TrendMonitor_userId_key', 'TrendMonitor', ['userId']],
       ['TrendMonitor_id_userId_key', 'TrendMonitor', ['id', 'userId']],
       ['TrendRun_id_userId_key', 'TrendRun', ['id', 'userId']],
-      ['TrendSeed_runId_fingerprint_key', 'TrendSeed', ['runId', 'fingerprint']],
       ['RadarItem_userId_canonicalPrimaryUrl_key', 'RadarItem', ['userId', 'canonicalPrimaryUrl']],
     ];
     for (const [indexName, tableName, columns] of expectedUniqueIndexes) {
@@ -131,6 +130,9 @@ describe('multi-source Prisma schema', () => {
         `CREATE UNIQUE INDEX "${indexName}" ON "${tableName}"\\("${columns.join('", "')}"\\);`,
       ));
     }
+    expect(normalizedMigration).not.toContain(
+      'CREATE UNIQUE INDEX "TrendSeed_runId_fingerprint_key"',
+    );
     const expectedIndexes: Array<[string, string, string[]]> = [
       ['TrendMonitor_nextRunAt_runStatus_idx', 'TrendMonitor', ['nextRunAt', 'runStatus']],
       ['TrendMonitor_runStatus_runLeaseUntil_idx', 'TrendMonitor', ['runStatus', 'runLeaseUntil']],
@@ -185,6 +187,28 @@ describe('multi-source Prisma schema', () => {
     );
     expect(normalizedMigration).toMatch(
       /INSERT INTO "TrendMonitor" \("id", "userId", "runStatus", "nextRunAt", "intervalHours", "manualRefreshPending"\) SELECT .+ "id", 'queued', NOW\(\), 4, false FROM "User";/,
+    );
+  });
+
+  it('deduplicates trend seeds before adding the run fingerprint unique index', () => {
+    const migrationPath = join(
+      process.cwd(),
+      'prisma',
+      'migrations',
+      '20260728_trend_seed_run_fingerprint_unique',
+      'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    const normalizedMigration = migration.replace(/\s+/g, ' ').trim();
+
+    expect(normalizedMigration).toContain(
+      'LOCK TABLE "TrendSeed" IN SHARE ROW EXCLUSIVE MODE;',
+    );
+    expect(normalizedMigration).toMatch(
+      /DELETE FROM "TrendSeed" AS "duplicate" USING "TrendSeed" AS "retained" WHERE "duplicate"\."runId" = "retained"\."runId" AND "duplicate"\."fingerprint" = "retained"\."fingerprint" AND \( "duplicate"\."discoveredAt" > "retained"\."discoveredAt" OR \( "duplicate"\."discoveredAt" = "retained"\."discoveredAt" AND "duplicate"\."id" > "retained"\."id" \) \);/,
+    );
+    expect(normalizedMigration).toContain(
+      'CREATE UNIQUE INDEX "TrendSeed_runId_fingerprint_key" ON "TrendSeed"("runId", "fingerprint");',
     );
   });
 });

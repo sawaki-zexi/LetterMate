@@ -35,10 +35,12 @@ export function createWorkerShutdown(resources: WorkerShutdownResources): () => 
         'Worker scheduler shutdown encountered an error',
       );
       await settlePhase(
-        [
-          ...resources.workers.map((worker) => () => worker.close()),
-          ...resources.queues.map((queue) => () => queue.close()),
-        ],
+        resources.workers.map((worker) => () => worker.close()),
+        logger,
+        'Worker shutdown encountered an error',
+      );
+      await settlePhase(
+        resources.queues.map((queue) => () => queue.close()),
         logger,
         'Worker queue shutdown encountered an error',
       );
