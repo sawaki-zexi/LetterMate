@@ -168,8 +168,17 @@ describe('topic store multi-source mappings', () => {
       status: 'succeeded', newItemCount: 1, finishedAt: '2026-07-28T12:00:00.000Z',
     });
 
-    await store.queueRefresh('user-1', topic.id);
+    const previousRun = (await store.findTopic('user-1', topic.id))!.lastRun!;
+    const queued = await store.queueRefresh('user-1', topic.id);
+    expect(queued?.topic).toMatchObject({
+      runStatus: 'queued',
+      lastRun: { id: previousRun.id, status: 'succeeded' },
+    });
     await store.startFakeDiscovery('user-1', topic.id);
+    expect((await store.findTopic('user-1', topic.id))?.lastRun).toMatchObject({
+      trigger: 'manual', status: 'running',
+    });
+    expect((await store.findTopic('user-1', topic.id))?.lastRun?.id).not.toBe(previousRun.id);
     await store.failFakeDiscovery('user-1', topic.id, { code: 'FAILED', message: 'Safe failure' });
     expect((await store.findTopic('user-1', topic.id))?.lastRun).toMatchObject({
       trigger: 'manual', status: 'failed', newItemCount: null,

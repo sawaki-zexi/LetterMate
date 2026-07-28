@@ -41,7 +41,24 @@ function touch(target: Element, type: 'start' | 'move' | 'end', x: number, y: nu
 describe('usePullRefresh', () => {
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     Object.defineProperty(window, 'scrollY', { configurable: true, value: 0 });
+  });
+
+  it('registers a non-passive native move listener and removes it on unmount', () => {
+    const addEventListener = vi.spyOn(HTMLElement.prototype, 'addEventListener');
+    const removeEventListener = vi.spyOn(HTMLElement.prototype, 'removeEventListener');
+    const rendered = render(<Harness onRefresh={vi.fn(async () => undefined)} />);
+    const registration = addEventListener.mock.calls.find(([type, _listener, options]) => (
+      type === 'touchmove'
+      && typeof options === 'object'
+      && options !== null
+      && (options as AddEventListenerOptions).passive === false
+    ));
+
+    expect(registration).toBeDefined();
+    rendered.unmount();
+    expect(removeEventListener).toHaveBeenCalledWith('touchmove', registration?.[1]);
   });
 
   it('arms above 72px, caps visual distance, and resets after async refresh', async () => {

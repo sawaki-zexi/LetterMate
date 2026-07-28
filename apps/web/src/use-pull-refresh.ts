@@ -1,4 +1,11 @@
-import { useCallback, useRef, useState, type TouchEventHandler } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type RefCallback,
+  type TouchEventHandler,
+} from 'react';
 
 const triggerDistance = 72;
 const maximumDistance = 120;
@@ -9,8 +16,8 @@ interface PullRefreshOptions {
 }
 
 interface PullRefreshContainerProps {
+  ref: RefCallback<HTMLElement>;
   onTouchStart: TouchEventHandler<HTMLElement>;
-  onTouchMove: TouchEventHandler<HTMLElement>;
   onTouchEnd: TouchEventHandler<HTMLElement>;
   onTouchCancel: TouchEventHandler<HTMLElement>;
 }
@@ -41,6 +48,7 @@ export function usePullRefresh({
 } {
   const gesture = useRef<GestureState>({ active: false, armed: false, startX: 0, startY: 0 });
   const refreshingRef = useRef(false);
+  const [container, setContainer] = useState<HTMLElement | null>(null);
   const [pullDistance, setPullDistance] = useState(0);
   const [armed, setArmed] = useState(false);
 
@@ -72,7 +80,7 @@ export function usePullRefresh({
     };
   }, [refreshing, reset]);
 
-  const onTouchMove = useCallback<TouchEventHandler<HTMLElement>>((event) => {
+  const onTouchMove = useCallback((event: TouchEvent) => {
     if (!gesture.current.active) return;
     if (event.touches.length !== 1 || window.scrollY !== 0) {
       reset();
@@ -95,6 +103,16 @@ export function usePullRefresh({
     setArmed(isArmed);
   }, [reset]);
 
+  useEffect(() => {
+    if (!container) return;
+    container.addEventListener('touchmove', onTouchMove, { passive: false });
+    return () => container.removeEventListener('touchmove', onTouchMove);
+  }, [container, onTouchMove]);
+
+  const containerRef = useCallback<RefCallback<HTMLElement>>((node) => {
+    setContainer(node);
+  }, []);
+
   const onTouchEnd = useCallback<TouchEventHandler<HTMLElement>>(() => {
     if (!gesture.current.active || !gesture.current.armed || refreshing || refreshingRef.current) {
       reset();
@@ -116,8 +134,8 @@ export function usePullRefresh({
 
   return {
     containerProps: {
+      ref: containerRef,
       onTouchStart,
-      onTouchMove,
       onTouchEnd,
       onTouchCancel: reset,
     },

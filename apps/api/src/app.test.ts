@@ -153,8 +153,8 @@ describe('AI discovery API', () => {
       .post(`/api/v1/topics/${own.id}/refresh`)
       .set('x-user-id', 'user-a')
       .expect(202)
-      .expect(({ body }) => expect(body.lastRun).toMatchObject({
-        trigger: 'manual', status: 'queued', newItemCount: null,
+      .expect(({ body }) => expect(body).toMatchObject({
+        runStatus: 'queued', lastRun: null,
       }));
     expect(queue.jobs).toContainEqual({
       topicId: own.id,

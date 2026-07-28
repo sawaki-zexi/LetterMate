@@ -529,10 +529,6 @@ export class MemoryTopicStore implements TopicStore {
     }
     topic.runStatus = 'queued';
     topic.lastError = null;
-    topic.lastRun = {
-      id: randomUUID(), trigger: 'manual', status: 'queued',
-      startedAt: this.now().toISOString(), finishedAt: null, newItemCount: null,
-    };
     return { topic: structuredClone(topic), shouldEnqueue: true };
   }
 
@@ -744,10 +740,12 @@ export class MemoryTopicStore implements TopicStore {
       (candidate) => candidate.id === topicId && candidate.userId === userId,
     );
     if (!topic) return;
-    const run = topic.lastRun ?? {
-      id: randomUUID(), trigger: 'manual' as const, status: 'queued' as const,
-      startedAt: this.now().toISOString(), finishedAt: null, newItemCount: null,
-    };
+    const run = topic.lastRun?.status === 'queued' || topic.lastRun?.status === 'running'
+      ? topic.lastRun
+      : {
+          id: randomUUID(), trigger: 'manual' as const, status: 'queued' as const,
+          startedAt: this.now().toISOString(), finishedAt: null, newItemCount: null,
+        };
     topic.runStatus = 'running';
     topic.lastRun = {
       id: run.id, trigger: run.trigger, status: 'running', startedAt: run.startedAt,

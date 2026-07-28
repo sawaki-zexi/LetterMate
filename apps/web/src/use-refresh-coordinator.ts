@@ -15,8 +15,8 @@ export interface RefreshCoordinatorOptions {
   trendStatus: TrendStatus | undefined;
   origin: FeedOrigin;
   selectedTopicId?: string;
-  refreshTopic: (topicId: string) => Promise<unknown>;
-  refreshTrends: () => Promise<unknown>;
+  refreshTopic: (topicId: string) => Promise<Topic>;
+  refreshTrends: () => Promise<TrendStatus>;
   refetchTopics: () => Promise<Topic[] | undefined>;
   refetchTrendStatus: () => Promise<TrendStatus | undefined>;
   invalidateFeed: () => Promise<unknown>;
@@ -45,18 +45,20 @@ interface CoordinatorView {
 }
 
 interface RefreshSession {
-  requestBoundary: number;
-  deadline: number;
   targetCount: number;
   pendingTopicIds: Set<string>;
   trendPending: boolean;
-  baselineTopicRunIds: Map<string, string | null>;
-  baselineTrendRunId: string | null;
+  readyTopicIds: Set<string>;
+  topicIgnoredRunIds: Map<string, Set<string>>;
+  trendReady: boolean;
+  trendIgnoredRunIds: Set<string>;
   succeededTargets: number;
   failedTargets: number;
   newItemCount: number;
-  consecutivePollFailures: number;
-  polling: boolean;
+  topicPollFailures: number;
+  trendPollFailures: number;
+  topicsPolling: boolean;
+  trendPolling: boolean;
   finishing: boolean;
   completion: Promise<RefreshNotification | null>;
   resolve: (notification: RefreshNotification | null) => void;
@@ -70,17 +72,15 @@ const initialView: CoordinatorView = {
   notification: null,
 };
 
-function isLaterManualTerminalRun(
+function isNewManualTerminalRun(
   run: RunSummary | null,
-  baselineRunId: string | null,
-  requestBoundary: number,
+  ignoredRunIds: ReadonlySet<string>,
 ): run is Extract<RunSummary, { status: 'succeeded' | 'failed' }> {
   return Boolean(
     run
-    && run.id !== baselineRunId
+    && !ignoredRunIds.has(run.id)
     && run.trigger === 'manual'
-    && (run.status === 'succeeded' || run.status === 'failed')
-    && new Date(run.startedAt).getTime() >= requestBoundary,
+    && (run.status === 'succeeded' || run.status === 'failed'),
   );
 }
 
@@ -92,6 +92,13 @@ function targetTopicIds(options: RefreshCoordinatorOptions): string[] {
 
 function targetsTrend(options: RefreshCoordinatorOptions): boolean {
   return !options.selectedTopicId && options.origin !== 'topic';
+}
+
+function initialTopicBaselines(options: RefreshCoordinatorOptions, topicIds: string[]) {
+  return new Map(topicIds.map((topicId) => {
+    const runId = options.topics.find((topic) => topic.id === topicId)?.lastRun?.id;
+    return [topicId, new Set(runId ? [runId] : [])] as const;
+  }));
 }
 
 export function useRefreshCoordinator(options: RefreshCoordinatorOptions): RefreshCoordinator {
@@ -126,7 +133,7 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     }));
   }, []);
 
-  const finish = useCallback(async (
+  const finish = useCallback((
     session: RefreshSession,
     notification: Omit<RefreshNotification, 'id'>,
     refreshFeed: boolean,
@@ -136,9 +143,9 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     clearTimers();
     if (refreshFeed) {
       try {
-        await optionsRef.current.invalidateFeed();
+        void Promise.resolve(optionsRef.current.invalidateFeed()).catch(() => undefined);
       } catch {
-        // The authoritative run result still completes the refresh; cached Feed remains intact.
+        // Completion is authoritative even if the cached Feed cannot be refreshed.
       }
     }
     const payload: RefreshNotification = {
@@ -159,7 +166,7 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
   }, [clearTimers]);
 
   const finishUnconfirmed = useCallback((session: RefreshSession) => {
-    void finish(session, {
+    finish(session, {
       kind: 'warning',
       message: '刷新状态无法确认，已保留现有内容',
       ariaLive: 'polite',
@@ -181,8 +188,14 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
       kind = 'error';
       message = '刷新失败，已保留现有内容';
     }
-    void finish(session, { kind, message, ariaLive: 'polite' }, true);
+    finish(session, { kind, message, ariaLive: 'polite' }, true);
   }, [finish]);
+
+  const maybeFinish = useCallback((session: RefreshSession) => {
+    if (session.pendingTopicIds.size === 0 && !session.trendPending) {
+      finishConfirmed(session);
+    }
+  }, [finishConfirmed]);
 
   const acceptRun = useCallback((session: RefreshSession, run: RunSummary) => {
     if (run.status === 'succeeded') {
@@ -193,75 +206,96 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     }
   }, []);
 
-  const pollRef = useRef<(session: RefreshSession) => Promise<void>>(async () => undefined);
+  const recordPollFailure = useCallback((
+    session: RefreshSession,
+    target: 'topic' | 'trend',
+  ) => {
+    if (sessionRef.current !== session || session.finishing) return;
+    if (target === 'topic') session.topicPollFailures += 1;
+    else session.trendPollFailures += 1;
+    const failures = target === 'topic'
+      ? session.topicPollFailures
+      : session.trendPollFailures;
+    if (failures >= (optionsRef.current.maxConsecutivePollFailures ?? 4)) {
+      finishUnconfirmed(session);
+    }
+  }, [finishUnconfirmed]);
+
+  const pollRef = useRef<(session: RefreshSession) => void>(() => undefined);
   const schedulePoll = useCallback(function schedule(session: RefreshSession) {
-    if (
-      sessionRef.current !== session
-      || session.finishing
-      || session.polling
-      || timerRef.current !== null
-    ) return;
-    const delay = optionsRef.current.pollIntervalMs ?? 1_500;
+    if (sessionRef.current !== session || session.finishing || timerRef.current !== null) return;
     timerRef.current = window.setTimeout(() => {
       timerRef.current = null;
-      session.polling = true;
-      void pollRef.current(session).finally(() => {
-        session.polling = false;
-        schedule(session);
-      });
-    }, delay);
-  }, []);
+      try {
+        pollRef.current(session);
+      } catch {
+        finishUnconfirmed(session);
+      }
+      schedule(session);
+    }, optionsRef.current.pollIntervalMs ?? 1_500);
+  }, [finishUnconfirmed]);
 
-  pollRef.current = async (session: RefreshSession) => {
+  pollRef.current = (session: RefreshSession) => {
     if (sessionRef.current !== session || session.finishing) return;
     const currentOptions = optionsRef.current;
-    const [topicsResult, trendResult] = await Promise.allSettled([
-      currentOptions.refetchTopics(),
-      currentOptions.refetchTrendStatus(),
-    ]);
-    if (sessionRef.current !== session || session.finishing) return;
 
-    const topicConfirmationFailed = session.pendingTopicIds.size > 0
-      && topicsResult.status === 'rejected';
-    const trendConfirmationFailed = session.trendPending && trendResult.status === 'rejected';
-    if (topicConfirmationFailed || trendConfirmationFailed) {
-      session.consecutivePollFailures += 1;
-    } else {
-      session.consecutivePollFailures = 0;
-    }
-
-    if (topicsResult.status === 'fulfilled') {
-      for (const topic of topicsResult.value ?? []) {
-        if (!session.pendingTopicIds.has(topic.id)) continue;
-        const baselineId = session.baselineTopicRunIds.get(topic.id) ?? null;
-        if (isLaterManualTerminalRun(topic.lastRun, baselineId, session.requestBoundary)) {
-          session.pendingTopicIds.delete(topic.id);
-          acceptRun(session, topic.lastRun);
-        }
+    if (session.pendingTopicIds.size > 0 && !session.topicsPolling) {
+      session.topicsPolling = true;
+      const readyAtLaunch = new Set(session.readyTopicIds);
+      let request: Promise<Topic[] | undefined> | null = null;
+      try {
+        request = Promise.resolve(currentOptions.refetchTopics());
+      } catch {
+        session.topicsPolling = false;
+        recordPollFailure(session, 'topic');
       }
-    }
-    if (
-      session.trendPending
-      && trendResult.status === 'fulfilled'
-      && isLaterManualTerminalRun(
-        trendResult.value?.lastRun ?? null,
-        session.baselineTrendRunId,
-        session.requestBoundary,
-      )
-    ) {
-      session.trendPending = false;
-      acceptRun(session, trendResult.value!.lastRun!);
+      void request?.then((topics) => {
+        session.topicsPolling = false;
+        if (sessionRef.current !== session || session.finishing) return;
+        session.topicPollFailures = 0;
+        for (const topic of topics ?? []) {
+          if (!session.pendingTopicIds.has(topic.id) || !readyAtLaunch.has(topic.id)) continue;
+          const ignoredRunIds = session.topicIgnoredRunIds.get(topic.id) ?? new Set<string>();
+          if (isNewManualTerminalRun(topic.lastRun, ignoredRunIds)) {
+            session.pendingTopicIds.delete(topic.id);
+            acceptRun(session, topic.lastRun);
+          }
+        }
+        syncView(session);
+        maybeFinish(session);
+      }).catch(() => {
+        session.topicsPolling = false;
+        recordPollFailure(session, 'topic');
+      }).catch(() => undefined);
     }
 
-    syncView(session);
-    if (session.pendingTopicIds.size === 0 && !session.trendPending) {
-      finishConfirmed(session);
-      return;
-    }
-    const maxFailures = currentOptions.maxConsecutivePollFailures ?? 4;
-    if (session.consecutivePollFailures >= maxFailures || Date.now() >= session.deadline) {
-      finishUnconfirmed(session);
-      return;
+    if (session.trendPending && !session.trendPolling) {
+      session.trendPolling = true;
+      const readyAtLaunch = session.trendReady;
+      let request: Promise<TrendStatus | undefined> | null = null;
+      try {
+        request = Promise.resolve(currentOptions.refetchTrendStatus());
+      } catch {
+        session.trendPolling = false;
+        recordPollFailure(session, 'trend');
+      }
+      void request?.then((status) => {
+        session.trendPolling = false;
+        if (sessionRef.current !== session || session.finishing) return;
+        session.trendPollFailures = 0;
+        if (
+          readyAtLaunch
+          && isNewManualTerminalRun(status?.lastRun ?? null, session.trendIgnoredRunIds)
+        ) {
+          session.trendPending = false;
+          acceptRun(session, status!.lastRun!);
+        }
+        syncView(session);
+        maybeFinish(session);
+      }).catch(() => {
+        session.trendPolling = false;
+        recordPollFailure(session, 'trend');
+      }).catch(() => undefined);
     }
   };
 
@@ -272,25 +306,24 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     const currentOptions = optionsRef.current;
     const topicIds = targetTopicIds(currentOptions);
     const trendTargeted = targetsTrend(currentOptions);
-    const requestBoundary = (currentOptions.now ?? (() => new Date()))().getTime();
     let resolve!: (notification: RefreshNotification | null) => void;
     const completion = new Promise<RefreshNotification | null>((done) => { resolve = done; });
+    const initialTrendRunId = currentOptions.trendStatus?.lastRun?.id;
     const session: RefreshSession = {
-      requestBoundary,
-      deadline: Date.now() + (currentOptions.confirmationTimeoutMs ?? 12 * 60 * 1_000),
       targetCount: topicIds.length + Number(trendTargeted),
       pendingTopicIds: new Set(topicIds),
       trendPending: trendTargeted,
-      baselineTopicRunIds: new Map(topicIds.map((topicId) => [
-        topicId,
-        currentOptions.topics.find((topic) => topic.id === topicId)?.lastRun?.id ?? null,
-      ])),
-      baselineTrendRunId: currentOptions.trendStatus?.lastRun?.id ?? null,
+      readyTopicIds: new Set(),
+      topicIgnoredRunIds: initialTopicBaselines(currentOptions, topicIds),
+      trendReady: false,
+      trendIgnoredRunIds: new Set(initialTrendRunId ? [initialTrendRunId] : []),
       succeededTargets: 0,
       failedTargets: 0,
       newItemCount: 0,
-      consecutivePollFailures: 0,
-      polling: false,
+      topicPollFailures: 0,
+      trendPollFailures: 0,
+      topicsPolling: false,
+      trendPolling: false,
       finishing: false,
       completion,
       resolve,
@@ -312,36 +345,59 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     }
     schedulePoll(session);
 
-    void (async () => {
-      const topicTriggers = topicIds.map(async (topicId) => {
+    for (const topicId of topicIds) {
+      void (async () => {
         try {
-          await currentOptions.refreshTopic(topicId);
+          const response = await currentOptions.refreshTopic(topicId);
+          if (sessionRef.current !== session || session.finishing) return;
+          if (response.lastRun) {
+            session.topicIgnoredRunIds.get(topicId)?.add(response.lastRun.id);
+          }
+          session.readyTopicIds.add(topicId);
         } catch {
+          if (sessionRef.current !== session || session.finishing) return;
           if (session.pendingTopicIds.delete(topicId)) session.failedTargets += 1;
+          syncView(session);
+          maybeFinish(session);
         }
+      })().catch(() => {
+        if (sessionRef.current !== session || session.finishing) return;
+        if (session.pendingTopicIds.delete(topicId)) session.failedTargets += 1;
+        syncView(session);
+        maybeFinish(session);
       });
-      const trendTrigger = trendTargeted
-        ? (async () => {
-            try {
-              await currentOptions.refreshTrends();
-            } catch {
-              if (session.trendPending) {
-                session.trendPending = false;
-                session.failedTargets += 1;
-              }
-            }
-          })()
-        : Promise.resolve();
-      await Promise.all([...topicTriggers, trendTrigger]);
-      if (sessionRef.current !== session || session.finishing) return;
-      syncView(session);
-      if (session.pendingTopicIds.size === 0 && !session.trendPending) {
-        finishConfirmed(session);
-      }
-    })();
+    }
 
+    if (trendTargeted) {
+      void (async () => {
+        try {
+          const response = await currentOptions.refreshTrends();
+          if (sessionRef.current !== session || session.finishing) return;
+          if (response.lastRun) session.trendIgnoredRunIds.add(response.lastRun.id);
+          session.trendReady = true;
+        } catch {
+          if (sessionRef.current !== session || session.finishing) return;
+          if (session.trendPending) {
+            session.trendPending = false;
+            session.failedTargets += 1;
+          }
+          syncView(session);
+          maybeFinish(session);
+        }
+      })().catch(() => {
+        if (sessionRef.current !== session || session.finishing) return;
+        if (session.trendPending) {
+          session.trendPending = false;
+          session.failedTargets += 1;
+        }
+        syncView(session);
+        maybeFinish(session);
+      });
+    }
+
+    if (session.targetCount === 0) maybeFinish(session);
     return completion;
-  }, [finishConfirmed, finishUnconfirmed, schedulePoll, syncView]);
+  }, [finishUnconfirmed, maybeFinish, schedulePoll, syncView]);
 
   useEffect(() => {
     mountedRef.current = true;
