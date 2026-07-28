@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const rfc3339Timestamp = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
@@ -19,12 +20,13 @@ const isValidRfc3339 = (value: string): boolean => {
 const timestampSchema = z.string()
   .refine(isValidRfc3339)
   .transform((value) => new Date(value).toISOString());
-const responseSchema = z.object({
-  items: z.array(z.object({
+const itemSchema = z.object({
     id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
     snippet: z.object({ title: z.string(), publishedAt: timestampSchema }).passthrough(),
     statistics: z.record(z.string(), z.string()).optional(),
-  }).passthrough()).max(50),
+  }).passthrough();
+const responseSchema = z.object({
+  items: z.array(z.unknown()).max(50),
 }).passthrough();
 
 export interface YouTubeTrendSourceConfig {
@@ -36,6 +38,7 @@ export interface YouTubeTrendSourceConfig {
 export class YouTubeTrendSource implements TrendSource {
   readonly id = 'youtube-trends';
   readonly label = 'YouTube';
+  readonly minimumRequestBudget = 1;
   private readonly maxResults: number;
 
   constructor(private readonly config: YouTubeTrendSourceConfig, private readonly fetcher: typeof fetch = fetch) {
@@ -58,21 +61,27 @@ export class YouTubeTrendSource implements TrendSource {
     url.searchParams.set('regionCode', this.config.region);
     url.searchParams.set('maxResults', String(this.maxResults));
     url.searchParams.set('key', key);
+    window.recordRequest?.();
     const payload = await this.request(url.toString(), signal);
     const parsed = responseSchema.safeParse(payload);
     if (!parsed.success) throw this.invalid();
-    const candidates = parsed.data.items.slice(0, window.maxCandidates).map((item) => {
+    const candidates = [];
+    for (const rawItem of parsed.data.items) {
+      const itemResult = itemSchema.safeParse(rawItem);
+      if (!itemResult.success) continue;
+      const item = itemResult.data;
       const title = item.snippet.title.trim();
-      if (!title) throw this.invalid();
-      return {
+      if (!title) continue;
+      candidates.push({
         sourceId: this.id,
         platform: this.label,
         externalId: item.id,
         title,
         url: `https://www.youtube.com/watch?v=${item.id}`,
         publishedAt: item.snippet.publishedAt,
-      };
-    });
+      });
+      if (candidates.length >= window.maxCandidates) break;
+    }
     return { candidates, requestCount: 1 };
   }
 
@@ -86,7 +95,7 @@ export class YouTubeTrendSource implements TrendSource {
     if (response.status === 401 || response.status === 403) throw new TrendSourceError('TREND_SOURCE_AUTH_FAILED', 'YouTube credentials are unavailable', false);
     if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'YouTube rate limit reached', true);
     if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'YouTube is temporarily unavailable', response.status >= 500);
-    try { return await response.json(); } catch { throw this.invalid(); }
+    try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 
   private invalid(): TrendSourceError {

@@ -118,4 +118,16 @@ describe('RedditTrendSource', () => {
     expect(error).toMatchObject({ code: 'TREND_SOURCE_AUTH_FAILED', message: 'Reddit credentials are unavailable' });
     expect(String(error)).not.toContain('private');
   });
+
+  it('rejects an oversized OAuth JSON response before parsing it', async () => {
+    const token = { access_token: 'private-token', token_type: 'bearer', expires_in: 3600 };
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(token), { headers: { 'content-length': '600000' } }),
+    );
+    const source = new RedditTrendSource({ clientId: 'id', clientSecret: 'secret', communities: ['programming'] }, fetcher as typeof fetch);
+    await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
+      code: 'TREND_SOURCE_RESPONSE_INVALID', message: 'Reddit returned an invalid response',
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
 });

@@ -54,4 +54,22 @@ describe('HackerNewsTrendSource', () => {
     const malformed = new HackerNewsTrendSource(vi.fn().mockResolvedValue(new Response(JSON.stringify({ ids: [1] }), { status: 200 })) as typeof fetch);
     await expect(malformed.collect(window, new AbortController().signal)).rejects.toMatchObject({ code: 'TREND_SOURCE_RESPONSE_INVALID' });
   });
+
+  it('rejects an oversized JSON response before parsing it', async () => {
+    const source = new HackerNewsTrendSource(vi.fn().mockResolvedValue(new Response('[]', {
+      headers: { 'content-length': '600000' },
+    })) as typeof fetch);
+    await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
+      code: 'TREND_SOURCE_RESPONSE_INVALID', message: 'Hacker News returned an invalid response',
+    });
+  });
+
+  it('maps HTTP 429 to the shared rate-limit failure code', async () => {
+    const source = new HackerNewsTrendSource(vi.fn().mockResolvedValue(
+      new Response('private body', { status: 429 }),
+    ) as typeof fetch);
+    await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
+      code: 'TREND_SOURCE_RATE_LIMITED', retryable: true,
+    });
+  });
 });

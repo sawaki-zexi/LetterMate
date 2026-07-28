@@ -1,4 +1,5 @@
 import type { AppConfig } from '@lettermate/config';
+import { ContentFetcher } from './content-fetcher.js';
 import { ArxivConnector } from './connectors/arxiv.js';
 import { BilibiliConnector } from './connectors/bilibili.js';
 import { BlueskyConnector } from './connectors/bluesky.js';
@@ -70,6 +71,9 @@ export function createTrendSources(
       communities: config.TREND_REDDIT_COMMUNITIES,
     }, fetcher),
     new BilibiliTrendSource({}, fetcher),
-    new GoogleRssTrendSource({ feedUrls: config.TREND_GOOGLE_RSS_URLS }, fetcher),
+    new GoogleRssTrendSource(
+      { feedUrls: config.TREND_GOOGLE_RSS_URLS },
+      new ContentFetcher({}, fetcher),
+    ),
   ];
 }

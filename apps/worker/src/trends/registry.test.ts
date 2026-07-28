@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { TrendSourceRegistry } from './registry.js';
+import { RedditTrendSource } from './reddit.js';
 import {
   TrendSourceError,
   type TrendSeedCandidate,
@@ -94,6 +95,20 @@ describe('TrendSourceRegistry', () => {
     expect(JSON.stringify(result)).not.toContain('javascript');
   });
 
+  it('rejects candidate URLs containing credentials', async () => {
+    const registry = new TrendSourceRegistry([
+      source('credential-url', { collect: async () => ({
+        candidates: [candidate('credential-url', 'private', 'https://user:password@example.com/trend')],
+        requestCount: 1,
+      }) }),
+    ], { concurrency: 1, timeoutMs: 1_000 });
+
+    await expect(registry.collect(window)).resolves.toMatchObject({
+      candidates: [],
+      failures: [{ sourceId: 'credential-url', code: 'TREND_SOURCE_RESPONSE_INVALID' }],
+    });
+  });
+
   it('round-robins valid source results, canonicalizes URLs, and caps output', async () => {
     const registry = new TrendSourceRegistry([
       source('one', { collect: async () => ({ candidates: [
@@ -151,6 +166,84 @@ describe('TrendSourceRegistry', () => {
       process.removeListener('unhandledRejection', onUnhandled);
       vi.useRealTimers();
     }
+  });
+
+  it('retains a hung source request count after timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const hung = source('hung', { collect: async (receivedWindow) => {
+        (receivedWindow as TrendWindow & { recordRequest?: () => void }).recordRequest?.();
+        return new Promise<TrendSourceResult>(() => undefined);
+      } });
+      const registry = new TrendSourceRegistry([hung], { concurrency: 1, timeoutMs: 10 });
+      const pending = registry.collect(window);
+      await vi.advanceTimersByTimeAsync(10);
+
+      await expect(pending).resolves.toMatchObject({
+        requestCount: 1,
+        requestCounts: { hung: 1 },
+        failures: [{ sourceId: 'hung', code: 'TREND_SOURCE_TIMEOUT' }],
+      });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('retains both Reddit requests when the listing fails', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: 'temporary-token', token_type: 'bearer', expires_in: 3600,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response('private listing body', { status: 503 }));
+    const reddit = new RedditTrendSource({
+      clientId: 'id', clientSecret: 'secret', communities: ['programming'],
+    }, fetcher as typeof fetch);
+    const registry = new TrendSourceRegistry([reddit], { concurrency: 1, timeoutMs: 1_000 });
+
+    const result = await registry.collect(window);
+
+    expect(result).toMatchObject({
+      requestCount: 2,
+      requestCounts: { 'reddit-trends': 2 },
+      failures: [{ sourceId: 'reddit-trends', code: 'TREND_SOURCE_UNAVAILABLE' }],
+    });
+  });
+
+  it('allocates only useful minimum request budgets', async () => {
+    const received: Array<[string, number]> = [];
+    const costSource = (id: string, minimumRequestBudget: number): TrendSource => ({
+      ...source(id),
+      minimumRequestBudget,
+      collect: async (receivedWindow) => {
+        received.push([id, receivedWindow.requestBudget]);
+        return { candidates: [], requestCount: receivedWindow.requestBudget };
+      },
+    } as TrendSource);
+    const registry = new TrendSourceRegistry([
+      costSource('one', 1), costSource('two', 2), costSource('three', 1),
+      costSource('four', 2), costSource('five', 1), costSource('six', 1),
+    ], { concurrency: 6, timeoutMs: 1_000 });
+
+    const result = await registry.collect(window);
+
+    expect(received).toEqual([['one', 1], ['two', 2], ['three', 1], ['four', 2]]);
+    expect(result.skippedSourceIds).toEqual(['five', 'six']);
+    expect(result.requestCount).toBe(6);
+  });
+
+  it('rotates source priority across repeated low-budget collections', async () => {
+    const called: string[] = [];
+    const rotating = (id: string): TrendSource => source(id, { collect: async () => {
+      called.push(id);
+      return { candidates: [], requestCount: 1 };
+    } });
+    const registry = new TrendSourceRegistry([
+      rotating('one'), rotating('two'), rotating('three'),
+    ], { concurrency: 1, timeoutMs: 1_000 });
+
+    await registry.collect({ ...window, requestBudget: 1 });
+    await registry.collect({ ...window, requestBudget: 1 });
+    await registry.collect({ ...window, requestBudget: 1 });
+
+    expect(called).toEqual(['one', 'two', 'three']);
   });
 
   it('rejects duplicate IDs and invalid options or windows', async () => {

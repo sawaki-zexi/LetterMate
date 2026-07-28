@@ -46,7 +46,7 @@ const canonicalizeUrl = (value: string): string => {
       false,
     );
   }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) {
     throw new TrendSourceError(
       'TREND_SOURCE_RESPONSE_INVALID',
       'Trend source returned an invalid response',
@@ -94,6 +94,7 @@ const validateWindow = (window: TrendWindow): void => {
 export class TrendSourceRegistry {
   private readonly sources: readonly TrendSource[];
   private readonly options: TrendSourceRegistryOptions;
+  private rotationOffset = 0;
 
   constructor(sources: readonly TrendSource[], options: TrendSourceRegistryOptions) {
     if (!Number.isInteger(options.concurrency) || options.concurrency < 1 || options.concurrency > 16) {
@@ -107,6 +108,10 @@ export class TrendSourceRegistry {
       if (!source.id.trim()) throw new Error('Trend source ID must not be blank');
       if (ids.has(source.id)) throw new Error(`Duplicate trend source ID: ${source.id}`);
       ids.add(source.id);
+      const minimum = source.minimumRequestBudget ?? 1;
+      if (!Number.isInteger(minimum) || minimum < 1) {
+        throw new Error(`minimumRequestBudget for ${source.id} must be a positive integer`);
+      }
     }
     this.sources = [...sources];
     this.options = { ...options };
@@ -114,26 +119,41 @@ export class TrendSourceRegistry {
 
   async collect(window: TrendWindow, parentSignal?: AbortSignal): Promise<TrendCollectionSummary> {
     validateWindow(window);
-    const skippedSourceIds: string[] = [];
+    const skippedSourceIdSet = new Set<string>();
     const failuresByIndex: Array<TrendSourceFailure | undefined> = new Array(this.sources.length);
     const selected: Array<{ source: TrendSource; index: number }> = [];
     for (const [index, source] of this.sources.entries()) {
       try {
         if (source.isEnabled()) selected.push({ source, index });
-        else skippedSourceIds.push(source.id);
+        else skippedSourceIdSet.add(source.id);
       } catch (error) {
         failuresByIndex[index] = safeFailure(source.id, error);
       }
     }
 
-    const runnable = selected.slice(0, window.requestBudget);
-    for (const { source } of selected.slice(runnable.length)) skippedSourceIds.push(source.id);
-    const baseBudget = runnable.length === 0 ? 0 : Math.floor(window.requestBudget / runnable.length);
-    const allocations = runnable.map((entry, index) => ({
-      ...entry,
-      budget: baseBudget + (index < window.requestBudget % runnable.length ? 1 : 0),
-    }));
+    const rotation = selected.length === 0 ? 0 : this.rotationOffset % selected.length;
+    if (selected.length > 0) this.rotationOffset = (rotation + 1) % selected.length;
+    const ordered = [...selected.slice(rotation), ...selected.slice(0, rotation)];
+    let remainingBudget = window.requestBudget;
+    const allocations: Array<{ source: TrendSource; index: number; budget: number }> = [];
+    for (const entry of ordered) {
+      const minimum = entry.source.minimumRequestBudget ?? 1;
+      if (minimum <= remainingBudget) {
+        allocations.push({ ...entry, budget: minimum });
+        remainingBudget -= minimum;
+      } else {
+        skippedSourceIdSet.add(entry.source.id);
+      }
+    }
+    for (let index = 0; remainingBudget > 0 && allocations.length > 0; index += 1) {
+      allocations[index % allocations.length]!.budget += 1;
+      remainingBudget -= 1;
+    }
+    const skippedSourceIds = this.sources
+      .map(({ id }) => id)
+      .filter((id) => skippedSourceIdSet.has(id));
     const results: Array<TrendSourceResult | undefined> = new Array(this.sources.length);
+    const accountedCounts: number[] = new Array(this.sources.length).fill(0);
     let next = 0;
     let cancelled = parentSignal?.aborted ?? false;
     const markCancelled = () => { cancelled = true; };
@@ -172,19 +192,32 @@ export class TrendSourceRegistry {
             if (parentSignal.aborted) abortParent();
             else parentSignal.addEventListener('abort', abortParent, { once: true });
           });
+          const recordRequest = () => {
+            if (accountedCounts[index]! >= budget) {
+              throw new TrendSourceError(
+                'TREND_SOURCE_REQUEST_BUDGET_EXCEEDED',
+                'Trend source exceeded its request budget',
+                false,
+              );
+            }
+            accountedCounts[index]! += 1;
+          };
           const raw: unknown = await Promise.race([
-            source.collect({ ...window, requestBudget: budget }, controller.signal),
+            source.collect({ ...window, requestBudget: budget, recordRequest }, controller.signal),
             timeout,
             cancellation,
           ]);
           const parsed = resultSchema.safeParse(raw);
-          if (!parsed.success || parsed.data.requestCount > budget) throw responseError();
+          if (!parsed.success) throw responseError();
+          const reconciledCount = Math.max(accountedCounts[index]!, parsed.data.requestCount);
+          if (reconciledCount > budget) throw responseError();
+          accountedCounts[index] = reconciledCount;
           const candidates = parsed.data.candidates.map((rawCandidate) => {
             const candidate = candidateSchema.safeParse(rawCandidate);
             if (!candidate.success || candidate.data.sourceId !== source.id) throw responseError();
             return { ...candidate.data, url: canonicalizeUrl(candidate.data.url) };
           });
-          results[index] = { candidates, requestCount: parsed.data.requestCount };
+          results[index] = { candidates, requestCount: reconciledCount };
         } catch (error) {
           failuresByIndex[index] = safeFailure(source.id, error);
         } finally {
@@ -220,10 +253,12 @@ export class TrendSourceRegistry {
     const queues: TrendSeedCandidate[][] = [];
     for (const [index, source] of this.sources.entries()) {
       const result = results[index];
-      if (!result) continue;
-      successfulSourceIds.push(source.id);
-      requestCounts[source.id] = result.requestCount;
-      queues.push([...result.candidates]);
+      const accountedCount = accountedCounts[index] ?? 0;
+      if (accountedCount > 0 || result) requestCounts[source.id] = accountedCount;
+      if (result) {
+        successfulSourceIds.push(source.id);
+        queues.push([...result.candidates]);
+      }
     }
     const candidates: TrendSeedCandidate[] = [];
     const seenIds = new Set<string>();

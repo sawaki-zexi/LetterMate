@@ -1,15 +1,17 @@
 import { z } from 'zod';
+import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const responseSchema = z.object({
   code: z.number().int(),
   data: z.object({
-    list: z.array(z.object({
-      bvid: z.string().regex(/^BV[A-Za-z0-9]+$/),
-      title: z.string(),
-      pubdate: z.number().int().nonnegative(),
-    }).passthrough()).max(100),
+    list: z.array(z.unknown()).max(100),
   }).passthrough().optional().nullable(),
+}).passthrough();
+const itemSchema = z.object({
+  bvid: z.string().regex(/^BV[A-Za-z0-9]+$/),
+  title: z.string(),
+  pubdate: z.number().int().nonnegative(),
 }).passthrough();
 
 const cleanTitle = (value: string): string => value.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
@@ -19,6 +21,7 @@ export interface BilibiliTrendSourceConfig { limit?: number }
 export class BilibiliTrendSource implements TrendSource {
   readonly id = 'bilibili-trends';
   readonly label = 'Bilibili';
+  readonly minimumRequestBudget = 1;
   private readonly limit: number;
 
   constructor(config: BilibiliTrendSourceConfig, private readonly fetcher: typeof fetch = fetch) {
@@ -33,21 +36,27 @@ export class BilibiliTrendSource implements TrendSource {
     const url = new URL('https://api.bilibili.com/x/web-interface/popular');
     url.searchParams.set('pn', '1');
     url.searchParams.set('ps', String(this.limit));
+    window.recordRequest?.();
     const payload = await this.request(url.toString(), signal);
     const parsed = responseSchema.safeParse(payload);
     if (!parsed.success || parsed.data.code !== 0 || !parsed.data.data) throw this.invalid();
-    const candidates = parsed.data.data.list.slice(0, window.maxCandidates).map((item) => {
+    const candidates = [];
+    for (const rawItem of parsed.data.data.list) {
+      const itemResult = itemSchema.safeParse(rawItem);
+      if (!itemResult.success) continue;
+      const item = itemResult.data;
       const title = cleanTitle(item.title);
-      if (!title) throw this.invalid();
-      return {
+      if (!title) continue;
+      candidates.push({
         sourceId: this.id,
         platform: this.label,
         externalId: item.bvid,
         title,
         url: `https://www.bilibili.com/video/${item.bvid}`,
         publishedAt: item.pubdate === 0 ? null : new Date(item.pubdate * 1_000).toISOString(),
-      };
-    });
+      });
+      if (candidates.length >= window.maxCandidates) break;
+    }
     return { candidates, requestCount: 1 };
   }
 
@@ -61,7 +70,7 @@ export class BilibiliTrendSource implements TrendSource {
     }
     if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'Bilibili rate limit reached', true);
     if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Bilibili is temporarily unavailable', response.status >= 500);
-    try { return await response.json(); } catch { throw this.invalid(); }
+    try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 
   private invalid(): TrendSourceError {

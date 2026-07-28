@@ -1,8 +1,15 @@
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import { ContentFetchError, ContentFetcher } from '../content-fetcher.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 type XmlObject = Record<string, unknown>;
-const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', trimValues: true });
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  trimValues: true,
+  parseTagValue: false,
+  processEntities: false,
+});
 const asObject = (value: unknown): XmlObject | null => typeof value === 'object' && value !== null && !Array.isArray(value)
   ? value as XmlObject : null;
 const asArray = (value: unknown): unknown[] => value === undefined ? [] : Array.isArray(value) ? value : [value];
@@ -21,6 +28,13 @@ const safeHttpUrl = (value: string): string | null => {
     return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null;
   } catch { return null; }
 };
+const normalizedIdentityTitle = (value: string): string => value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+const geoFromUrl = (value: string): string | null => {
+  try {
+    const geo = new URL(value).searchParams.get('geo')?.trim().toUpperCase() ?? '';
+    return /^[A-Z]{2}$/.test(geo) ? geo : null;
+  } catch { return null; }
+};
 const isoDate = (value: string | null): string | null => {
   if (!value) return null;
   const milliseconds = Date.parse(value);
@@ -35,10 +49,14 @@ export interface GoogleRssTrendSourceConfig {
 export class GoogleRssTrendSource implements TrendSource {
   readonly id = 'google-trends-rss';
   readonly label = 'Google Trends';
+  readonly minimumRequestBudget = 1;
   private readonly feedUrls: string[];
   private readonly maxEntriesPerFeed: number;
 
-  constructor(config: GoogleRssTrendSourceConfig, private readonly fetcher: typeof fetch = fetch) {
+  constructor(
+    config: GoogleRssTrendSourceConfig,
+    private readonly textFetcher: Pick<ContentFetcher, 'fetchRawText'> = new ContentFetcher({ maxBytes: 512_000 }),
+  ) {
     this.feedUrls = config.feedUrls.map((value) => {
       try {
         const url = new URL(value);
@@ -59,9 +77,9 @@ export class GoogleRssTrendSource implements TrendSource {
     let requestCount = 0;
     for (const feedUrl of this.feedUrls.slice(0, window.requestBudget)) {
       if (candidates.length >= window.maxCandidates) break;
-      const xml = await this.request(feedUrl, signal);
-      requestCount += 1;
-      candidates.push(...this.parse(xml, feedUrl, Math.min(
+      const fetched = await this.request(feedUrl, signal, window.recordRequest);
+      requestCount += fetched.requestCount;
+      candidates.push(...this.parse(fetched.xml, feedUrl, Math.min(
         this.maxEntriesPerFeed,
         window.maxCandidates - candidates.length,
       )));
@@ -69,15 +87,43 @@ export class GoogleRssTrendSource implements TrendSource {
     return { candidates, requestCount };
   }
 
-  private async request(url: string, signal: AbortSignal): Promise<string> {
-    let response: Response;
-    try { response = await this.fetcher(url, { signal }); }
-    catch {
-      if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'Google Trends RSS collection was aborted', true);
+  private async request(
+    url: string,
+    signal: AbortSignal,
+    recordRegistryRequest?: () => void,
+  ): Promise<{ xml: string; requestCount: number }> {
+    let requestCount = 0;
+    try {
+      const fetched = await this.textFetcher.fetchRawText(url, {
+        signal,
+        acceptedContentTypes: [
+          'application/rss+xml',
+          'application/atom+xml',
+          'application/xml',
+          'text/xml',
+        ],
+        onRequest: () => {
+          recordRegistryRequest?.();
+          requestCount += 1;
+        },
+      });
+      return { xml: fetched.text, requestCount };
+    } catch (error) {
+      if (signal.aborted || (error instanceof ContentFetchError && error.code === 'CONTENT_FETCH_ABORTED')) {
+        throw new TrendSourceError('TREND_SOURCE_ABORTED', 'Google Trends RSS collection was aborted', true);
+      }
+      if (error instanceof ContentFetchError && error.status === 429) {
+        throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'Google Trends RSS rate limit reached', true);
+      }
+      if (error instanceof ContentFetchError && [
+        'UNSAFE_SOURCE_URL',
+        'UNSUPPORTED_CONTENT_TYPE',
+        'CONTENT_TOO_LARGE',
+      ].includes(error.code)) {
+        throw new TrendSourceError('TREND_SOURCE_RESPONSE_INVALID', 'Google Trends RSS returned an invalid response', false);
+      }
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Google Trends RSS is temporarily unavailable', true);
     }
-    if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Google Trends RSS is temporarily unavailable', response.status >= 500 || response.status === 429);
-    try { return await response.text(); } catch { throw this.invalidXml(); }
   }
 
   private parse(xml: string, feedUrl: string, limit: number): TrendSeedCandidate[] {
@@ -98,14 +144,18 @@ export class GoogleRssTrendSource implements TrendSource {
       const title = asText(item.title);
       const rawLink = asText(item.link);
       if (!title || !rawLink) continue;
-      const url = safeHttpUrl(rawLink);
-      if (!url) continue;
+      const itemLink = safeHttpUrl(rawLink);
+      if (!itemLink) continue;
+      const geo = geoFromUrl(feedUrl) ?? geoFromUrl(itemLink);
+      const exploreUrl = new URL('https://trends.google.com/trends/explore');
+      exploreUrl.searchParams.set('q', title);
+      if (geo) exploreUrl.searchParams.set('geo', geo);
       candidates.push({
         sourceId: this.id,
         platform: this.label,
-        externalId: asText(item.guid) ?? `${feedUrl}#${title}`,
+        externalId: asText(item.guid) ?? `${geo ?? 'GLOBAL'}:${normalizedIdentityTitle(title)}`,
         title,
-        url,
+        url: exploreUrl.toString(),
         publishedAt: isoDate(asText(item.pubDate) ?? asText(item.published) ?? asText(item.date)),
       });
       if (candidates.length >= limit) break;

@@ -5,7 +5,7 @@ import ipaddr from 'ipaddr.js';
 import { Agent } from 'undici';
 
 export class ContentFetchError extends Error {
-  constructor(public readonly code: string, message: string) { super(message); this.name = 'ContentFetchError'; }
+  constructor(public readonly code: string, message: string, public readonly status?: number) { super(message); this.name = 'ContentFetchError'; }
 }
 
 export interface ContentFetcherOptions {
@@ -13,6 +13,12 @@ export interface ContentFetcherOptions {
   resolveHostname?: (hostname: string) => Promise<string[]>;
 }
 export interface FetchedText { finalUrl: string; title: string | null; text: string; contentType: string }
+export interface FetchedRawText { finalUrl: string; text: string; contentType: string }
+export interface RawTextFetchOptions {
+  acceptedContentTypes: readonly string[];
+  signal?: AbortSignal;
+  onRequest?: () => void;
+}
 
 const defaultResolve = async (hostname: string): Promise<string[]> => (
   (await lookup(hostname, { all: true, verbatim: true })).map((result) => result.address)
@@ -38,6 +44,17 @@ export class ContentFetcher {
   }
 
   async fetchText(inputUrl: string, parentSignal?: AbortSignal): Promise<FetchedText> {
+    const raw = await this.fetchRawText(inputUrl, {
+      acceptedContentTypes: ['text/html', 'application/xhtml+xml', 'text/plain'],
+      ...(parentSignal ? { signal: parentSignal } : {}),
+    });
+    return { ...raw, ...this.extract(raw.text, raw.contentType) };
+  }
+
+  async fetchRawText(inputUrl: string, options: RawTextFetchOptions): Promise<FetchedRawText> {
+    if (options.acceptedContentTypes.length === 0) throw new Error('acceptedContentTypes must not be empty');
+    const acceptedContentTypes = new Set(options.acceptedContentTypes.map((value) => value.toLowerCase()));
+    const parentSignal = options.signal;
     let current = inputUrl; const visited = new Set<string>();
     for (let redirects = 0; redirects <= this.maxRedirects; redirects += 1) {
       if (visited.has(current)) throw new ContentFetchError('TOO_MANY_REDIRECTS', 'Source redirect loop detected');
@@ -54,6 +71,7 @@ export class ContentFetcher {
       }, this.timeoutMs);
       const dispatcher = this.createPinnedDispatcher(target);
       try {
+        options.onRequest?.();
         const response = await this.fetcher(current, {
           redirect: 'manual',
           signal: controller.signal,
@@ -69,10 +87,10 @@ export class ContentFetcher {
         }
         if (!response.ok) {
           await response.body?.cancel();
-          throw new ContentFetchError('CONTENT_FETCH_FAILED', 'Source request failed');
+          throw new ContentFetchError('CONTENT_FETCH_FAILED', 'Source request failed', response.status);
         }
         const contentType = response.headers.get('content-type')?.split(';')[0]?.trim().toLowerCase() ?? '';
-        if (!['text/html', 'application/xhtml+xml', 'text/plain'].includes(contentType)) {
+        if (!acceptedContentTypes.has(contentType)) {
           await response.body?.cancel();
           throw new ContentFetchError('UNSUPPORTED_CONTENT_TYPE', 'Source content type is not text');
         }
@@ -82,7 +100,7 @@ export class ContentFetcher {
           throw new ContentFetchError('CONTENT_TOO_LARGE', 'Source content exceeds the size limit');
         }
         const body = await this.readBody(response);
-        return { finalUrl: current, contentType, ...this.extract(body, contentType) };
+        return { finalUrl: current, contentType, text: body };
       } catch (error) {
         if (error instanceof ContentFetchError) throw error;
         if (parentSignal?.aborted) throw new ContentFetchError('CONTENT_FETCH_ABORTED', 'Source request was aborted');

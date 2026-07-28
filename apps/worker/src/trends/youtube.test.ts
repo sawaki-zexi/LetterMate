@@ -13,6 +13,12 @@ describe('YouTubeTrendSource', () => {
       id: 'abc_DEF-123',
       snippet: { title: 'Agent runtime demo', publishedAt: '2026-07-27T12:00:00.000Z' },
       statistics: { viewCount: '1000' },
+    }, {
+      id: 123,
+      snippet: { title: 'Malformed sibling', publishedAt: '2026-07-27T12:00:00Z' },
+    }, {
+      id: 'blankTitle',
+      snippet: { title: '  ', publishedAt: '2026-07-27T12:00:00Z' },
     }] }), { status: 200 }));
     const signal = new AbortController().signal;
     const result = await new YouTubeTrendSource({ apiKey: 'private-key', region: 'JP', maxResults: 20 }, fetcher as typeof fetch)
@@ -59,14 +65,25 @@ describe('YouTubeTrendSource', () => {
     ]);
   });
 
-  it('rejects invalid timestamps and maps API failures safely', async () => {
+  it('drops invalid timestamp items and maps API failures safely', async () => {
     const malformed = new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ items: [{ id: 'video123', snippet: { title: 'Title', publishedAt: '2026-02-31T12:00:00Z' } }] }), { status: 200 }),
     ) as typeof fetch);
-    await expect(malformed.collect(window, new AbortController().signal)).rejects.toMatchObject({ code: 'TREND_SOURCE_RESPONSE_INVALID' });
+    await expect(malformed.collect(window, new AbortController().signal)).resolves.toEqual({
+      candidates: [], requestCount: 1,
+    });
     const denied = new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, vi.fn().mockResolvedValue(new Response('secret body', { status: 403 })) as typeof fetch);
     await expect(denied.collect(window, new AbortController().signal)).rejects.toMatchObject({
       code: 'TREND_SOURCE_AUTH_FAILED', message: 'YouTube credentials are unavailable',
+    });
+  });
+
+  it('rejects an oversized JSON response before parsing it', async () => {
+    const source = new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ items: [] }), { headers: { 'content-length': '600000' } }),
+    ) as typeof fetch);
+    await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
+      code: 'TREND_SOURCE_RESPONSE_INVALID', message: 'YouTube returned an invalid response',
     });
   });
 });

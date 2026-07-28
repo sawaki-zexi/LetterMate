@@ -11,6 +11,7 @@ describe('TwitterApiIoTrendSource', () => {
   it('collects normalized X trend seeds within the WOEID request budget', async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ trends: [
       { name: '#AgenticAI', query: '%23AgenticAI', tweet_volume: 1200 },
+      { name: 123, query: 'invalid' },
       { name: '  ' },
     ] }), { status: 200 }));
     const signal = new AbortController().signal;
@@ -57,9 +58,19 @@ describe('TwitterApiIoTrendSource', () => {
 
   it('rejects malformed responses safely', async () => {
     const source = new TwitterApiIoTrendSource({ apiKey: 'key', woeids: [1] }, vi.fn()
-      .mockResolvedValue(new Response(JSON.stringify({ trends: [{ name: 123 }] }), { status: 200 })) as typeof fetch);
+      .mockResolvedValue(new Response(JSON.stringify({ trends: 'not-an-array' }), { status: 200 })) as typeof fetch);
     await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
       code: 'TREND_SOURCE_RESPONSE_INVALID', retryable: false,
+    });
+  });
+
+  it('rejects an oversized JSON response before parsing it', async () => {
+    const response = new Response(JSON.stringify({ trends: [] }), {
+      headers: { 'content-length': '600000' },
+    });
+    const source = new TwitterApiIoTrendSource({ apiKey: 'key', woeids: [1] }, vi.fn().mockResolvedValue(response) as typeof fetch);
+    await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
+      code: 'TREND_SOURCE_RESPONSE_INVALID', message: 'TwitterAPI.io returned an invalid response',
     });
   });
 });

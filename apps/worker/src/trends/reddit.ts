@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const tokenSchema = z.object({
@@ -26,6 +27,7 @@ export interface RedditTrendSourceConfig {
 export class RedditTrendSource implements TrendSource {
   readonly id = 'reddit-trends';
   readonly label = 'Reddit';
+  readonly minimumRequestBudget = 2;
   private readonly communities: string[];
   private readonly limit: number;
 
@@ -49,6 +51,7 @@ export class RedditTrendSource implements TrendSource {
     const clientId = this.config.clientId?.trim();
     const clientSecret = this.config.clientSecret?.trim();
     if (!clientId || !clientSecret) throw new TrendSourceError('TREND_SOURCE_NOT_CONFIGURED', 'Reddit is not configured', false);
+    window.recordRequest?.();
     const tokenPayload = await this.request('https://www.reddit.com/api/v1/access_token', {
       method: 'POST', body: 'grant_type=client_credentials', signal,
       headers: {
@@ -64,6 +67,7 @@ export class RedditTrendSource implements TrendSource {
       const url = new URL(`https://oauth.reddit.com/r/${community}/hot`);
       url.searchParams.set('limit', String(this.limit));
       url.searchParams.set('raw_json', '1');
+      window.recordRequest?.();
       const payload = await this.request(url.toString(), {
         signal,
         headers: { authorization: `Bearer ${token.data.access_token}`, 'user-agent': 'LetterMate/0.1' },
@@ -110,7 +114,7 @@ export class RedditTrendSource implements TrendSource {
     if (response.status === 401 || response.status === 403) throw new TrendSourceError('TREND_SOURCE_AUTH_FAILED', 'Reddit credentials are unavailable', false);
     if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'Reddit rate limit reached', true);
     if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Reddit is temporarily unavailable', response.status >= 500);
-    try { return await response.json(); } catch { throw this.invalid(); }
+    try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 
   private invalid(): TrendSourceError {

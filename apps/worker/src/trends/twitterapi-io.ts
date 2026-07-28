@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const trendSchema = z.object({
@@ -6,7 +7,7 @@ const trendSchema = z.object({
   query: z.string().optional().nullable(),
   id: z.union([z.string(), z.number()]).optional().nullable(),
 }).passthrough();
-const responseSchema = z.object({ trends: z.array(trendSchema).max(100) }).passthrough();
+const responseSchema = z.object({ trends: z.array(z.unknown()).max(100) }).passthrough();
 
 export interface TwitterApiIoTrendSourceConfig {
   apiKey: string | undefined;
@@ -16,6 +17,7 @@ export interface TwitterApiIoTrendSourceConfig {
 export class TwitterApiIoTrendSource implements TrendSource {
   readonly id = 'twitter-trends';
   readonly label = 'X Trends';
+  readonly minimumRequestBudget = 1;
   private readonly woeids: number[];
 
   constructor(
@@ -42,11 +44,15 @@ export class TwitterApiIoTrendSource implements TrendSource {
       const url = new URL('https://api.twitterapi.io/twitter/trends');
       url.searchParams.set('woeid', String(woeid));
       url.searchParams.set('count', '30');
+      window.recordRequest?.();
       const payload = await this.request(url.toString(), apiKey, signal);
       requestCount += 1;
       const parsed = responseSchema.safeParse(payload);
       if (!parsed.success) throw this.invalid();
-      for (const trend of parsed.data.trends) {
+      for (const rawTrend of parsed.data.trends) {
+        const trendResult = trendSchema.safeParse(rawTrend);
+        if (!trendResult.success) continue;
+        const trend = trendResult.data;
         const title = trend.name.trim();
         if (!title) continue;
         const query = trend.query?.trim() || encodeURIComponent(title);
@@ -81,7 +87,7 @@ export class TwitterApiIoTrendSource implements TrendSource {
     }
     if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'TwitterAPI.io rate limit reached', true);
     if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'TwitterAPI.io is temporarily unavailable', response.status >= 500);
-    try { return await response.json(); } catch { throw this.invalid(); }
+    try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 
   private invalid(): TrendSourceError {

@@ -7,6 +7,22 @@ const makeResponse = (body: string, headers: Record<string, string> = {}) => new
 });
 
 describe('ContentFetcher', () => {
+  it('securely returns bounded raw text for an explicitly allowed XML content type', async () => {
+    const request = vi.fn().mockResolvedValue(new Response('<rss/>', {
+      headers: { 'content-type': 'application/rss+xml; charset=utf-8' },
+    }));
+    const fetcher = new ContentFetcher({ resolveHostname: publicResolver, maxBytes: 100 }, request as typeof fetch);
+
+    await expect(fetcher.fetchRawText('https://example.com/feed.xml', {
+      acceptedContentTypes: ['application/rss+xml'],
+    })).resolves.toEqual({
+      finalUrl: 'https://example.com/feed.xml',
+      contentType: 'application/rss+xml',
+      text: '<rss/>',
+    });
+    expect(request.mock.calls[0]![1]).toMatchObject({ redirect: 'manual' });
+  });
+
   it('extracts substantive HTML text and removes navigation noise', async () => {
     const fetcher = new ContentFetcher({ resolveHostname: publicResolver }, vi.fn().mockResolvedValue(
       makeResponse('<html><head><title>Article</title><script>bad()</script></head><body><nav>Menu</nav><main><h1>Article</h1><p>Substantive body text.</p></main><form>Ads</form></body></html>'),

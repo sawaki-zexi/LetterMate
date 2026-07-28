@@ -12,6 +12,10 @@ describe('BilibiliTrendSource', () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: { list: [{
       bvid: 'BV1xx411c7mD', title: '<em>开源</em> Agent 运行时', pubdate: 1785196800,
       stat: { view: 999 },
+    }, {
+      bvid: 123, title: 'Malformed sibling', pubdate: 1785196800,
+    }, {
+      bvid: 'BV1blank', title: '  ', pubdate: 1785196800,
     }] } }), { status: 200 }));
     const signal = new AbortController().signal;
 
@@ -46,6 +50,16 @@ describe('BilibiliTrendSource', () => {
     const unavailable = new BilibiliTrendSource({}, vi.fn().mockResolvedValue(new Response('body', { status: 503 })) as typeof fetch);
     await expect(unavailable.collect(window, new AbortController().signal)).rejects.toMatchObject({
       code: 'TREND_SOURCE_UNAVAILABLE', message: 'Bilibili is temporarily unavailable',
+    });
+  });
+
+  it('rejects an oversized JSON response before parsing it', async () => {
+    const payload = { code: 0, data: { list: [] } };
+    const source = new BilibiliTrendSource({}, vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(payload), { headers: { 'content-length': '600000' } }),
+    ) as typeof fetch);
+    await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
+      code: 'TREND_SOURCE_RESPONSE_INVALID', message: 'Bilibili returned an invalid response',
     });
   });
 });

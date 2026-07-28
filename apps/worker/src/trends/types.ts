@@ -12,6 +12,7 @@ export interface TrendWindow {
   windowEnd: string;
   maxCandidates: number;
   requestBudget: number;
+  recordRequest?: () => void;
 }
 
 export interface TrendSourceResult {
@@ -22,6 +23,7 @@ export interface TrendSourceResult {
 export interface TrendSource {
   readonly id: string;
   readonly label: string;
+  readonly minimumRequestBudget?: number;
   isEnabled(): boolean;
   collect(window: TrendWindow, signal: AbortSignal): Promise<TrendSourceResult>;
 }
