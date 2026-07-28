@@ -42,9 +42,26 @@ describe('YouTubeTrendSource', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it('accepts standard RFC3339 timestamp forms and canonicalizes them to ISO', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ items: [
+      { id: 'noFraction', snippet: { title: 'No fraction', publishedAt: '2026-07-27T12:00:00Z' } },
+      { id: 'offsetTime', snippet: { title: 'Offset', publishedAt: '2026-07-27T20:00:00+08:00' } },
+      { id: 'fractional', snippet: { title: 'Fraction', publishedAt: '2026-07-27T12:00:00.123Z' } },
+    ] }), { status: 200 }));
+
+    const result = await new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, fetcher as typeof fetch)
+      .collect({ ...window, maxCandidates: 3 }, new AbortController().signal);
+
+    expect(result.candidates.map(({ publishedAt }) => publishedAt)).toEqual([
+      '2026-07-27T12:00:00.000Z',
+      '2026-07-27T12:00:00.000Z',
+      '2026-07-27T12:00:00.123Z',
+    ]);
+  });
+
   it('rejects invalid timestamps and maps API failures safely', async () => {
     const malformed = new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ items: [{ id: 'video123', snippet: { title: 'Title', publishedAt: 'yesterday' } }] }), { status: 200 }),
+      new Response(JSON.stringify({ items: [{ id: 'video123', snippet: { title: 'Title', publishedAt: '2026-02-31T12:00:00Z' } }] }), { status: 200 }),
     ) as typeof fetch);
     await expect(malformed.collect(window, new AbortController().signal)).rejects.toMatchObject({ code: 'TREND_SOURCE_RESPONSE_INVALID' });
     const denied = new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, vi.fn().mockResolvedValue(new Response('secret body', { status: 403 })) as typeof fetch);

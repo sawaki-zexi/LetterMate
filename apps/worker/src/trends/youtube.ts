@@ -1,10 +1,24 @@
 import { z } from 'zod';
 import { TrendSourceError, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
-const timestampSchema = z.string().refine((value) => {
+const rfc3339Timestamp = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+
+const isValidRfc3339 = (value: string): boolean => {
+  const match = rfc3339Timestamp.exec(value);
+  if (!match) return false;
+  const [, year, month, day] = match;
+  const calendarDate = new Date(`${year}-${month}-${day}T00:00:00.000Z`);
   const milliseconds = Date.parse(value);
-  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
-});
+  return Number.isFinite(milliseconds) &&
+    Number.isFinite(calendarDate.getTime()) &&
+    calendarDate.getUTCFullYear() === Number(year) &&
+    calendarDate.getUTCMonth() + 1 === Number(month) &&
+    calendarDate.getUTCDate() === Number(day);
+};
+
+const timestampSchema = z.string()
+  .refine(isValidRfc3339)
+  .transform((value) => new Date(value).toISOString());
 const responseSchema = z.object({
   items: z.array(z.object({
     id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),

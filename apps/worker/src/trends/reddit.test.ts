@@ -7,7 +7,7 @@ const window: TrendWindow = {
   maxCandidates: 10, requestBudget: 3,
 };
 
-const listing = (community: string, id: string) => new Response(JSON.stringify({ data: { children: [{ data: {
+const listing = (community: string, id: string) => new Response(JSON.stringify({ data: { children: [{ kind: 't3', data: {
   id, name: `t3_${id}`, title: `${community} hot post`,
   permalink: `/r/${community}/comments/${id}/hot_post/`, created_utc: 1785196800,
   score: 999,
@@ -59,6 +59,44 @@ describe('RedditTrendSource', () => {
       .collect({ ...window, requestBudget: 1 }, new AbortController().signal);
     expect(result).toEqual({ candidates: [], requestCount: 0 });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('accepts normal t3 listing children while projecting only seed fields', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: 'token', token_type: 'bearer', expires_in: 3600,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        kind: 'Listing',
+        data: {
+          after: null,
+          children: [{
+            kind: 't1',
+            data: { body: 'unsupported comment child' },
+          }, {
+            kind: 't3',
+            data: {
+              id: 'realpost', name: 't3_realpost', title: 'A realistic Reddit listing post',
+              permalink: '/r/programming/comments/realpost/a_realistic_post/',
+              created_utc: 1785196800, author: 'upstream-author', score: 999,
+              selftext: 'untrusted upstream payload', subreddit: 'programming', over_18: false,
+            },
+          }],
+        },
+      }), { status: 200 }));
+
+    const result = await new RedditTrendSource({
+      clientId: 'id', clientSecret: 'secret', communities: ['programming'],
+    }, fetcher as typeof fetch).collect(window, new AbortController().signal);
+
+    expect(result).toEqual({ requestCount: 2, candidates: [{
+      sourceId: 'reddit-trends', platform: 'Reddit', externalId: 't3_realpost',
+      title: 'A realistic Reddit listing post',
+      url: 'https://www.reddit.com/r/programming/comments/realpost/a_realistic_post/',
+      publishedAt: '2026-07-28T00:00:00.000Z',
+    }] });
+    expect(JSON.stringify(result)).not.toContain('upstream-author');
+    expect(JSON.stringify(result)).not.toContain('selftext');
   });
 
   it('rejects a permalink outside the configured community', async () => {

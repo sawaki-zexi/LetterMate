@@ -3,14 +3,18 @@ import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type Trend
 
 const tokenSchema = z.object({
   access_token: z.string().min(1), token_type: z.string().min(1), expires_in: z.number().finite().positive(),
-}).passthrough();
+});
+const listingChildSchema = z.object({
+  kind: z.string().min(1),
+  data: z.unknown(),
+});
 const listingSchema = z.object({
-  data: z.object({ children: z.array(z.object({ data: z.unknown() }).strict()).max(100) }).passthrough(),
-}).passthrough();
+  data: z.object({ children: z.array(listingChildSchema).max(100) }),
+});
 const postSchema = z.object({
   id: z.string().min(1), name: z.string().min(1), title: z.string(), permalink: z.string().startsWith('/'),
   created_utc: z.number().finite().nonnegative(),
-}).passthrough();
+});
 
 export interface RedditTrendSourceConfig {
   clientId: string | undefined;
@@ -68,6 +72,7 @@ export class RedditTrendSource implements TrendSource {
       const listing = listingSchema.safeParse(payload);
       if (!listing.success) throw this.invalid();
       for (const child of listing.data.data.children) {
+        if (child.kind !== 't3') continue;
         const parsed = postSchema.safeParse(child.data);
         if (!parsed.success) continue;
         const post = parsed.data;
