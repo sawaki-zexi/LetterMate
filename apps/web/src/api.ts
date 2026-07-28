@@ -1,12 +1,15 @@
 import {
   apiErrorSchema,
-  discoveryItemSchema,
   discoveryKindSchema,
   discoverySourceStatusSchema,
+  feedItemSchema,
+  feedOriginSchema,
   feedRangeSchema,
   topicInputSchema,
   topicSchema,
+  trendStatusSchema,
   type DiscoveryKind,
+  type FeedOrigin,
   type FeedRange,
   type TopicInput,
 } from '@lettermate/contracts';
@@ -60,18 +63,26 @@ export const api = {
     body: JSON.stringify(topicInputSchema.parse(input)),
   }),
   refreshTopic: (id: string) => apiRequest(`/topics/${encodeURIComponent(id)}/refresh`, topicSchema, { method: 'POST' }),
-  feed: (filter: { topicId?: string; kind?: DiscoveryKind; range?: FeedRange } = {}) => {
+  feed: (filter: {
+    topicId?: string;
+    kind?: DiscoveryKind;
+    range?: FeedRange;
+    origin?: FeedOrigin;
+  } = {}) => {
     const query = new URLSearchParams(compact({
       topicId: filter.topicId,
       kind: filter.kind && discoveryKindSchema.parse(filter.kind),
-      range: feedRangeSchema.parse(filter.range ?? 'recent'),
+      range: feedRangeSchema.parse(filter.range ?? '30d'),
+      origin: filter.origin && feedOriginSchema.parse(filter.origin),
     }));
     const suffix = query.size ? `?${query.toString()}` : '';
-    return apiRequest(`/feed${suffix}`, z.array(discoveryItemSchema));
+    return apiRequest(`/feed${suffix}`, z.array(feedItemSchema));
   },
+  trendStatus: () => apiRequest('/trends/status', trendStatusSchema),
+  refreshTrends: () => apiRequest('/trends/refresh', trendStatusSchema, { method: 'POST' }),
   discoverySources: () => apiRequest(
     '/discovery-sources',
     z.array(discoverySourceStatusSchema),
   ),
-  item: (id: string) => apiRequest(`/items/${encodeURIComponent(id)}`, discoveryItemSchema),
+  item: (id: string) => apiRequest(`/items/${encodeURIComponent(id)}`, feedItemSchema),
 };

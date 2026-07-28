@@ -1,0 +1,321 @@
+// @vitest-environment jsdom
+import type { RunSummary, Topic, TrendStatus } from '@lettermate/contracts';
+import { act, cleanup, renderHook } from '@testing-library/react';
+import { StrictMode, type ReactNode } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  useRefreshCoordinator,
+  type RefreshCoordinatorOptions,
+} from './use-refresh-coordinator.js';
+
+const requestTime = new Date('2026-07-28T12:00:00.000Z');
+
+function run(
+  id: string,
+  status: 'queued' | 'running' | 'succeeded' | 'failed',
+  startedAt = requestTime.toISOString(),
+  newItemCount = 0,
+): RunSummary {
+  if (status === 'succeeded') {
+    return {
+      id,
+      trigger: 'manual',
+      status,
+      startedAt,
+      finishedAt: '2026-07-28T12:01:00.000Z',
+      newItemCount,
+    };
+  }
+  if (status === 'failed') {
+    return {
+      id,
+      trigger: 'manual',
+      status,
+      startedAt,
+      finishedAt: '2026-07-28T12:01:00.000Z',
+      newItemCount: null,
+    };
+  }
+  return {
+    id,
+    trigger: 'manual',
+    status,
+    startedAt,
+    finishedAt: null,
+    newItemCount: null,
+  };
+}
+
+function topic(id: string, lastRun: RunSummary | null = null): Topic {
+  return {
+    id,
+    userId: 'user-a',
+    keyword: id,
+    expandedTerms: [],
+    createdAt: '2026-07-01T00:00:00.000Z',
+    lastRunAt: lastRun?.startedAt ?? null,
+    nextRunAt: null,
+    scheduleIntervalHours: 12,
+    runStatus: lastRun?.status ?? 'succeeded',
+    lastError: null,
+    lastRun,
+  };
+}
+
+function trend(lastRun: RunSummary | null = null): TrendStatus {
+  return {
+    runStatus: lastRun?.status ?? 'succeeded',
+    nextRunAt: null,
+    intervalHours: 4,
+    lastError: null,
+    lastRun,
+  };
+}
+
+function setup(overrides: Partial<RefreshCoordinatorOptions> = {}, strict = false) {
+  let topicSnapshot = overrides.topics ?? [topic('topic-1'), topic('topic-2')];
+  let trendSnapshot = overrides.trendStatus ?? trend();
+  const options: RefreshCoordinatorOptions = {
+    topics: topicSnapshot,
+    trendStatus: trendSnapshot,
+    origin: 'all',
+    refreshTopic: vi.fn(async () => undefined),
+    refreshTrends: vi.fn(async () => undefined),
+    refetchTopics: vi.fn(async () => topicSnapshot),
+    refetchTrendStatus: vi.fn(async () => trendSnapshot),
+    invalidateFeed: vi.fn(async () => undefined),
+    now: () => requestTime,
+    pollIntervalMs: 1_500,
+    maxConsecutivePollFailures: 2,
+    confirmationTimeoutMs: 60_000,
+    ...overrides,
+  };
+  const wrapper = strict
+    ? ({ children }: { children: ReactNode }) => <StrictMode>{children}</StrictMode>
+    : undefined;
+  const rendered = renderHook(() => useRefreshCoordinator(options), { wrapper });
+  return {
+    ...rendered,
+    options,
+    setSnapshots(topics: Topic[], status: TrendStatus) {
+      topicSnapshot = topics;
+      trendSnapshot = status;
+    },
+  };
+}
+
+function begin(result: ReturnType<typeof setup>['result']) {
+  let completion!: ReturnType<typeof result.current.startRefresh>;
+  act(() => {
+    completion = result.current.startRefresh();
+  });
+  return completion;
+}
+
+describe('useRefreshCoordinator', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  it('targets only a selected topic and exposes independent pending IDs', async () => {
+    const harness = setup({ selectedTopicId: 'topic-2' });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    expect(harness.options.refreshTopic).toHaveBeenCalledTimes(1);
+    expect(harness.options.refreshTopic).toHaveBeenCalledWith('topic-2');
+    expect(harness.options.refreshTrends).not.toHaveBeenCalled();
+    expect(harness.result.current).toMatchObject({
+      active: true,
+      targetCount: 1,
+      pendingCount: 1,
+      pendingTopicIds: ['topic-2'],
+      trendPending: false,
+    });
+
+    harness.setSnapshots(
+      [topic('topic-1'), topic('topic-2', run('topic-run', 'succeeded', undefined, 2))],
+      trend(),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    await expect(completion).resolves.toMatchObject({ message: '刷新完成，新增 2 条内容' });
+  });
+
+  it.each([
+    ['all', ['topic-1', 'topic-2'], true],
+    ['topic', ['topic-1', 'topic-2'], false],
+    ['trend', [], true],
+  ] as const)('targets the %s origin scope', async (origin, topicIds, includesTrend) => {
+    const harness = setup({ origin });
+    void begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    expect(harness.options.refreshTopic).toHaveBeenCalledTimes(topicIds.length);
+    for (const topicId of topicIds) {
+      expect(harness.options.refreshTopic).toHaveBeenCalledWith(topicId);
+    }
+    expect(harness.options.refreshTrends).toHaveBeenCalledTimes(includesTrend ? 1 : 0);
+    expect(harness.result.current.targetCount).toBe(topicIds.length + Number(includesTrend));
+  });
+
+  it('ignores stale, non-manual, and pre-request runs before accepting a later manual run', async () => {
+    const baseline = run('baseline', 'succeeded', '2026-07-28T11:59:00.000Z', 99);
+    const harness = setup({
+      topics: [topic('topic-1', baseline)],
+      selectedTopicId: 'topic-1',
+    });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    harness.setSnapshots([topic('topic-1', baseline)], trend());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    expect(harness.result.current.active).toBe(true);
+    expect(harness.options.invalidateFeed).not.toHaveBeenCalled();
+
+    harness.setSnapshots([topic('topic-1', {
+      ...run('scheduled', 'succeeded', requestTime.toISOString(), 7),
+      trigger: 'scheduled',
+    })], trend());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    expect(harness.result.current.active).toBe(true);
+
+    harness.setSnapshots([
+      topic('topic-1', run('too-early', 'succeeded', '2026-07-28T11:59:59.999Z', 8)),
+    ], trend());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    expect(harness.result.current.active).toBe(true);
+
+    harness.setSnapshots([topic('topic-1', run('accepted', 'succeeded', undefined, 3))], trend());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    await expect(completion).resolves.toMatchObject({ message: '刷新完成，新增 3 条内容' });
+    expect(harness.options.invalidateFeed).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [run('topic-run', 'succeeded', undefined, 0), run('trend-run', 'succeeded', undefined, 0), '刷新完成，暂无新增内容', 'success'],
+    [run('topic-run', 'succeeded', undefined, 4), run('trend-run', 'failed'), '部分更新失败，已新增 4 条内容', 'warning'],
+    [run('topic-run', 'failed'), run('trend-run', 'failed'), '刷新失败，已保留现有内容', 'error'],
+  ] as const)('reports authoritative completion outcomes', async (
+    topicRun,
+    trendRun,
+    message,
+    kind,
+  ) => {
+    const harness = setup({ topics: [topic('topic-1')] });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+    harness.setSnapshots([topic('topic-1', topicRun)], trend(trendRun));
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    await expect(completion).resolves.toEqual(expect.objectContaining({
+      message,
+      kind,
+      ariaLive: 'polite',
+    }));
+    expect(harness.result.current.notification).toEqual(expect.objectContaining({ message }));
+    expect(harness.result.current.active).toBe(false);
+    expect(harness.options.invalidateFeed).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not launch duplicate actions while active', async () => {
+    const harness = setup({ selectedTopicId: 'topic-1' });
+    const first = begin(harness.result);
+    await act(async () => Promise.resolve());
+    const second = harness.result.current.startRefresh();
+
+    expect(second).toBe(first);
+    expect(harness.options.refreshTopic).toHaveBeenCalledTimes(1);
+
+    harness.setSnapshots([topic('topic-1', run('done', 'succeeded'))], trend());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    await first;
+  });
+
+  it('counts trigger failures as terminal targets instead of polling forever', async () => {
+    const refreshTopic = vi.fn(async () => { throw new Error('offline'); });
+    const harness = setup({
+      topics: [topic('topic-1')],
+      origin: 'all',
+      refreshTopic,
+    });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+    harness.setSnapshots([topic('topic-1')], trend(run('trend-run', 'succeeded', undefined, 2)));
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    await expect(completion).resolves.toMatchObject({
+      message: '部分更新失败，已新增 2 条内容',
+    });
+    expect(harness.result.current.active).toBe(false);
+  });
+
+  it('stops safely when polling cannot confirm status', async () => {
+    const harness = setup({
+      selectedTopicId: 'topic-1',
+      refetchTopics: vi.fn(async () => { throw new Error('offline'); }),
+      refetchTrendStatus: vi.fn(async () => { throw new Error('offline'); }),
+    });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+
+    await expect(completion).resolves.toEqual(expect.objectContaining({
+      kind: 'warning',
+      message: '刷新状态无法确认，已保留现有内容',
+      ariaLive: 'polite',
+    }));
+    expect(harness.result.current.active).toBe(false);
+    expect(harness.options.invalidateFeed).not.toHaveBeenCalled();
+  });
+
+  it('remains mounted after Strict Mode effect replay', async () => {
+    const harness = setup({ selectedTopicId: 'topic-1' }, true);
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    expect(harness.result.current.active).toBe(true);
+    harness.setSnapshots([topic('topic-1', run('done', 'succeeded'))], trend());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+    await completion;
+  });
+
+  it('uses the confirmation deadline when a polling request never settles', async () => {
+    const never = new Promise<never>(() => undefined);
+    const harness = setup({
+      selectedTopicId: 'topic-1',
+      refetchTopics: vi.fn(() => never),
+      confirmationTimeoutMs: 3_000,
+    });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    await act(async () => vi.advanceTimersByTimeAsync(4_500));
+
+    expect(harness.result.current.active).toBe(false);
+    await expect(completion).resolves.toMatchObject({
+      message: '刷新状态无法确认，已保留现有内容',
+    });
+  });
+
+  it('polls while a trigger request is still pending', async () => {
+    const never = new Promise<never>(() => undefined);
+    const refetchTopics = vi.fn(async () => [topic('topic-1')]);
+    const refetchTrendStatus = vi.fn(async () => trend());
+    const harness = setup({
+      selectedTopicId: 'topic-1',
+      refreshTopic: vi.fn(() => never),
+      refetchTopics,
+      refetchTrendStatus,
+    });
+    void begin(harness.result);
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    expect(refetchTopics).toHaveBeenCalledTimes(1);
+    expect(refetchTrendStatus).toHaveBeenCalledTimes(1);
+  });
+});
