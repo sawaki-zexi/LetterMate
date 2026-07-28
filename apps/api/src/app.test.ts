@@ -1,4 +1,8 @@
-import type { DiscoveryJobData, DiscoverySourceStatus } from '@lettermate/contracts';
+import type {
+  DiscoveryJobData,
+  DiscoverySourceStatus,
+  TrendJobData,
+} from '@lettermate/contracts';
 import type { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -6,6 +10,7 @@ import { configuredDiscoverySources, createApiApp } from './app.js';
 import { parseConfig } from '@lettermate/config';
 import { MemoryTopicStore } from './topic-store.js';
 import type { TopicQueue } from './topic-queue.js';
+import type { TrendQueue } from './trend-queue.js';
 
 class RecordingQueue implements TopicQueue {
   jobs: DiscoveryJobData[] = [];
@@ -17,10 +22,21 @@ class RecordingQueue implements TopicQueue {
   async close() {}
 }
 
+class RecordingTrendQueue implements TrendQueue {
+  jobs: TrendJobData[] = [];
+
+  async enqueue(data: TrendJobData) {
+    this.jobs.push(data);
+  }
+
+  async close() {}
+}
+
 describe('AI discovery API', () => {
   let app: INestApplication;
   let store: MemoryTopicStore;
   let queue: RecordingQueue;
+  let trendQueue: RecordingTrendQueue;
   const discoverySources: DiscoverySourceStatus[] = [
     { id: 'openrouter-search', label: 'OpenRouter Web Search', category: 'web', status: 'enabled' },
     { id: 'twitterapi-io', label: 'X', category: 'social', status: 'not_configured' },
@@ -29,9 +45,11 @@ describe('AI discovery API', () => {
   beforeEach(async () => {
     store = new MemoryTopicStore();
     queue = new RecordingQueue();
+    trendQueue = new RecordingTrendQueue();
     app = await createApiApp({
       store,
       queue,
+      trendQueue,
       aiConfigured: true,
       discoverySources,
       now: () => new Date('2026-07-27T12:00:00.000Z'),
@@ -54,6 +72,7 @@ describe('AI discovery API', () => {
       keyword: 'AI Agent',
       runStatus: 'queued',
       expandedTerms: [],
+      lastRun: { trigger: 'initial', status: 'queued', newItemCount: null },
     });
     expect(queue.jobs).toEqual([{
       topicId: response.body.id,
@@ -85,6 +104,7 @@ describe('AI discovery API', () => {
     const noKeyApp = await createApiApp({
       store: localStore,
       queue: localQueue,
+      trendQueue: new RecordingTrendQueue(),
       aiConfigured: false,
     });
 
@@ -120,7 +140,10 @@ describe('AI discovery API', () => {
     await request(app.getHttpServer())
       .post(`/api/v1/topics/${own.id}/refresh`)
       .set('x-user-id', 'user-a')
-      .expect(202);
+      .expect(202)
+      .expect(({ body }) => expect(body.lastRun).toMatchObject({
+        trigger: 'manual', status: 'queued', newItemCount: null,
+      }));
     expect(queue.jobs).toContainEqual({
       topicId: own.id,
       userId: 'user-a',
@@ -142,6 +165,23 @@ describe('AI discovery API', () => {
       .expect(404);
   });
 
+  it('supports user-owned Radar detail through the unified item endpoint', async () => {
+    const own = store.seedRadarItem('user-a', 'quality');
+    const other = store.seedRadarItem('user-b', 'hot');
+
+    await request(app.getHttpServer())
+      .get(`/api/v1/items/${own.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({
+        id: own.id, origin: 'trend', topicId: null,
+      }));
+    await request(app.getHttpServer())
+      .get(`/api/v1/items/${other.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(404);
+  });
+
   it('filters the feed by hot or quality', async () => {
     store.seedDiscovery('user-a', 'hot');
     store.seedDiscovery('user-a', 'quality');
@@ -155,11 +195,15 @@ describe('AI discovery API', () => {
     expect(response.body[0].kind).toBe('hot');
   });
 
-  it('defaults the feed to 90 days and supports all retained history', async () => {
+  it('defaults the feed to 30 days and supports all retained history', async () => {
     const topic = store.seedTopic('user-a', 'History');
     store.seedItem(topic.id, 'quality', {
       publishedAt: '2020-01-01T00:00:00.000Z',
       discoveredAt: '2020-01-02T00:00:00.000Z',
+    });
+    store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-06-01T00:00:00.000Z',
+      discoveredAt: '2026-06-01T01:00:00.000Z',
     });
     store.seedItem(topic.id, 'hot', {
       publishedAt: '2026-07-26T00:00:00.000Z',
@@ -177,7 +221,73 @@ describe('AI discovery API', () => {
 
     expect(recent.body).toHaveLength(1);
     expect(recent.body[0].kind).toBe('hot');
-    expect(all.body).toHaveLength(2);
+    expect(all.body).toHaveLength(3);
+  });
+
+  it('applies a 72-hour Feed window from the injected clock', async () => {
+    const topic = store.seedTopic('user-a', 'Window');
+    store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-07-24T11:59:59.999Z',
+    });
+    const boundary = store.seedItem(topic.id, 'hot', {
+      publishedAt: '2026-07-24T12:00:00.000Z',
+    });
+
+    const response = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=3d')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+
+    expect(response.body.map((item: { id: string }) => item.id)).toEqual([boundary.id]);
+  });
+
+  it('filters the unified Feed by Topic or trend origin', async () => {
+    const topic = store.seedTopic('user-a', 'Origins');
+    const topicItem = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-07-27T10:00:00.000Z',
+    });
+    const radarItem = store.seedRadarItem('user-a', 'hot', {
+      publishedAt: '2026-07-27T11:00:00.000Z',
+    });
+
+    const trend = await request(app.getHttpServer())
+      .get('/api/v1/feed?origin=trend')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    const topicOnly = await request(app.getHttpServer())
+      .get('/api/v1/feed?origin=topic')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+
+    expect(trend.body.map((item: { id: string }) => item.id)).toEqual([radarItem.id]);
+    expect(topicOnly.body.map((item: { id: string }) => item.id)).toEqual([topicItem.id]);
+  });
+
+  it('returns safe trend status and registers only one repeated manual refresh', async () => {
+    const initial = await request(app.getHttpServer())
+      .get('/api/v1/trends/status')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(initial.body).toEqual({
+      runStatus: 'queued', nextRunAt: '2026-07-27T12:00:00.000Z',
+      intervalHours: 4, lastError: null, lastRun: null,
+    });
+
+    const first = await request(app.getHttpServer())
+      .post('/api/v1/trends/refresh')
+      .set('x-user-id', 'user-a')
+      .expect(202);
+    const second = await request(app.getHttpServer())
+      .post('/api/v1/trends/refresh')
+      .set('x-user-id', 'user-a')
+      .expect(202);
+
+    expect(first.body).toMatchObject({
+      runStatus: 'queued', lastRun: { trigger: 'manual', status: 'queued' },
+    });
+    expect(second.body.lastRun.id).toBe(first.body.lastRun.id);
+    expect(trendQueue.jobs).toEqual([{ userId: 'user-a', trigger: 'manual' }]);
+    expect(JSON.stringify(first.body)).not.toMatch(/secret|token|connector|candidate/i);
   });
 
   it('returns safe source configuration states without credentials', async () => {
@@ -210,6 +320,20 @@ describe('AI discovery API', () => {
       .get('/api/v1/feed?range=forever')
       .set('x-user-id', 'user-a')
       .expect(400);
+  });
+
+  it('rejects invalid Feed origins and trend origin combined with topicId', async () => {
+    const topic = store.seedTopic('user-a', 'Invalid combination');
+    for (const path of [
+      '/api/v1/feed?origin=unknown',
+      `/api/v1/feed?origin=trend&topicId=${topic.id}`,
+    ]) {
+      await request(app.getHttpServer())
+        .get(path)
+        .set('x-user-id', 'user-a')
+        .expect(400)
+        .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+    }
   });
 
   it('returns a trace id for invalid keyword input', async () => {

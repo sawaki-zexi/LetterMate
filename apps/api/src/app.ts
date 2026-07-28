@@ -2,6 +2,7 @@ import { parseConfig } from '@lettermate/config';
 import {
   discoveryKindSchema,
   discoverySourceStatusSchema,
+  feedOriginSchema,
   feedRangeSchema,
   topicInputSchema,
   type DiscoverySourceStatus,
@@ -40,12 +41,18 @@ import {
   createBullTopicQueue,
   type TopicQueue,
 } from './topic-queue.js';
+import {
+  createBullTrendQueue,
+  type TrendQueue,
+} from './trend-queue.js';
 
 const STORE = Symbol('TopicStore');
 const QUEUE = Symbol('TopicQueue');
+const TREND_QUEUE = Symbol('TrendQueue');
 const AI_CONFIGURED = Symbol('AiConfigured');
 const DISCOVERY_SOURCES = Symbol('DiscoverySources');
 const NOW = Symbol('Now');
+const TREND_INTERVAL_HOURS = Symbol('TrendIntervalHours');
 
 function errorBody(code: string, message: string) {
   return { code, message, traceId: randomUUID() };
@@ -72,17 +79,35 @@ function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, message: string):
 const feedFilterSchema = z.object({
   topicId: z.string().min(1).optional(),
   kind: discoveryKindSchema.optional(),
-  range: feedRangeSchema.default('recent'),
+  range: feedRangeSchema.default('30d'),
+  origin: feedOriginSchema.default('all'),
+}).strict().superRefine((filter, context) => {
+  if (filter.topicId && filter.origin === 'trend') {
+    context.addIssue({
+      code: 'custom', path: ['origin'],
+      message: 'topicId cannot be combined with trend origin',
+    });
+  }
 });
+
+const feedRangeMilliseconds = {
+  '1d': 24 * 60 * 60 * 1_000,
+  '3d': 3 * 24 * 60 * 60 * 1_000,
+  '7d': 7 * 24 * 60 * 60 * 1_000,
+  '30d': 30 * 24 * 60 * 60 * 1_000,
+  '90d': 90 * 24 * 60 * 60 * 1_000,
+} as const;
 
 @Controller('api/v1')
 class ApiController {
   constructor(
     @Inject(STORE) private readonly store: TopicStore,
     @Inject(QUEUE) private readonly queue: TopicQueue,
+    @Inject(TREND_QUEUE) private readonly trendQueue: TrendQueue,
     @Inject(AI_CONFIGURED) private readonly aiConfigured: boolean,
     @Inject(DISCOVERY_SOURCES) private readonly discoverySources: DiscoverySourceStatus[],
     @Inject(NOW) private readonly now: () => Date,
+    @Inject(TREND_INTERVAL_HOURS) private readonly trendIntervalHours: number,
   ) {}
 
   @Get('health')
@@ -155,13 +180,37 @@ class ApiController {
     if (filter.topicId && !(await this.store.findTopic(userId, filter.topicId))) {
       throw new NotFoundException(errorBody('NOT_FOUND', '主题不存在'));
     }
+    const now = this.now();
+    const since = filter.range === 'all'
+      ? null
+      : new Date(now.getTime() - feedRangeMilliseconds[filter.range]);
     return this.store.listFeed(userId, {
+      origin: filter.origin,
+      since,
       ...(filter.topicId ? { topicId: filter.topicId } : {}),
       ...(filter.kind ? { kind: filter.kind } : {}),
-      ...(filter.range === 'recent'
-        ? { since: new Date(this.now().getTime() - 90 * 24 * 60 * 60 * 1_000) }
-        : {}),
     });
+  }
+
+  @Get('trends/status')
+  getTrendStatus(@Headers('x-user-id') header?: string) {
+    return this.store.getTrendStatus(
+      authenticatedUser(header), this.trendIntervalHours, this.now(),
+    );
+  }
+
+  @Post('trends/refresh')
+  @HttpCode(202)
+  async refreshTrends(@Headers('x-user-id') header?: string) {
+    this.assertAiConfigured();
+    const userId = authenticatedUser(header);
+    const refresh = await this.store.queueTrendRefresh(
+      userId, this.trendIntervalHours, this.now(),
+    );
+    if (refresh.shouldEnqueue) {
+      await this.trendQueue.enqueue({ userId, trigger: 'manual' });
+    }
+    return refresh.status;
   }
 
   @Get('discovery-sources')
@@ -196,10 +245,12 @@ class ResourceCloser implements OnModuleDestroy {
   constructor(
     @Inject(STORE) private readonly store: TopicStore,
     @Inject(QUEUE) private readonly queue: TopicQueue,
+    @Inject(TREND_QUEUE) private readonly trendQueue: TrendQueue,
   ) {}
 
   async onModuleDestroy() {
     await this.queue.close();
+    await this.trendQueue.close();
     await this.store.close();
   }
 }
@@ -211,9 +262,11 @@ class AppModule implements NestModule {
   static register(
     store: TopicStore,
     queue: TopicQueue,
+    trendQueue: TrendQueue,
     aiConfigured: boolean,
     discoverySources: DiscoverySourceStatus[],
     now: () => Date,
+    trendIntervalHours: number,
   ): DynamicModule {
     return {
       module: AppModule,
@@ -221,9 +274,11 @@ class AppModule implements NestModule {
       providers: [
         { provide: STORE, useValue: store },
         { provide: QUEUE, useValue: queue },
+        { provide: TREND_QUEUE, useValue: trendQueue },
         { provide: AI_CONFIGURED, useValue: aiConfigured },
         { provide: DISCOVERY_SOURCES, useValue: discoverySources },
         { provide: NOW, useValue: now },
+        { provide: TREND_INTERVAL_HOURS, useValue: trendIntervalHours },
         ResourceCloser,
       ],
     };
@@ -233,9 +288,11 @@ class AppModule implements NestModule {
 export interface CreateApiAppOptions {
   store?: TopicStore;
   queue?: TopicQueue;
+  trendQueue?: TrendQueue;
   aiConfigured?: boolean;
   discoverySources?: DiscoverySourceStatus[];
   now?: () => Date;
+  trendIntervalHours?: number;
   webOrigin?: string;
 }
 
@@ -285,6 +342,27 @@ export function configuredDiscoverySources(
     },
     { id: 'bluesky', label: 'Bluesky', category: 'social', status: 'enabled' },
     { id: 'bilibili', label: 'Bilibili', category: 'video', status: 'enabled' },
+    {
+      id: 'x-trends', label: 'X Trends', category: 'social',
+      status: status(Boolean(config.TWITTERAPI_IO_API_KEY)),
+    },
+    {
+      id: 'hacker-news-trends', label: 'Hacker News Top Stories',
+      category: 'community', status: 'enabled',
+    },
+    {
+      id: 'youtube-trends', label: 'YouTube Most Popular', category: 'video',
+      status: status(Boolean(config.YOUTUBE_API_KEY)),
+    },
+    {
+      id: 'reddit-trends', label: 'Reddit Hot', category: 'community',
+      status: status(Boolean(config.REDDIT_CLIENT_ID && config.REDDIT_CLIENT_SECRET)),
+    },
+    { id: 'bilibili-trends', label: 'Bilibili Popular', category: 'video', status: 'enabled' },
+    {
+      id: 'google-trends', label: 'Google Trends RSS', category: 'feed',
+      status: status(config.TREND_GOOGLE_RSS_URLS.length > 0),
+    },
   ]);
 }
 
@@ -294,6 +372,7 @@ export async function createApiApp(
   const config = parseConfig(process.env);
   const store = options.store ?? new PrismaTopicStore(new PrismaClient());
   const queue = options.queue ?? createBullTopicQueue(config.REDIS_URL);
+  const trendQueue = options.trendQueue ?? createBullTrendQueue(config.REDIS_URL);
   const aiConfigured = options.aiConfigured ?? Boolean(config.AI_API_KEY);
   const discoverySources = discoverySourceStatusSchema.array().parse(
     options.discoverySources ?? configuredDiscoverySources(config),
@@ -302,9 +381,11 @@ export async function createApiApp(
     AppModule.register(
       store,
       queue,
+      trendQueue,
       aiConfigured,
       discoverySources,
       options.now ?? (() => new Date()),
+      options.trendIntervalHours ?? config.TREND_INTERVAL_HOURS,
     ),
     { logger: false },
   );
