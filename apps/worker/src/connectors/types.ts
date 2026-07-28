@@ -1,8 +1,10 @@
 import type { SourceType } from '@lettermate/contracts';
 import type { SourceCandidate, ValidatedSourceCandidate } from '@lettermate/domain';
+import type { KeywordPolicy } from '../keyword-policy.js';
 
 export interface SourceQueryPlan {
   keyword: string;
+  matchPolicy?: KeywordPolicy;
   expandedTerms: string[];
   queries: string[];
   sourceTypes: SourceType[];

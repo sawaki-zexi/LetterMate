@@ -28,6 +28,7 @@ describe('OpenRouterAiGateway', () => {
   it('assesses only supplied candidates without web search', async () => {
     const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ decisions: [{
       id: 'https://example.com/article', accepted: true, kind: 'quality', reason: 'substantive',
+      claimSupport: 'supported',
     }] })));
     const result = await makeGateway(fetcher).evaluateCandidates({
       keyword: 'AI agents', candidates: [{
@@ -37,10 +38,34 @@ describe('OpenRouterAiGateway', () => {
       }],
     });
 
-    expect(result).toEqual([{ id: 'https://example.com/article', accepted: true, kind: 'quality', reason: 'substantive' }]);
+    expect(result).toEqual([{
+      id: 'https://example.com/article', accepted: true, kind: 'quality', reason: 'substantive',
+      claimSupport: 'supported',
+    }]);
     const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
     expect(body.plugins).toBeUndefined();
     expect(body.response_format.json_schema.name).toBe('candidate_assessment');
+    expect(body.response_format.json_schema.schema.properties.decisions.items.required)
+      .toContain('claimSupport');
+    expect(body.messages[0].content).toContain('supplied candidate');
+    expect(body.messages[0].content).toContain('external URLs or facts');
+    expect(body.messages[0].content).toContain('unsupported');
+    expect(body.messages[0].content).toContain('conflicting');
+  });
+
+  it('rejects assessments that omit internal claim support', async () => {
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ decisions: [{
+      id: 'https://example.com/article', accepted: true, kind: 'quality', reason: 'substantive',
+    }] })));
+
+    await expect(makeGateway(fetcher).evaluateCandidates({
+      keyword: 'AI agents', candidates: [{
+        id: 'https://example.com/article', url: 'https://example.com/article', sourceType: 'web',
+        platform: 'Example', title: 'Article', text: 'Detailed article body.', authorName: null,
+        authorHandle: null, publishedAt: null,
+      }],
+    })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it('composes source-aware Chinese items from accepted candidates', async () => {
@@ -59,7 +84,10 @@ describe('OpenRouterAiGateway', () => {
 
     await expect(makeGateway(fetcher).composeItems({
       keyword: 'agent runtime', candidates: [{
-        candidate: source, assessment: { id: source.canonicalUrl, accepted: true, kind: 'quality', reason: 'new' },
+        candidate: source, assessment: {
+          id: source.canonicalUrl, accepted: true, kind: 'quality', reason: 'new',
+          claimSupport: 'supported',
+        },
       }],
     })).resolves.toEqual([item]);
     const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { filterQueriesForPolicy } from './keyword-policy.js';
 import { SourceRouter } from './source-router.js';
 
 const route = (keyword: string, terms: string[] = [], searchQueries: string[] = []) => (
@@ -11,6 +12,34 @@ const route = (keyword: string, terms: string[] = [], searchQueries: string[] = 
 );
 
 describe('SourceRouter', () => {
+  it('keeps versioned topic queries precise and carries the match policy', () => {
+    const plan = route('gpt-5.7', ['GPT', 'latest model'], [
+      'gpt-5.7 release notes',
+      'latest GPT model',
+    ]);
+
+    expect(plan.matchPolicy).toEqual({
+      exactPhrase: 'gpt-5.7',
+      aliases: ['gpt-5.7', 'gpt 5.7', 'gpt5.7'],
+    });
+    expect(plan.queries).toContain('gpt-5.7 release notes');
+    expect(plan.queries).not.toContain('latest GPT model');
+    expect(filterQueriesForPolicy(plan.queries, plan.matchPolicy!)).toEqual(plan.queries);
+    expect(plan.queries.some((query) => query.includes('gpt-5.7'))).toBe(true);
+    expect(plan.queries.length).toBeLessThanOrEqual(6);
+  });
+
+  it('adds deterministic release, announcement, changelog, and official intents', () => {
+    const plan = route('gpt-5.7', [], []);
+
+    expect(plan.queries).toEqual(expect.arrayContaining([
+      '"gpt-5.7" release',
+      '"gpt-5.7" announcement',
+      '"gpt-5.7" changelog',
+      '"gpt-5.7" official',
+    ]));
+  });
+
   it('prioritizes code, paper, and technical community connectors for technical topics', () => {
     const plan = route('AI agent runtime architecture', ['agent runtime'], ['agent runtime release']);
 
@@ -63,15 +92,17 @@ describe('SourceRouter', () => {
   });
 
   it('deduplicates English query variants without consuming extra query budget', () => {
-    const plan = route('AI Agents', [], ['AI Agent Release', 'ai agent release']);
+    const plan = route('AI Agents', [], ['AI Agents Release', 'ai agents release']);
 
-    expect(plan.queries).toEqual(['AI Agent Release']);
+    expect(plan.queries[0]).toBe('AI Agents Release');
+    expect(plan.queries).not.toContain('ai agents release');
+    expect(plan.queries).toHaveLength(6);
   });
 
   it('deduplicates and bounds bilingual query terms before connector execution', () => {
     const plan = route('AI Agents', ['AI Agents', '智能体', '智能体'], [
-      'AI agent release',
-      'AI agent release',
+      'AI Agents release',
+      'AI Agents release',
       '智能体 发布',
       'agent architecture',
       'agent benchmark',
@@ -80,13 +111,8 @@ describe('SourceRouter', () => {
     ]);
 
     expect(plan.expandedTerms).toEqual(['AI Agents', '智能体']);
-    expect(plan.queries).toEqual([
-      'AI agent release',
-      '智能体 发布',
-      'agent architecture',
-      'agent benchmark',
-      'agent security',
-      'agent deployment',
-    ]);
+    expect(plan.queries[0]).toBe('AI Agents release');
+    expect(plan.queries).toHaveLength(6);
+    expect(filterQueriesForPolicy(plan.queries, plan.matchPolicy!)).toEqual(plan.queries);
   });
 });

@@ -1,6 +1,7 @@
 import type { SourceType } from '@lettermate/contracts';
 import type { ExpandedTopic } from './ai-gateway.js';
 import type { SourceQueryPlan } from './connectors/types.js';
+import { buildKeywordPolicy, filterQueriesForPolicy } from './keyword-policy.js';
 
 export interface SourceRoutingInput {
   keyword: string;
@@ -75,6 +76,7 @@ const unique = (values: readonly string[], limit: number): string[] => {
 
 export class SourceRouter {
   route(input: SourceRoutingInput): SourceQueryPlan {
+    const matchPolicy = buildKeywordPolicy(input.keyword);
     const routeText = [input.keyword, ...input.expanded.terms, ...input.expanded.searchQueries]
       .join(' ');
     const connectorIds = productSignal.test(routeText)
@@ -90,10 +92,26 @@ export class SourceRouter {
       }, []),
       7,
     ) as SourceType[];
-    const queries = unique(input.expanded.searchQueries, 6);
+    const generatedQueries = filterQueriesForPolicy(
+      input.expanded.searchQueries,
+      matchPolicy,
+    ).slice(0, 1);
+    const quotedPhrase = `"${matchPolicy.exactPhrase}"`;
+    const intentQueries = matchPolicy.exactPhrase.length === 0 ? [] : [
+      `${quotedPhrase} release`,
+      `${quotedPhrase} announcement`,
+      `${quotedPhrase} changelog`,
+      `${quotedPhrase} official`,
+      ...(connectorIds.includes('github') ? [`${quotedPhrase} github release`] : []),
+      ...(connectorIds.includes('arxiv') ? [`${quotedPhrase} paper`] : []),
+      ...(connectorIds.includes('youtube') ? [`${quotedPhrase} official video`] : []),
+      ...(connectorIds.includes('twitterapi-io') ? [`${quotedPhrase} official account`] : []),
+    ];
+    const queries = unique([...generatedQueries, ...intentQueries], 6);
 
     return {
       keyword: input.keyword,
+      matchPolicy,
       expandedTerms: unique(input.expanded.terms, 8),
       queries: queries.length > 0 ? queries : [input.keyword],
       sourceTypes,

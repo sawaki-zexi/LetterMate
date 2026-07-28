@@ -1,5 +1,6 @@
 import { validateSourceCandidate, type ValidatedSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from './keyword-policy.js';
 import { QualityPipeline, type QualityAiGateway } from './quality-pipeline.js';
 
 const candidate = (id: string, overrides: Partial<ValidatedSourceCandidate> = {}) => validateSourceCandidate({
@@ -18,7 +19,9 @@ const composed = (source: ValidatedSourceCandidate) => ({
 });
 
 const gateway = (overrides: Partial<QualityAiGateway> = {}): QualityAiGateway => ({
-  evaluateCandidates: async ({ candidates }) => candidates.map(({ id }) => ({ id, accepted: true, kind: 'quality', reason: 'substantive' })),
+  evaluateCandidates: async ({ candidates }) => candidates.map(({ id }) => ({
+    id, accepted: true, kind: 'quality', reason: 'substantive', claimSupport: 'supported',
+  })),
   composeItems: async ({ candidates }) => candidates.map(({ candidate: item }) => composed(item)),
   ...overrides,
 });
@@ -36,7 +39,9 @@ describe('QualityPipeline', () => {
       finalUrl: web.canonicalUrl, title: 'Full article', contentType: 'text/html',
       text: 'A complete article body with architecture, migration details, measurements, and limitations.',
     });
-    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({ id, accepted: true, kind: 'quality' as const, reason: 'new' })));
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id, accepted: true, kind: 'quality' as const, reason: 'new', claimSupport: 'supported' as const,
+    })));
     const pipeline = new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates }));
 
     const result = await pipeline.run({ keyword: 'agents', candidates: [web, social], historyUrls: [],
@@ -58,7 +63,7 @@ describe('QualityPipeline', () => {
       text: 'Recovered architecture details, migration steps, measurements, and limitations.',
     });
     const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
-      id, accepted: true, kind: 'quality' as const, reason: 'new',
+      id, accepted: true, kind: 'quality' as const, reason: 'new', claimSupport: 'supported' as const,
     })));
 
     const result = await new QualityPipeline(
@@ -82,7 +87,7 @@ describe('QualityPipeline', () => {
       text: 'The release adds offline support, deterministic synchronization, and a complete migration guide.',
     });
     const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
-      id, accepted: true, kind: 'quality' as const, reason: 'new',
+      id, accepted: true, kind: 'quality' as const, reason: 'new', claimSupport: 'supported' as const,
     })));
 
     await new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates })).run({
@@ -99,7 +104,7 @@ describe('QualityPipeline', () => {
       content: `Substantive candidate ${index} with architecture, measurements, migration details, and limitations.`,
     }));
     const evaluateCandidates = vi.fn(async ({ candidates: batch }) => batch.map(({ id }: { id: string }) => ({
-      id, accepted: true, kind: 'quality' as const, reason: 'new',
+      id, accepted: true, kind: 'quality' as const, reason: 'new', claimSupport: 'supported' as const,
     })));
 
     await new QualityPipeline(
@@ -165,7 +170,7 @@ describe('QualityPipeline', () => {
       text: 'Complete release details with architecture, measurements, migration steps, and limitations.',
     });
     const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
-      id, accepted: true, kind: 'quality' as const, reason: 'new',
+      id, accepted: true, kind: 'quality' as const, reason: 'new', claimSupport: 'supported' as const,
     })));
 
     await new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates })).run({
@@ -185,7 +190,9 @@ describe('QualityPipeline', () => {
       kind: 'feed_entry', connectorId: 'rss', feedUrl: 'https://example1.com/feed', entryId: 'duplicate',
     } });
     const historical = candidate('3', { content: 'A substantive historical article with detailed implementation information.' });
-    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({ id, accepted: true, kind: 'quality' as const, reason: 'new' })));
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id, accepted: true, kind: 'quality' as const, reason: 'new', claimSupport: 'supported' as const,
+    })));
     const pipeline = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({ evaluateCandidates }));
 
     await pipeline.run({ keyword: 'agents', candidates: [accepted, lowValue, duplicate, historical],
@@ -195,10 +202,75 @@ describe('QualityPipeline', () => {
     expect(evaluateCandidates.mock.calls[0]![0].candidates[0].id).toBe(accepted.canonicalUrl);
   });
 
+  it('rejects candidates outside the query match policy before AI review', async () => {
+    const generic = candidate('generic', {
+      title: 'The latest GPT models compared',
+      content: 'A substantive roundup with architecture details, measurements, tradeoffs, and limitations.',
+    });
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(({ id }: { id: string }) => ({
+      id,
+      accepted: true,
+      kind: 'quality' as const,
+      reason: 'otherwise relevant',
+      claimSupport: 'supported' as const,
+    })));
+    const pipeline = new QualityPipeline(
+      { fetchText: vi.fn() } as never,
+      gateway({ evaluateCandidates }),
+    );
+
+    await expect(pipeline.run({
+      keyword: 'gpt-5.7',
+      matchPolicy: buildKeywordPolicy('gpt-5.7'),
+      candidates: [generic],
+      historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z',
+      windowEnd: '2026-07-27T00:00:00.000Z',
+    })).resolves.toEqual([]);
+
+    expect(evaluateCandidates).not.toHaveBeenCalled();
+  });
+
+  it.each(['unsupported', 'conflicting'] as const)(
+    'rejects otherwise accepted %s claims',
+    async (claimSupport) => {
+      const source = candidate(claimSupport, {
+        title: `gpt-5.7 ${claimSupport} release`,
+        content: 'A substantive candidate body with implementation details, measurements, and limitations.',
+      });
+      const composeItems = vi.fn(async ({ candidates }) => candidates.map(
+        ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => composed(item),
+      ));
+      const pipeline = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
+        evaluateCandidates: async () => [{
+          id: source.canonicalUrl,
+          accepted: true,
+          kind: 'quality',
+          reason: 'otherwise relevant',
+          claimSupport,
+        }],
+        composeItems,
+      }));
+
+      await expect(pipeline.run({
+        keyword: 'gpt-5.7',
+        matchPolicy: buildKeywordPolicy('gpt-5.7'),
+        candidates: [source],
+        historyUrls: [],
+        windowStart: '2026-07-20T00:00:00.000Z',
+        windowEnd: '2026-07-27T00:00:00.000Z',
+      })).resolves.toEqual([]);
+      expect(composeItems).not.toHaveBeenCalled();
+    },
+  );
+
   it('allows empty success and rejects composed URLs outside the accepted pool', async () => {
     const source = candidate('1', { content: 'A substantive article with detailed architecture, benchmarks, migration steps, and limitations.' });
     const rejecting = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
-      evaluateCandidates: async () => [{ id: source.canonicalUrl, accepted: false, kind: null, reason: 'low value' }],
+      evaluateCandidates: async () => [{
+        id: source.canonicalUrl, accepted: false, kind: null, reason: 'low value',
+        claimSupport: 'unsupported',
+      }],
       composeItems: vi.fn(),
     }));
     await expect(rejecting.run({ keyword: 'agents', candidates: [source], historyUrls: [],
@@ -216,10 +288,30 @@ describe('QualityPipeline', () => {
     const first = candidate('1', { content: 'A substantive article with detailed architecture, benchmarks, migration steps, and limitations.' });
     const second = candidate('2', { content: 'Another substantive article with implementation details, measurements, and tradeoffs.' });
     const pipeline = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
-      evaluateCandidates: async () => [{ id: first.canonicalUrl, accepted: true, kind: 'quality', reason: 'new' }],
+      evaluateCandidates: async () => [{
+        id: first.canonicalUrl, accepted: true, kind: 'quality', reason: 'new', claimSupport: 'supported',
+      }],
     }));
 
     await expect(pipeline.run({ keyword: 'agents', candidates: [first, second], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' }))
+      .rejects.toMatchObject({ code: 'QUALITY_RESPONSE_INVALID' });
+  });
+
+  it('rejects an assessment that omits claim support', async () => {
+    const source = candidate('missing-support', {
+      content: 'A substantive article with implementation details, measurements, and tradeoffs.',
+    });
+    const pipeline = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
+      evaluateCandidates: async () => [{
+        id: source.canonicalUrl,
+        accepted: true,
+        kind: 'quality',
+        reason: 'new',
+      }] as never,
+    }));
+
+    await expect(pipeline.run({ keyword: 'agents', candidates: [source], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' }))
       .rejects.toMatchObject({ code: 'QUALITY_RESPONSE_INVALID' });
   });

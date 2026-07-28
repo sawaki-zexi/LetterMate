@@ -9,12 +9,16 @@ import type {
   QualityAssessment,
   QualityAssessmentCandidate,
 } from './ai-gateway.js';
+import {
+  candidateMatchesKeyword,
+  type KeywordPolicy,
+} from './keyword-policy.js';
 
 export type QualityAiGateway = Pick<AiGateway, 'evaluateCandidates' | 'composeItems'>;
 export type { QualityAssessment, QualityAssessmentCandidate } from './ai-gateway.js';
 export interface QualityPipelineInput {
   keyword: string; candidates: ValidatedSourceCandidate[]; historyUrls: string[];
-  windowStart: string; windowEnd: string; signal?: AbortSignal;
+  windowStart: string; windowEnd: string; matchPolicy?: KeywordPolicy; signal?: AbortSignal;
 }
 interface ContentFetcherLike { fetchText(url: string, signal?: AbortSignal): Promise<FetchedText> }
 
@@ -27,7 +31,10 @@ export class QualityPipeline {
   constructor(private readonly contentFetcher: ContentFetcherLike, private readonly gateway: QualityAiGateway) {}
 
   async run(input: QualityPipelineInput): Promise<DiscoveryCandidate[]> {
-    const preliminarilyEligible = input.candidates.filter((item) => {
+    const policyMatched = input.matchPolicy === undefined
+      ? input.candidates
+      : input.candidates.filter((item) => candidateMatchesKeyword(item, input.matchPolicy!));
+    const preliminarilyEligible = policyMatched.filter((item) => {
       const rejection = rejectCandidate(item, {
         windowStart: input.windowStart,
         windowEnd: input.windowEnd,
@@ -82,7 +89,9 @@ export class QualityPipeline {
     }
     const accepted = finalCandidates.flatMap((candidate) => {
       const assessment = decisions.get(candidate.canonicalUrl);
-      return assessment?.accepted ? [{ candidate, assessment }] : [];
+      return assessment?.accepted && assessment.claimSupport === 'supported'
+        ? [{ candidate, assessment }]
+        : [];
     });
     if (accepted.length === 0) return [];
 
@@ -156,7 +165,7 @@ export class QualityPipeline {
   private validateAssessments(values: QualityAssessment[], allowed: Set<string>): Map<string, QualityAssessment> {
     const decisions = new Map<string, QualityAssessment>();
     for (const value of values) {
-      if (!allowed.has(value.id) || decisions.has(value.id) || typeof value.accepted !== 'boolean' || typeof value.reason !== 'string' || value.reason.trim().length === 0 || value.accepted && value.kind !== 'hot' && value.kind !== 'quality' || !value.accepted && value.kind !== null) throw new QualityPipelineError();
+      if (!allowed.has(value.id) || decisions.has(value.id) || typeof value.accepted !== 'boolean' || typeof value.reason !== 'string' || value.reason.trim().length === 0 || value.accepted && value.kind !== 'hot' && value.kind !== 'quality' || !value.accepted && value.kind !== null || value.claimSupport !== 'supported' && value.claimSupport !== 'unsupported' && value.claimSupport !== 'conflicting') throw new QualityPipelineError();
       decisions.set(value.id, value);
     }
     if (decisions.size !== allowed.size) throw new QualityPipelineError();

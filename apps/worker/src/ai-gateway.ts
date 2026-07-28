@@ -23,6 +23,7 @@ export interface QualityAssessment {
   accepted: boolean;
   kind: DiscoveryKind | null;
   reason: string;
+  claimSupport: 'supported' | 'unsupported' | 'conflicting';
 }
 
 export interface CompositionCandidate {
