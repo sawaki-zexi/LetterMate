@@ -2,6 +2,7 @@ import { validateSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it } from 'vitest';
 import { OpenRouterSearchConnector } from './connectors/openrouter-search.js';
 import type { SourceQueryPlan } from './connectors/types.js';
+import { buildKeywordPolicy } from './keyword-policy.js';
 import { OpenRouterAiGateway } from './openrouter-gateway.js';
 
 try {
@@ -27,6 +28,7 @@ describe.skipIf(!enabled)('OpenRouter live discovery', () => {
     const windowStart = new Date(windowEnd.getTime() - 30 * 24 * 60 * 60 * 1_000);
     const plan: SourceQueryPlan = {
       keyword: '人工智能',
+      matchPolicy: buildKeywordPolicy('人工智能'),
       expandedTerms: expanded.terms,
       queries: expanded.searchQueries.slice(0, 3),
       sourceTypes: ['web'],

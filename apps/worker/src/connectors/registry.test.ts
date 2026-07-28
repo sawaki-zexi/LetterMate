@@ -1,5 +1,6 @@
 import { type SourceCandidate, validateSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from '../keyword-policy.js';
 import {
   ConnectorError,
   type ConnectorResult,
@@ -10,6 +11,7 @@ import { ConnectorRegistry } from './registry.js';
 
 const plan: SourceQueryPlan = {
   keyword: 'AI agents',
+  matchPolicy: buildKeywordPolicy('AI agents'),
   expandedTerms: ['agentic AI'],
   queries: ['AI agents latest'],
   sourceTypes: ['web'],

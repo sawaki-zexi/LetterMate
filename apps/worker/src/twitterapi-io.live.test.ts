@@ -2,6 +2,7 @@ import { validateSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it } from 'vitest';
 import { TwitterApiIoConnector } from './connectors/twitterapi-io.js';
 import type { SourceQueryPlan } from './connectors/types.js';
+import { buildKeywordPolicy } from './keyword-policy.js';
 
 try {
   process.loadEnvFile();
@@ -18,6 +19,7 @@ describe.skipIf(!enabled)('TwitterAPI.io live discovery', () => {
     const windowStart = new Date(windowEnd.getTime() - 7 * 24 * 60 * 60 * 1_000);
     const plan: SourceQueryPlan = {
       keyword: 'OpenAI',
+      matchPolicy: buildKeywordPolicy('OpenAI'),
       expandedTerms: ['OpenAI'],
       queries: ['OpenAI'],
       sourceTypes: ['social'],

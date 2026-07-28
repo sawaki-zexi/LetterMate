@@ -9,6 +9,7 @@ import {
   type DiscoveryRepository,
 } from './discovery-service.js';
 import type { SourceQueryPlan } from './connectors/types.js';
+import { buildKeywordPolicy } from './keyword-policy.js';
 
 const finishedAt = new Date('2026-07-27T10:00:00.000Z');
 
@@ -492,6 +493,7 @@ function createOrchestration() {
       windowEnd: string;
     }): SourceQueryPlan => ({
       keyword: input.keyword,
+      matchPolicy: buildKeywordPolicy(input.keyword),
       expandedTerms: input.expanded.terms,
       queries: input.expanded.searchQueries,
       sourceTypes: ['code'],
@@ -543,6 +545,10 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     expect(registry.search).toHaveBeenCalledWith(
       expect.objectContaining({
         keyword: 'AI Agent',
+        matchPolicy: {
+          exactPhrase: 'ai agent',
+          aliases: ['ai agent', 'aiagent'],
+        },
         expandedTerms: ['intelligent agent'],
         queries: ['AI agent release', '智能体 发布'],
         sourceTypes: ['code'],
@@ -555,6 +561,10 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     );
     expect(qualityPipeline.run).toHaveBeenCalledWith({
       keyword: 'AI Agent',
+      matchPolicy: {
+        exactPhrase: 'ai agent',
+        aliases: ['ai agent', 'aiagent'],
+      },
       candidates: [sourceCandidate],
       historyUrls: ['https://example.com/old'],
       windowStart: '2026-07-20T10:00:00.000Z',

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from '../keyword-policy.js';
 import type { SourceQueryPlan } from './types.js';
 import { HackerNewsConnector } from './hacker-news.js';
 
 const plan: SourceQueryPlan = {
+  matchPolicy: buildKeywordPolicy('AI agents'),
   keyword: 'AI agents', expandedTerms: [], queries: ['AI agents'], sourceTypes: ['community'],
   windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z', maxCandidates: 5,
 };

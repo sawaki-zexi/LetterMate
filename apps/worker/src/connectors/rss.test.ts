@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from '../keyword-policy.js';
 import type { SourceQueryPlan } from './types.js';
 import { RssConnector } from './rss.js';
 
 const plan: SourceQueryPlan = {
   keyword: 'AI agents',
+  matchPolicy: buildKeywordPolicy('AI agents'),
   expandedTerms: [],
   queries: ['AI agents'],
   sourceTypes: ['feed'],

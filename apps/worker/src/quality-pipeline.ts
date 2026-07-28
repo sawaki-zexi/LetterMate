@@ -18,7 +18,7 @@ export type QualityAiGateway = Pick<AiGateway, 'evaluateCandidates' | 'composeIt
 export type { QualityAssessment, QualityAssessmentCandidate } from './ai-gateway.js';
 export interface QualityPipelineInput {
   keyword: string; candidates: ValidatedSourceCandidate[]; historyUrls: string[];
-  windowStart: string; windowEnd: string; matchPolicy?: KeywordPolicy; signal?: AbortSignal;
+  windowStart: string; windowEnd: string; matchPolicy: KeywordPolicy; signal?: AbortSignal;
 }
 interface ContentFetcherLike { fetchText(url: string, signal?: AbortSignal): Promise<FetchedText> }
 
@@ -31,9 +31,9 @@ export class QualityPipeline {
   constructor(private readonly contentFetcher: ContentFetcherLike, private readonly gateway: QualityAiGateway) {}
 
   async run(input: QualityPipelineInput): Promise<DiscoveryCandidate[]> {
-    const policyMatched = input.matchPolicy === undefined
-      ? input.candidates
-      : input.candidates.filter((item) => candidateMatchesKeyword(item, input.matchPolicy!));
+    const policyMatched = input.candidates.filter(
+      (item) => candidateMatchesKeyword(item, input.matchPolicy),
+    );
     const preliminarilyEligible = policyMatched.filter((item) => {
       const rejection = rejectCandidate(item, {
         windowStart: input.windowStart,

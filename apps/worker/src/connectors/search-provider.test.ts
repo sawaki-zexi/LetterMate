@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from '../keyword-policy.js';
 import type { SourceQueryPlan } from './types.js';
 import { SearchProviderConnector } from './search-provider.js';
 
 const plan: SourceQueryPlan = {
+  matchPolicy: buildKeywordPolicy('AI agent'),
   keyword: 'AI agent', expandedTerms: [], queries: ['AI agent', '智能体'], sourceTypes: ['web'],
   windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z', maxCandidates: 10,
 };

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from '../keyword-policy.js';
 import type { SourceQueryPlan } from './types.js';
 import { GitHubConnector } from './github.js';
 
 const plan: SourceQueryPlan = {
+  matchPolicy: buildKeywordPolicy('agent runtime'),
   keyword: 'agent runtime', expandedTerms: [], queries: ['agent runtime'], sourceTypes: ['code'],
   windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z', maxCandidates: 6,
 };

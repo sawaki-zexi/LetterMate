@@ -4,7 +4,7 @@ import type { KeywordPolicy } from '../keyword-policy.js';
 
 export interface SourceQueryPlan {
   keyword: string;
-  matchPolicy?: KeywordPolicy;
+  matchPolicy: KeywordPolicy;
   expandedTerms: string[];
   queries: string[];
   sourceTypes: SourceType[];

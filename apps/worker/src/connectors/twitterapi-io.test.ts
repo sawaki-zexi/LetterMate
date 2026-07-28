@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from '../keyword-policy.js';
 import type { SourceQueryPlan } from './types.js';
 import { ConnectorError } from './types.js';
 import { TwitterApiIoConnector } from './twitterapi-io.js';
 
 const plan: SourceQueryPlan = {
   keyword: 'AI agents',
+  matchPolicy: buildKeywordPolicy('AI agents'),
   expandedTerms: ['agentic AI'],
   queries: ['AI agents latest'],
   sourceTypes: ['social'],

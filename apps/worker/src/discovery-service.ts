@@ -466,6 +466,7 @@ export class TopicDiscoveryService {
       }
       const items = await this.qualityPipeline.run({
         keyword: topic.keyword,
+        matchPolicy: plan.matchPolicy,
         candidates: connectorResult.candidates,
         historyUrls,
         windowStart: plan.windowStart,

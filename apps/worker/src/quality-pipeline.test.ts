@@ -5,7 +5,7 @@ import { QualityPipeline, type QualityAiGateway } from './quality-pipeline.js';
 
 const candidate = (id: string, overrides: Partial<ValidatedSourceCandidate> = {}) => validateSourceCandidate({
   connectorId: 'search-brave', sourceType: 'web', platform: 'Brave Search', externalId: id,
-  url: `https://example${id}.com/article`, title: `Agent article ${id}`, content: null,
+  url: `https://example${id}.com/article`, title: `Agents article ${id}`, content: null,
   excerpt: 'Search excerpt that needs complete article content.', authorName: null, authorHandle: null,
   publishedAt: '2026-07-25T12:00:00.000Z', language: 'en', engagement: {},
   proof: { kind: 'api_record', connectorId: 'search-brave', externalId: id }, ...overrides,
@@ -26,12 +26,14 @@ const gateway = (overrides: Partial<QualityAiGateway> = {}): QualityAiGateway =>
   ...overrides,
 });
 
+const agentsPolicy = buildKeywordPolicy('agents');
+
 describe('QualityPipeline', () => {
   it('enriches only body-dependent web candidates before assessment', async () => {
     const web = candidate('1');
     const social = candidate('2', {
       connectorId: 'twitterapi-io', sourceType: 'social', platform: 'X', externalId: '2',
-      url: 'https://x.com/project/status/2', title: null, content: 'We released v2 today.', excerpt: null,
+      url: 'https://x.com/project/status/2', title: null, content: 'Agents: we released v2 today.', excerpt: null,
       authorName: 'Project', authorHandle: 'project',
       proof: { kind: 'api_record', connectorId: 'twitterapi-io', externalId: '2' },
     });
@@ -44,7 +46,7 @@ describe('QualityPipeline', () => {
     })));
     const pipeline = new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates }));
 
-    const result = await pipeline.run({ keyword: 'agents', candidates: [web, social], historyUrls: [],
+    const result = await pipeline.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [web, social], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
 
     expect(fetchText).toHaveBeenCalledOnce();
@@ -54,8 +56,8 @@ describe('QualityPipeline', () => {
     expect(result).toHaveLength(2);
   });
 
-  it('fetches a body before rejecting a web candidate with no title or excerpt', async () => {
-    const web = candidate('bodyless', { title: null, content: null, excerpt: null });
+  it('fetches a body before rejecting a matching web candidate with no content or excerpt', async () => {
+    const web = candidate('bodyless', { title: 'Agents', content: null, excerpt: null });
     const fetchText = vi.fn().mockResolvedValue({
       finalUrl: web.canonicalUrl,
       title: 'Recovered article',
@@ -69,7 +71,7 @@ describe('QualityPipeline', () => {
     const result = await new QualityPipeline(
       { fetchText } as never,
       gateway({ evaluateCandidates }),
-    ).run({ keyword: 'agents', candidates: [web], historyUrls: [],
+    ).run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [web], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
 
     expect(fetchText).toHaveBeenCalledOnce();
@@ -78,11 +80,11 @@ describe('QualityPipeline', () => {
   });
 
   it('deduplicates matching fetched bodies before AI review', async () => {
-    const first = candidate('mirror-a', { content: null, excerpt: null, title: 'Shared release' });
-    const second = candidate('mirror-b', { content: null, excerpt: null, title: ' shared release ' });
+    const first = candidate('mirror-a', { content: null, excerpt: null, title: 'Agents shared release' });
+    const second = candidate('mirror-b', { content: null, excerpt: null, title: ' agents shared release ' });
     const fetchText = vi.fn().mockResolvedValue({
       finalUrl: first.canonicalUrl,
-      title: 'Shared release',
+      title: 'Agents shared release',
       contentType: 'text/html',
       text: 'The release adds offline support, deterministic synchronization, and a complete migration guide.',
     });
@@ -91,7 +93,7 @@ describe('QualityPipeline', () => {
     })));
 
     await new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates })).run({
-      keyword: 'agents', candidates: [first, second], historyUrls: [],
+      keyword: 'agents', matchPolicy: agentsPolicy, candidates: [first, second], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z',
     });
 
@@ -110,7 +112,7 @@ describe('QualityPipeline', () => {
     await new QualityPipeline(
       { fetchText: vi.fn() } as never,
       gateway({ evaluateCandidates }),
-    ).run({ keyword: 'agents', candidates, historyUrls: [],
+    ).run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates, historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
 
     expect(evaluateCandidates).toHaveBeenCalledTimes(2);
@@ -126,7 +128,7 @@ describe('QualityPipeline', () => {
     await new QualityPipeline(
       { fetchText: vi.fn() } as never,
       gateway({ composeItems }),
-    ).run({ keyword: 'agents', candidates: [source], historyUrls: [],
+    ).run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
 
     const composedSource = composeItems.mock.calls[0]![0].candidates[0].candidate;
@@ -144,7 +146,7 @@ describe('QualityPipeline', () => {
     await new QualityPipeline(
       { fetchText: vi.fn() } as never,
       gateway({ composeItems }),
-    ).run({ keyword: 'agents', candidates: sources, historyUrls: [],
+    ).run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: sources, historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
 
     const compositionCandidates = composeItems.mock.calls[0]![0].candidates;
@@ -174,7 +176,7 @@ describe('QualityPipeline', () => {
     })));
 
     await new QualityPipeline({ fetchText } as never, gateway({ evaluateCandidates })).run({
-      keyword: 'agents', candidates: [feed], historyUrls: [],
+      keyword: 'agents', matchPolicy: agentsPolicy, candidates: [feed], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z',
     });
 
@@ -195,7 +197,7 @@ describe('QualityPipeline', () => {
     })));
     const pipeline = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({ evaluateCandidates }));
 
-    await pipeline.run({ keyword: 'agents', candidates: [accepted, lowValue, duplicate, historical],
+    await pipeline.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [accepted, lowValue, duplicate, historical],
       historyUrls: [historical.canonicalUrl], windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' });
 
     expect(evaluateCandidates.mock.calls[0]![0].candidates).toHaveLength(1);
@@ -273,13 +275,13 @@ describe('QualityPipeline', () => {
       }],
       composeItems: vi.fn(),
     }));
-    await expect(rejecting.run({ keyword: 'agents', candidates: [source], historyUrls: [],
+    await expect(rejecting.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' })).resolves.toEqual([]);
 
     const inventing = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
       composeItems: async () => [{ ...composed(source), sourceUrls: ['https://invented.example/article'] }],
     }));
-    await expect(inventing.run({ keyword: 'agents', candidates: [source], historyUrls: [],
+    await expect(inventing.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' }))
       .rejects.toMatchObject({ code: 'QUALITY_RESPONSE_INVALID' });
   });
@@ -293,7 +295,7 @@ describe('QualityPipeline', () => {
       }],
     }));
 
-    await expect(pipeline.run({ keyword: 'agents', candidates: [first, second], historyUrls: [],
+    await expect(pipeline.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [first, second], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' }))
       .rejects.toMatchObject({ code: 'QUALITY_RESPONSE_INVALID' });
   });
@@ -311,7 +313,7 @@ describe('QualityPipeline', () => {
       }] as never,
     }));
 
-    await expect(pipeline.run({ keyword: 'agents', candidates: [source], historyUrls: [],
+    await expect(pipeline.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' }))
       .rejects.toMatchObject({ code: 'QUALITY_RESPONSE_INVALID' });
   });

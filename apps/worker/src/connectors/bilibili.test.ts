@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+import { buildKeywordPolicy } from '../keyword-policy.js';
 import type { SourceQueryPlan } from './types.js';
 import { BilibiliConnector } from './bilibili.js';
 
 const plan: SourceQueryPlan = {
+  matchPolicy: buildKeywordPolicy('智能体'),
   keyword: '智能体', expandedTerms: [], queries: ['智能体'], sourceTypes: ['video'],
   windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z', maxCandidates: 5,
 };
