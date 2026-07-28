@@ -24,6 +24,7 @@ export interface RefreshCoordinatorOptions {
   pollIntervalMs?: number;
   maxConsecutivePollFailures?: number;
   confirmationTimeoutMs?: number;
+  synchronizationTimeoutMs?: number;
 }
 
 export interface RefreshCoordinator {
@@ -33,6 +34,9 @@ export interface RefreshCoordinator {
   pendingCount: number;
   pendingTopicIds: string[];
   trendPending: boolean;
+  synchronizing: boolean;
+  synchronizationStale: boolean;
+  retrySynchronization: () => Promise<boolean>;
   notification: RefreshNotification | null;
 }
 
@@ -41,6 +45,8 @@ interface CoordinatorView {
   targetCount: number;
   pendingTopicIds: string[];
   trendPending: boolean;
+  synchronizing: boolean;
+  synchronizationStale: boolean;
   notification: RefreshNotification | null;
 }
 
@@ -69,6 +75,8 @@ const initialView: CoordinatorView = {
   targetCount: 0,
   pendingTopicIds: [],
   trendPending: false,
+  synchronizing: false,
+  synchronizationStale: false,
   notification: null,
 };
 
@@ -110,6 +118,8 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
   const deadlineTimerRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
   const notificationIdRef = useRef(0);
+  const staleOutcomeRef = useRef<Omit<RefreshNotification, 'id'> | null>(null);
+  const synchronizationRetryRef = useRef<Promise<boolean> | null>(null);
 
   const clearTimers = useCallback(() => {
     if (timerRef.current !== null) {
@@ -133,21 +143,13 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     }));
   }, []);
 
-  const finish = useCallback((
+  const completeSession = useCallback((
     session: RefreshSession,
     notification: Omit<RefreshNotification, 'id'>,
-    refreshFeed: boolean,
+    synchronizationStale = false,
   ) => {
-    if (sessionRef.current !== session || session.finishing) return;
-    session.finishing = true;
+    if (sessionRef.current !== session) return;
     clearTimers();
-    if (refreshFeed) {
-      try {
-        void Promise.resolve(optionsRef.current.invalidateFeed()).catch(() => undefined);
-      } catch {
-        // Completion is authoritative even if the cached Feed cannot be refreshed.
-      }
-    }
     const payload: RefreshNotification = {
       ...notification,
       id: ++notificationIdRef.current,
@@ -159,19 +161,43 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
         targetCount: session.targetCount,
         pendingTopicIds: [],
         trendPending: false,
+        synchronizing: false,
+        synchronizationStale,
         notification: payload,
       });
     }
     session.resolve(payload);
   }, [clearTimers]);
 
+  const synchronizeFeed = useCallback(async () => {
+    let timeoutId: number | null = null;
+    try {
+      await Promise.race([
+        Promise.resolve().then(() => optionsRef.current.invalidateFeed()),
+        new Promise<never>((_resolve, reject) => {
+          timeoutId = window.setTimeout(
+            () => reject(new Error('Feed synchronization timed out')),
+            optionsRef.current.synchronizationTimeoutMs ?? 10_000,
+          );
+        }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    }
+  }, []);
+
   const finishUnconfirmed = useCallback((session: RefreshSession) => {
-    finish(session, {
+    if (sessionRef.current !== session || session.finishing) return;
+    session.finishing = true;
+    completeSession(session, {
       kind: 'warning',
       message: '刷新状态无法确认，已保留现有内容',
       ariaLive: 'polite',
-    }, false);
-  }, [finish]);
+    });
+  }, [completeSession]);
 
   const finishConfirmed = useCallback((session: RefreshSession) => {
     let kind: RefreshNotificationKind;
@@ -188,8 +214,35 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
       kind = 'error';
       message = '刷新失败，已保留现有内容';
     }
-    finish(session, { kind, message, ariaLive: 'polite' }, true);
-  }, [finish]);
+    if (sessionRef.current !== session || session.finishing) return;
+    session.finishing = true;
+    clearTimers();
+    const outcome = { kind, message, ariaLive: 'polite' as const };
+    if (mountedRef.current) {
+      setView((current) => ({
+        ...current,
+        active: true,
+        pendingTopicIds: [],
+        trendPending: false,
+        synchronizing: true,
+        notification: null,
+      }));
+    }
+    void synchronizeFeed().then((synchronized) => {
+      if (sessionRef.current !== session) return;
+      if (synchronized) {
+        staleOutcomeRef.current = null;
+        completeSession(session, outcome);
+      } else {
+        staleOutcomeRef.current = outcome;
+        completeSession(session, {
+          kind: 'warning',
+          message: '刷新结果已生成，但发现内容尚未同步',
+          ariaLive: 'polite',
+        }, true);
+      }
+    });
+  }, [clearTimers, completeSession, synchronizeFeed]);
 
   const maybeFinish = useCallback((session: RefreshSession) => {
     if (session.pendingTopicIds.size === 0 && !session.trendPending) {
@@ -303,6 +356,7 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     const existing = sessionRef.current;
     if (existing) return existing.completion;
 
+    staleOutcomeRef.current = null;
     const currentOptions = optionsRef.current;
     const topicIds = targetTopicIds(currentOptions);
     const trendTargeted = targetsTrend(currentOptions);
@@ -340,6 +394,8 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
         targetCount: session.targetCount,
         pendingTopicIds: topicIds,
         trendPending: trendTargeted,
+        synchronizing: false,
+        synchronizationStale: false,
         notification: null,
       }));
     }
@@ -399,6 +455,40 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     return completion;
   }, [finishUnconfirmed, maybeFinish, schedulePoll, syncView]);
 
+  const retrySynchronization = useCallback((): Promise<boolean> => {
+    if (synchronizationRetryRef.current) return synchronizationRetryRef.current;
+    const outcome = staleOutcomeRef.current;
+    if (!outcome) return Promise.resolve(false);
+    if (mountedRef.current) {
+      setView((current) => ({ ...current, synchronizing: true }));
+    }
+    const retry = synchronizeFeed().then((synchronized) => {
+      if (!mountedRef.current || staleOutcomeRef.current !== outcome) return false;
+      const notification = synchronized
+        ? outcome
+        : {
+            kind: 'warning' as const,
+            message: '刷新结果已生成，但发现内容尚未同步',
+            ariaLive: 'polite' as const,
+          };
+      if (synchronized) staleOutcomeRef.current = null;
+      setView((current) => ({
+        ...current,
+        synchronizing: false,
+        synchronizationStale: !synchronized,
+        notification: {
+          ...notification,
+          id: ++notificationIdRef.current,
+        },
+      }));
+      return synchronized;
+    }).finally(() => {
+      synchronizationRetryRef.current = null;
+    });
+    synchronizationRetryRef.current = retry;
+    return retry;
+  }, [synchronizeFeed]);
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -417,6 +507,9 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
     pendingCount: view.pendingTopicIds.length + Number(view.trendPending),
     pendingTopicIds: view.pendingTopicIds,
     trendPending: view.trendPending,
+    synchronizing: view.synchronizing,
+    synchronizationStale: view.synchronizationStale,
+    retrySynchronization,
     notification: view.notification,
   };
 }

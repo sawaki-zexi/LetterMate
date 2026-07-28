@@ -1,4 +1,4 @@
-import type { DiscoveryItem, SourceType } from '@lettermate/contracts';
+import type { FeedItem, SourceType } from '@lettermate/contracts';
 import {
   Clock3,
   Code2,
@@ -25,7 +25,16 @@ const sourceTypeMeta: Record<SourceType, { label: string; icon: LucideIcon }> = 
   paper: { label: '论文', icon: FileText },
 };
 
-export function DiscoveryCard({ item, detailHref }: { item: DiscoveryItem; detailHref?: string }) {
+export function DiscoveryCard({
+  item,
+  detailHref,
+  headingLevel = 2,
+}: {
+  item: FeedItem;
+  detailHref?: string;
+  headingLevel?: 2 | 3;
+}) {
+  const Heading = `h${headingLevel}` as const;
   const ClassificationIcon = item.kind === 'hot' ? Flame : Sparkles;
   const classification = item.kind === 'hot' ? '热点' : '优质';
   const source = sourceTypeMeta[item.sourceType];
@@ -40,13 +49,16 @@ export function DiscoveryCard({ item, detailHref }: { item: DiscoveryItem; detai
           <ClassificationIcon size={15} />{classification}
         </span>
         <div className="discovery-card__meta">
+          <span className={`origin-label origin-label--${item.origin}`}>
+            {item.origin === 'trend' ? '趋势发现' : '关键词追踪'}
+          </span>
           <span><SourceIcon size={14} />{item.platform}</span>
           <span>{source.label}</span>
           <span className="meta"><Clock3 size={14} />{new Date(item.publishedAt ?? item.discoveredAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
         </div>
       </div>
       {author && <div className="source-author">{author}</div>}
-      <h2>{detailHref ? <Link to={detailHref}>{item.title}</Link> : item.title}</h2>
+      <Heading>{detailHref ? <Link to={detailHref}>{item.title}</Link> : item.title}</Heading>
       <p>{item.summary}</p>
       <p className="discovery-card__reason"><strong>推荐理由</strong>{item.reason}</p>
       <div className="discovery-card__footer">

@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
   DiscoveryKind,
   DiscoverySourceStatus,
+  FeedOrigin,
   FeedRange,
   SourceType,
   Topic,
@@ -20,10 +21,18 @@ import {
   RefreshCw,
   Search,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { NavLink, Route, Routes, useParams } from 'react-router-dom';
 import { api } from './api.js';
 import { DiscoveryCard } from './components/DiscoveryCard.js';
+import { groupFeedItems } from './feed-time.js';
+import { usePullRefresh } from './use-pull-refresh.js';
+import {
+  useRefreshCoordinator,
+  type RefreshCoordinator,
+  type RefreshNotification,
+} from './use-refresh-coordinator.js';
+import { useTopicRefreshManager, type TopicRefreshNotification } from './use-topic-refresh-manager.js';
 
 const navigation = [
   { to: '/', label: '发现', icon: Newspaper },
@@ -47,17 +56,21 @@ const sourceTypeLabel: Record<SourceType, string> = {
   paper: '论文',
 };
 
-function useTopics() {
+function useTopics(suppressBackgroundPolling = false) {
   return useQuery({
     queryKey: ['topics'],
     queryFn: api.topics,
-    refetchInterval: (query) => query.state.data?.some((topic) =>
+    refetchInterval: (query) => !suppressBackgroundPolling && query.state.data?.some((topic) =>
       topic.runStatus === 'queued' || topic.runStatus === 'running') ? 1_500 : false,
   });
 }
 
 function useDiscoverySources() {
   return useQuery({ queryKey: ['discovery-sources'], queryFn: api.discoverySources });
+}
+
+function useTrendStatus() {
+  return useQuery({ queryKey: ['trend-status'], queryFn: api.trendStatus });
 }
 
 function QueryState({ isLoading, error, retry }: { isLoading: boolean; error: Error | null; retry: () => void }) {
@@ -88,13 +101,117 @@ function TopicErrors({ topics }: { topics: Topic[] }) {
   );
 }
 
+function RefreshNotificationToast({ notification }: { notification: RefreshNotification | null }) {
+  const [displayed, setDisplayed] = useState<RefreshNotification | null>(null);
+
+  useEffect(() => {
+    if (!notification) {
+      setDisplayed(null);
+      return;
+    }
+    setDisplayed(null);
+    const timer = window.setTimeout(() => setDisplayed(notification), 0);
+    return () => window.clearTimeout(timer);
+  }, [notification]);
+
+  return (
+    <div
+      className={displayed
+        ? `refresh-toast refresh-toast--${displayed.kind}`
+        : 'refresh-announcer'}
+      aria-label="刷新结果"
+      aria-live="polite"
+      aria-atomic="true"
+      data-notification-id={displayed?.id}
+    >
+      {displayed?.message ?? ''}
+    </div>
+  );
+}
+
+function TopicRefreshResults({
+  notifications,
+  synchronizationStaleTopicIds,
+  retrySynchronization,
+}: {
+  notifications: Record<string, TopicRefreshNotification>;
+  synchronizationStaleTopicIds: string[];
+  retrySynchronization: (topicId: string) => Promise<boolean>;
+}) {
+  const results = Object.values(notifications);
+  const staleTopicIds = new Set(synchronizationStaleTopicIds);
+  return (
+    <div
+      className={results.length > 0 ? 'topic-refresh-results' : 'refresh-announcer'}
+      aria-label="刷新结果"
+      aria-live="polite"
+      aria-atomic="false"
+    >
+      {results.map((notification) => (
+        <div
+          className={`topic-refresh-result topic-refresh-result--${notification.kind}`}
+          data-notification-id={notification.id}
+          key={notification.topicId}
+        >
+          <span>{notification.message}</span>
+          {staleTopicIds.has(notification.topicId) && (
+            <button
+              className="button button--secondary"
+              aria-label={`重试同步 ${notification.topicKeyword}`}
+              onClick={() => void retrySynchronization(notification.topicId)}
+            ><RefreshCw size={16} />重试同步</button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RefreshFeedback({ refresh }: { refresh: RefreshCoordinator }) {
+  return (
+    <>
+      {refresh.active && (
+        <div className="refresh-status" role="status">
+          <RefreshCw className="spin" size={16} />
+          <span>正在更新 {refresh.targetCount} 个目标</span>
+        </div>
+      )}
+      <RefreshNotificationToast notification={refresh.notification} />
+      {refresh.synchronizationStale && (
+        <div className="error-banner">
+          <AlertCircle size={18} />
+          <span>刷新结果已生成，但发现内容尚未同步</span>
+          <button
+            className="button button--secondary"
+            disabled={refresh.synchronizing}
+            onClick={() => void refresh.retrySynchronization()}
+          ><RefreshCw className={refresh.synchronizing ? 'spin' : undefined} size={16} />重试同步</button>
+        </div>
+      )}
+    </>
+  );
+}
+
+const timeRangeOptions: ReadonlyArray<[FeedRange, string]> = [
+  ['1d', '近 24 小时'],
+  ['3d', '近 3 天'],
+  ['7d', '近 7 天'],
+  ['30d', '近 30 天'],
+  ['90d', '近 90 天'],
+  ['all', '全部历史'],
+];
+
 function FeedPage() {
+  const client = useQueryClient();
   const topics = useTopics();
+  const trendStatus = useTrendStatus();
   const [kind, setKind] = useState<DiscoveryKind | 'all'>('all');
-  const [range, setRange] = useState<FeedRange>('recent');
+  const [range, setRange] = useState<FeedRange>('30d');
+  const [origin, setOrigin] = useState<FeedOrigin>('all');
   const [topicId, setTopicId] = useState('');
   const filter = {
     range,
+    origin,
     ...(topicId ? { topicId } : {}),
     ...(kind === 'all' ? {} : { kind }),
   };
@@ -102,58 +219,183 @@ function FeedPage() {
     queryKey: ['feed', filter],
     queryFn: () => api.feed(filter),
   });
+  const refresh = useRefreshCoordinator({
+    topics: topics.data ?? [],
+    trendStatus: trendStatus.data,
+    origin,
+    ...(topicId ? { selectedTopicId: topicId } : {}),
+    refreshTopic: api.refreshTopic,
+    refreshTrends: api.refreshTrends,
+    refetchTopics: api.topics,
+    refetchTrendStatus: api.trendStatus,
+    invalidateFeed: async () => {
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ['feed'] }, { throwOnError: true }),
+        client.invalidateQueries({ queryKey: ['topics'] }, { throwOnError: true }),
+        client.invalidateQueries({ queryKey: ['trend-status'] }, { throwOnError: true }),
+      ]);
+    },
+  });
+  const hasSelectedTopic = topicId
+    ? topics.data?.some((topic) => topic.id === topicId) === true
+    : false;
+  const hasTopicTargets = topicId ? hasSelectedTopic : (topics.data?.length ?? 0) > 0;
+  const refreshReady = origin === 'trend'
+    ? trendStatus.data !== undefined
+    : origin === 'topic'
+      ? topics.data !== undefined && hasTopicTargets
+      : topics.data !== undefined && trendStatus.data !== undefined;
+  const pull = usePullRefresh({
+    refreshing: refresh.active || !refreshReady,
+    onRefresh: async () => { await refresh.startRefresh(); },
+  });
+  const groups = groupFeedItems(feed.data ?? []);
+  const changeOrigin = (nextOrigin: FeedOrigin) => {
+    setOrigin(nextOrigin);
+    if (nextOrigin !== 'topic') setTopicId('');
+  };
+
+  useEffect(() => {
+    if (topicId && topics.data && !hasSelectedTopic) setTopicId('');
+  }, [hasSelectedTopic, topicId, topics.data]);
 
   return (
     <Page title="发现" description="从搜索、社交、视频与技术社区汇集高价值新内容" action={
-      <button className="icon-button" title="刷新发现" aria-label="刷新发现" onClick={() => void feed.refetch()}><RefreshCw size={18} /></button>
-    }>
+      <button
+        className="icon-button refresh-button"
+        title="刷新发现"
+        aria-label="刷新发现"
+        aria-busy={refresh.active}
+        disabled={refresh.active || !refreshReady}
+        onClick={() => void refresh.startRefresh()}
+      ><RefreshCw className={refresh.active ? 'spin' : undefined} size={18} /></button>
+    } containerProps={pull.containerProps}>
+      <div
+        className={`pull-indicator ${pull.pullDistance > 0 ? 'pull-indicator--visible' : ''} ${pull.armed ? 'pull-indicator--armed' : ''} ${refresh.active ? 'pull-indicator--active' : ''}`}
+        style={{ '--pull-distance': `${pull.pullDistance}px` } as CSSProperties}
+        aria-hidden="true"
+      >
+        <RefreshCw className={refresh.active ? 'spin' : undefined} size={18} />
+      </div>
+      <RefreshFeedback refresh={refresh} />
+      {origin !== 'topic' && trendStatus.error && (
+        <div className="error-banner">
+          <AlertCircle size={18} />
+          <div><strong>趋势状态无法加载</strong><span>{trendStatus.error.message}</span></div>
+          <button
+            className="icon-button"
+            title="重试趋势状态"
+            aria-label="重试趋势状态"
+            onClick={() => void trendStatus.refetch()}
+          ><RefreshCw size={16} /></button>
+        </div>
+      )}
       <div className="feed-tools">
         <div className="feed-segments">
-          <div className="segmented" aria-label="发现分类">
+          <div className="segmented segmented--origin" role="group" aria-label="发现来源">
+            {([['all', '全部'], ['topic', '关键词追踪'], ['trend', '趋势发现']] as const).map(([value, label]) => (
+              <button key={value} aria-pressed={origin === value} onClick={() => changeOrigin(value)}>{label}</button>
+            ))}
+          </div>
+          <div className="segmented" role="group" aria-label="发现分类">
             {([['all', '全部'], ['hot', '热点'], ['quality', '优质']] as const).map(([value, label]) => (
               <button key={value} aria-pressed={kind === value} onClick={() => setKind(value)}>{label}</button>
             ))}
           </div>
-          <div className="segmented segmented--history" aria-label="历史范围">
-            <button aria-pressed={range === 'recent'} onClick={() => setRange('recent')}>最近 90 天</button>
-            <button aria-pressed={range === 'all'} onClick={() => setRange('all')}>全部历史</button>
-          </div>
         </div>
-        <label className="topic-filter">
-          <span>主题</span>
-          <select value={topicId} onChange={(event) => setTopicId(event.target.value)}>
-            <option value="">全部主题</option>
-            {(topics.data ?? []).map((topic) => <option key={topic.id} value={topic.id}>{topic.keyword}</option>)}
-          </select>
-        </label>
+        <div className="feed-selects">
+          <label className="filter-control time-filter">
+            <span>时间范围</span>
+            <select value={range} onChange={(event) => setRange(event.target.value as FeedRange)}>
+              {timeRangeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </label>
+          {origin !== 'trend' && (
+            <label className="filter-control topic-filter">
+              <span>主题</span>
+              <select value={topicId} onChange={(event) => {
+                const nextTopicId = event.target.value;
+                setTopicId(nextTopicId);
+                if (nextTopicId) setOrigin('topic');
+              }}>
+                <option value="">全部主题</option>
+                {(topics.data ?? []).map((topic) => <option key={topic.id} value={topic.id}>{topic.keyword}</option>)}
+              </select>
+            </label>
+          )}
+        </div>
       </div>
       <TopicErrors topics={topics.data ?? []} />
       {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
       {!feed.data && <QueryState isLoading={feed.isLoading} error={feed.error} retry={() => void feed.refetch()} />}
       {feed.data?.length === 0 && <div className="state"><Inbox />暂无发现内容</div>}
-      <div className="discovery-list">
-        {(feed.data ?? []).map((item) => <DiscoveryCard key={item.id} item={item} detailHref={`/items/${item.id}`} />)}
+      <div className="feed-groups">
+        {groups.map((group) => (
+          <section className="feed-time-group" key={group.label}>
+            <h2>{group.label}</h2>
+            <div className="discovery-list">
+              {group.items.map((item) => <DiscoveryCard key={item.id} item={item} detailHref={`/items/${item.id}`} headingLevel={3} />)}
+            </div>
+          </section>
+        ))}
       </div>
     </Page>
   );
 }
 
+function TopicRow({
+  topic,
+  pending,
+  onRefresh,
+}: {
+  topic: Topic;
+  pending: boolean;
+  onRefresh: () => void;
+}) {
+  return (
+    <article className="topic-row">
+      <div className="topic-row__main">
+        <div className="topic-row__title"><h2>{topic.keyword}</h2><span className={`run-state run-state--${topic.runStatus}`}>{statusLabel[topic.runStatus]}</span></div>
+        <p className="topic-schedule"><Clock3 size={14} />{topic.nextRunAt
+          ? `下次自动更新 ${new Date(topic.nextRunAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · 每 ${topic.scheduleIntervalHours} 小时`
+          : `每 ${topic.scheduleIntervalHours} 小时 · 等待首次自动更新`}</p>
+        {topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term) => <span key={term}>{term}</span>)}</div>}
+        {topic.lastError && <p className="inline-error"><AlertCircle size={15} />{topic.lastError.message}</p>}
+      </div>
+      <button
+        className="icon-button refresh-button"
+        title="重新搜索"
+        aria-label={`刷新 ${topic.keyword}`}
+        aria-busy={pending}
+        disabled={pending}
+        onClick={onRefresh}
+      ><RefreshCw className={pending ? 'spin' : undefined} size={17} /></button>
+    </article>
+  );
+}
+
 function TopicsPage() {
   const client = useQueryClient();
-  const topics = useTopics();
+  const [manualTopicRefreshActive, setManualTopicRefreshActive] = useState(false);
+  const topics = useTopics(manualTopicRefreshActive);
   const sources = useDiscoverySources();
   const [keyword, setKeyword] = useState('');
+  const refresh = useTopicRefreshManager({
+    topics: topics.data ?? [],
+    refreshTopic: api.refreshTopic,
+    refetchTopics: async () => (await topics.refetch()).data,
+    invalidateFeed: () => client.invalidateQueries(
+      { queryKey: ['feed'] },
+      { throwOnError: true },
+    ),
+    onActivityChange: setManualTopicRefreshActive,
+  });
   const create = useMutation({
     mutationFn: api.createTopic,
     onSuccess: (topic) => {
       client.setQueryData<Topic[]>(['topics'], (current = []) => [topic, ...current.filter((item) => item.id !== topic.id)]);
       setKeyword('');
     },
-  });
-  const refresh = useMutation({
-    mutationFn: api.refreshTopic,
-    onSuccess: (topic) => client.setQueryData<Topic[]>(['topics'], (current = []) =>
-      current.map((item) => item.id === topic.id ? topic : item)),
   });
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -162,6 +404,11 @@ function TopicsPage() {
 
   return (
     <Page title="主题" description="输入关键词后自动扩展中英文查询，并按计划持续更新">
+      <TopicRefreshResults
+        notifications={refresh.notifications}
+        synchronizationStaleTopicIds={refresh.synchronizationStaleTopicIds}
+        retrySynchronization={refresh.retrySynchronization}
+      />
       <form className="topic-create" onSubmit={submit}>
         <label htmlFor="topic-keyword">主题关键词</label>
         <input id="topic-keyword" value={keyword} maxLength={100} onChange={(event) => setKeyword(event.target.value)} placeholder="例如：AI Agent" />
@@ -170,19 +417,12 @@ function TopicsPage() {
       {create.error && <div className="error-banner"><AlertCircle size={18} /><span>{create.error.message}</span></div>}
       {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
       <div className="topic-list">
-        {(topics.data ?? []).map((topic) => (
-          <article className="topic-row" key={topic.id}>
-            <div className="topic-row__main">
-              <div className="topic-row__title"><h2>{topic.keyword}</h2><span className={`run-state run-state--${topic.runStatus}`}>{statusLabel[topic.runStatus]}</span></div>
-              <p className="topic-schedule"><Clock3 size={14} />{topic.nextRunAt
-                ? `下次自动更新 ${new Date(topic.nextRunAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · 每 ${topic.scheduleIntervalHours} 小时`
-                : `每 ${topic.scheduleIntervalHours} 小时 · 等待首次自动更新`}</p>
-              {topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term) => <span key={term}>{term}</span>)}</div>}
-              {topic.lastError && <p className="inline-error"><AlertCircle size={15} />{topic.lastError.message}</p>}
-            </div>
-            <button className="icon-button" title="重新搜索" aria-label={`刷新 ${topic.keyword}`} disabled={refresh.isPending} onClick={() => refresh.mutate(topic.id)}><RefreshCw size={17} /></button>
-          </article>
-        ))}
+        {(topics.data ?? []).map((topic) => <TopicRow
+          key={topic.id}
+          topic={topic}
+          pending={refresh.pendingTopicIds.includes(topic.id)}
+          onRefresh={() => void refresh.startTopicRefresh(topic.id)}
+        />)}
         {topics.data?.length === 0 && <div className="state"><Search />尚未创建主题</div>}
       </div>
       <section className="source-status-section">
@@ -223,8 +463,20 @@ function ItemPage() {
   );
 }
 
-function Page({ title, description, action, children }: { title: string; description: string; action?: React.ReactNode; children: React.ReactNode }) {
-  return <main className="page"><header className="page-header"><div><h1>{title}</h1><p>{description}</p></div>{action}</header>{children}</main>;
+function Page({
+  title,
+  description,
+  action,
+  containerProps,
+  children,
+}: {
+  title: string;
+  description: string;
+  action?: React.ReactNode;
+  containerProps?: ReturnType<typeof usePullRefresh>['containerProps'];
+  children: React.ReactNode;
+}) {
+  return <main className="page" {...containerProps}><header className="page-header"><div><h1>{title}</h1><p>{description}</p></div>{action}</header>{children}</main>;
 }
 
 export default function App() {

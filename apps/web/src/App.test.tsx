@@ -1,105 +1,540 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { DiscoveryItem, DiscoverySourceStatus, Topic } from '@lettermate/contracts';
+import type {
+  DiscoverySourceStatus,
+  FeedItem,
+  RunSummary,
+  Topic,
+  TrendStatus,
+} from '@lettermate/contracts';
 import App from './App.js';
 import './test-setup.js';
 
-const discoveryItem: DiscoveryItem = {
-  id: 'item-1', topicId: 'topic-1', kind: 'quality', title: 'Agent guide',
-  summary: '中文摘要', reason: '内容深入', sourceUrls: ['https://x.com/project/status/100'],
-  publishedAt: null, discoveredAt: '2026-07-24T08:00:00.000Z',
-  sourceType: 'social', platform: 'X', authorName: 'Project Team',
-  authorHandle: 'project', externalId: '100', provenanceKind: 'api_record',
-};
-const requests: Array<{ url: string; body?: unknown }> = [];
+const now = new Date();
 
-function installFetchMock(
-  topics: Topic[],
-  feed: DiscoveryItem[],
-  created?: Topic,
-  sources: DiscoverySourceStatus[] = [],
-) {
+function runSummary(
+  id: string,
+  status: RunSummary['status'],
+  newItemCount: number | null = null,
+): RunSummary {
+  const base = {
+    id,
+    trigger: 'manual' as const,
+    startedAt: new Date(now.getTime() - 60_000).toISOString(),
+  };
+  if (status === 'queued' || status === 'running') {
+    return { ...base, status, finishedAt: null, newItemCount: null };
+  }
+  if (status === 'failed') {
+    return { ...base, status, finishedAt: now.toISOString(), newItemCount: null };
+  }
+  return { ...base, status, finishedAt: now.toISOString(), newItemCount: newItemCount ?? 0 };
+}
+
+function topic(id: string, keyword: string, lastRun: RunSummary | null = null): Topic {
+  return {
+    id,
+    userId: 'user-a',
+    keyword,
+    expandedTerms: [`${keyword} news`],
+    createdAt: new Date(now.getTime() - 86_400_000).toISOString(),
+    lastRunAt: lastRun?.startedAt ?? null,
+    nextRunAt: new Date(now.getTime() + 43_200_000).toISOString(),
+    scheduleIntervalHours: 12,
+    runStatus: lastRun?.status ?? 'succeeded',
+    lastError: null,
+    lastRun,
+  };
+}
+
+function feedItem(
+  id: string,
+  origin: FeedItem['origin'],
+  ageInDays = 0,
+): FeedItem {
+  const common = {
+    id,
+    kind: 'quality' as const,
+    title: `发现 ${id}`,
+    summary: '中文摘要',
+    reason: '内容深入',
+    sourceUrls: [`https://example.com/${id}`],
+    publishedAt: null,
+    discoveredAt: new Date(now.getTime() - ageInDays * 86_400_000).toISOString(),
+    sourceType: 'web' as const,
+    platform: 'Example',
+    authorName: 'Project Team',
+    authorHandle: 'project',
+    externalId: id,
+    provenanceKind: 'api_record' as const,
+  };
+  return origin === 'topic'
+    ? { ...common, origin, topicId: 'topic-1' }
+    : { ...common, origin, topicId: null };
+}
+
+const initialTrendStatus: TrendStatus = {
+  runStatus: 'succeeded',
+  nextRunAt: new Date(now.getTime() + 14_400_000).toISOString(),
+  intervalHours: 4,
+  lastError: null,
+  lastRun: null,
+};
+
+const requests: Array<{ url: string; method: string; body?: unknown }> = [];
+
+interface FetchMockOptions {
+  topics?: Topic[];
+  topicsResponse?: Promise<Topic[]>;
+  feed?: FeedItem[];
+  created?: Topic;
+  sources?: DiscoverySourceStatus[];
+  topicCompletionCount?: number;
+  trendCompletionCount?: number;
+  trendStatusFailures?: number;
+  feedRefetchFailures?: number;
+  topicCompletionAfterPolls?: number;
+}
+
+function installFetchMock({
+  topics: initialTopics = [],
+  topicsResponse,
+  feed = [],
+  created,
+  sources = [],
+  topicCompletionCount = 0,
+  trendCompletionCount = 0,
+  trendStatusFailures: initialTrendStatusFailures = 0,
+  feedRefetchFailures: initialFeedRefetchFailures = 0,
+  topicCompletionAfterPolls = 1,
+}: FetchMockOptions = {}) {
+  const refreshedTopicIds = new Set<string>();
+  let currentTopics = initialTopics;
+  const topicRefreshGenerations = new Map<string, number>();
+  let trendRefreshStarted = false;
+  let trendStatusFailures = initialTrendStatusFailures;
+  let feedRequestCount = 0;
+  let feedRefetchFailures = initialFeedRefetchFailures;
+  let manualTopicPollCount = 0;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    const method = init?.method ?? 'GET';
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-    requests.push({ url, body });
-    if (url.endsWith('/topics') && init?.method === 'POST') return Response.json(created!, { status: 201 });
-    if (url.endsWith('/topics')) return Response.json(topics);
+    requests.push({ url, method, body });
+
+    if (url.endsWith('/topics') && method === 'POST') return Response.json(created!, { status: 201 });
+    const topicRefreshMatch = url.match(/\/topics\/([^/]+)\/refresh$/);
+    if (topicRefreshMatch && method === 'POST') {
+      const topicRefreshId = decodeURIComponent(topicRefreshMatch[1] ?? '');
+      refreshedTopicIds.add(topicRefreshId);
+      const generation = (topicRefreshGenerations.get(topicRefreshId) ?? 0) + 1;
+      topicRefreshGenerations.set(topicRefreshId, generation);
+      const refreshed = currentTopics.find((item) => item.id === topicRefreshId)!;
+      return Response.json({ ...refreshed, lastRun: runSummary(`queued-${topicRefreshId}-${generation}`, 'queued'), runStatus: 'queued' });
+    }
+    if (url.endsWith('/topics')) {
+      const availableTopics = topicsResponse
+        ? await topicsResponse
+        : currentTopics;
+      if (refreshedTopicIds.size > 0) manualTopicPollCount += 1;
+      const topicRunTerminal = manualTopicPollCount >= topicCompletionAfterPolls;
+      return Response.json(availableTopics.map((item) => refreshedTopicIds.has(item.id)
+        ? topicRunTerminal
+          ? { ...item, lastRun: runSummary(`done-${item.id}-${topicRefreshGenerations.get(item.id)}`, 'succeeded', topicCompletionCount), runStatus: 'succeeded' }
+          : { ...item, lastRun: runSummary(`queued-${item.id}-${topicRefreshGenerations.get(item.id)}`, 'running'), runStatus: 'running' }
+        : item));
+    }
+    if (url.endsWith('/trends/refresh') && method === 'POST') {
+      trendRefreshStarted = true;
+      return Response.json({ ...initialTrendStatus, runStatus: 'queued', lastRun: runSummary('queued-trend', 'queued') });
+    }
+    if (url.endsWith('/trends/status')) {
+      if (trendStatusFailures > 0) {
+        trendStatusFailures -= 1;
+        return Response.json({ code: 'TREND_STATUS_UNAVAILABLE', message: '趋势状态暂时不可用', traceId: 'test' }, { status: 503 });
+      }
+      return Response.json(trendRefreshStarted
+        ? { ...initialTrendStatus, lastRun: runSummary('done-trend', 'succeeded', trendCompletionCount) }
+        : initialTrendStatus);
+    }
     if (url.endsWith('/discovery-sources')) return Response.json(sources);
-    if (url.includes('/feed')) return Response.json(feed);
+    if (url.includes('/feed')) {
+      feedRequestCount += 1;
+      if (feedRequestCount > 1 && feedRefetchFailures > 0) {
+        feedRefetchFailures -= 1;
+        return Response.json({ code: 'FEED_UNAVAILABLE', message: '发现内容暂时不可用', traceId: 'test' }, { status: 503 });
+      }
+      return Response.json(feed);
+    }
     return Response.json({ code: 'NOT_FOUND', message: 'not found', traceId: 'test' }, { status: 404 });
   }));
+  return {
+    setTopics(nextTopics: Topic[]) {
+      currentTopics = nextTopics;
+    },
+  };
 }
 
 function renderApp(route: string) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[route]}><App /></MemoryRouter></QueryClientProvider>);
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const rendered = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[route]}><App /></MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { ...rendered, client };
 }
 
 describe('discovery workspace', () => {
   afterEach(() => {
     cleanup();
     requests.length = 0;
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
-  it('submits only one keyword and polls queued topics', async () => {
-    const created: Topic = {
-      id: 'topic-1', userId: 'user-a', keyword: 'AI Agent', expandedTerms: [],
-      createdAt: '2026-07-24T08:00:00.000Z', lastRunAt: null,
-      nextRunAt: null, scheduleIntervalHours: 12, runStatus: 'queued', lastError: null,
-    };
-    installFetchMock([], [], created);
+  it('requests the default 30-day range and offers every labeled time option', async () => {
+    installFetchMock({ feed: [feedItem('today', 'topic')] });
+    renderApp('/');
+
+    const range = await screen.findByRole('combobox', { name: '时间范围' });
+    expect(range).toHaveValue('30d');
+    expect(within(range).getAllByRole('option').map((option) => option.textContent)).toEqual([
+      '近 24 小时', '近 3 天', '近 7 天', '近 30 天', '近 90 天', '全部历史',
+    ]);
+    await waitFor(() => expect(requests.some(({ url }) => (
+      url.includes('/feed?') && url.includes('range=30d')
+    ))).toBe(true));
+
+    fireEvent.change(range, { target: { value: '3d' } });
+    await waitFor(() => expect(requests.some(({ url }) => url.includes('range=3d'))).toBe(true));
+  });
+
+  it('keeps origin and topic filters valid and omits topic selection from trend-only view', async () => {
+    installFetchMock({ topics: [topic('topic-1', 'AI Agent')], feed: [feedItem('today', 'topic')] });
+    renderApp('/');
+
+    expect(await screen.findByRole('group', { name: '发现来源' })).toBeVisible();
+    const topicSelect = await screen.findByRole('combobox', { name: '主题' });
+    await screen.findByRole('option', { name: 'AI Agent' });
+    fireEvent.change(topicSelect, { target: { value: 'topic-1' } });
+    await waitFor(() => expect(requests.some(({ url }) => (
+      url.includes('/feed?') && url.includes('topicId=topic-1') && url.includes('origin=topic')
+    ))).toBe(true));
+
+    fireEvent.click(screen.getByRole('button', { name: '趋势发现' }));
+    expect(screen.queryByRole('combobox', { name: '主题' })).not.toBeInTheDocument();
+    await waitFor(() => expect(requests.some(({ url }) => (
+      url.includes('/feed?') && url.includes('origin=trend') && !url.includes('topicId=')
+    ))).toBe(true));
+    expect(requests.every(({ url }) => !(url.includes('origin=trend') && url.includes('topicId=')))).toBe(true);
+  });
+
+  it('renders nonempty unframed time groups around feed cards', async () => {
+    installFetchMock({ feed: [feedItem('today', 'topic'), feedItem('yesterday', 'trend', 1)] });
+    renderApp('/');
+
+    expect(await screen.findByRole('heading', { level: 2, name: '今天' })).toBeVisible();
+    expect(screen.getByRole('heading', { level: 2, name: '昨天' })).toBeVisible();
+    expect(screen.getByRole('heading', { level: 3, name: '发现 today' })).toBeVisible();
+    expect(screen.getByRole('heading', { level: 3, name: '发现 yesterday' })).toBeVisible();
+    expect(screen.getAllByRole('article')).toHaveLength(2);
+    expect(screen.queryByRole('heading', { name: '近 3 天' })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '今天' }).closest('section')).toHaveClass('feed-time-group');
+  });
+
+  it('shows active target count and the coordinator completion message for top refresh', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent')],
+      feed: [feedItem('today', 'topic')],
+      topicCompletionCount: 2,
+      trendCompletionCount: 3,
+    });
+    renderApp('/');
+    await screen.findByText('发现 today');
+    const liveRegion = screen.getByLabelText('刷新结果');
+    expect(liveRegion).toBeEmptyDOMElement();
+    vi.useFakeTimers();
+
+    const refresh = screen.getByRole('button', { name: '刷新发现' });
+    fireEvent.click(refresh);
+
+    expect(refresh).toHaveAttribute('aria-busy', 'true');
+    expect(refresh.querySelector('svg')).toHaveClass('spin');
+    expect(screen.getByText('正在更新 2 个目标')).toBeVisible();
+
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(liveRegion).toHaveTextContent('刷新完成，新增 5 条内容');
+    expect(liveRegion).toHaveAttribute('aria-live', 'polite');
+    expect(screen.getByLabelText('刷新结果')).toBe(liveRegion);
+    expect(refresh).toHaveAttribute('aria-busy', 'false');
+  });
+
+  it('does not refresh an incomplete all-target scope while Topics are loading', async () => {
+    let resolveTopics!: (topics: Topic[]) => void;
+    const topicsResponse = new Promise<Topic[]>((resolve) => { resolveTopics = resolve; });
+    installFetchMock({ topicsResponse, feed: [feedItem('today', 'topic')] });
+    renderApp('/');
+
+    const refresh = screen.getByRole('button', { name: '刷新发现' });
+    expect(refresh).toBeDisabled();
+    fireEvent.click(refresh);
+    expect(requests.some(({ url, method }) => url.endsWith('/trends/refresh') && method === 'POST')).toBe(false);
+
+    resolveTopics([]);
+    await waitFor(() => expect(refresh).toBeEnabled());
+  });
+
+  it('disables topic-only refresh when there are no Topic targets', async () => {
+    installFetchMock({ topics: [], feed: [] });
+    renderApp('/');
+
+    await screen.findByText('暂无发现内容');
+    fireEvent.click(screen.getByRole('button', { name: '关键词追踪' }));
+
+    const refresh = screen.getByRole('button', { name: '刷新发现' });
+    expect(refresh).toBeDisabled();
+    fireEvent.click(refresh);
+    expect(requests.some(({ url, method }) => url.includes('/topics/') && method === 'POST')).toBe(false);
+  });
+
+  it('clears a selected Topic when a refreshed Topic snapshot removes it', async () => {
+    const activeTopic = topic('topic-1', 'AI Agent');
+    const mock = installFetchMock({
+      topics: [activeTopic],
+      feed: [feedItem('today', 'topic')],
+    });
+    const { client } = renderApp('/');
+
+    const topicSelect = await screen.findByRole('combobox', { name: '主题' });
+    await screen.findByRole('option', { name: 'AI Agent' });
+    fireEvent.change(topicSelect, { target: { value: 'topic-1' } });
+    await waitFor(() => expect(requests.some(({ url }) => url.includes('topicId=topic-1'))).toBe(true));
+
+    mock.setTopics([]);
+    await act(async () => { await client.invalidateQueries({ queryKey: ['topics'] }); });
+
+    await waitFor(() => expect(topicSelect).toHaveValue(''));
+    await waitFor(() => {
+      const latestFeedRequest = requests.filter(({ url }) => url.includes('/feed?')).at(-1)?.url;
+      expect(latestFeedRequest).not.toContain('topicId=topic-1');
+    });
+  });
+
+  it('explains a blocked trend-capable refresh and lets the user retry status loading', async () => {
+    installFetchMock({ trendStatusFailures: 1, feed: [feedItem('today', 'trend')] });
+    renderApp('/');
+
+    expect(await screen.findByText('趋势状态无法加载')).toBeVisible();
+    const refresh = screen.getByRole('button', { name: '刷新发现' });
+    expect(refresh).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '重试趋势状态' }));
+    await waitFor(() => expect(refresh).toBeEnabled());
+  });
+
+  it('keeps the Feed visible and offers synchronization retry after cache refresh fails', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent')],
+      feed: [feedItem('existing', 'topic')],
+      topicCompletionCount: 2,
+      feedRefetchFailures: 1,
+    });
+    renderApp('/');
+    expect(await screen.findByText('发现 existing')).toBeVisible();
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新发现' }));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+
+    expect(screen.getByText('发现 existing')).toBeVisible();
+    expect(screen.getByLabelText('刷新结果')).toHaveTextContent('刷新结果已生成，但发现内容尚未同步');
+    const retry = screen.getByRole('button', { name: '重试同步' });
+    expect(retry).toBeEnabled();
+
+    fireEvent.click(retry);
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByLabelText('刷新结果')).toHaveTextContent('刷新完成，新增 2 条内容');
+  });
+
+  it('shares one Topic poll and retains both concurrent keyed results', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent'), topic('topic-2', 'TypeScript')],
+      topicCompletionCount: 2,
+    });
     renderApp('/topics');
+    await screen.findByText('AI Agent');
+    await screen.findByText('TypeScript');
+    const topicGetsBeforeRefresh = requests.filter(({ url, method }) => url.endsWith('/topics') && method === 'GET').length;
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新 AI Agent' }));
+    fireEvent.click(screen.getByRole('button', { name: '刷新 TypeScript' }));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+
+    const topicGetsAfterRefresh = requests.filter(({ url, method }) => url.endsWith('/topics') && method === 'GET').length;
+    expect(topicGetsAfterRefresh - topicGetsBeforeRefresh).toBe(1);
+    const liveRegion = screen.getByLabelText('刷新结果');
+    expect(liveRegion).toHaveTextContent('AI Agent：刷新完成，新增 2 条内容');
+    expect(liveRegion).toHaveTextContent('TypeScript：刷新完成，新增 2 条内容');
+    expect(screen.getByRole('button', { name: '刷新 AI Agent' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '刷新 TypeScript' })).toBeEnabled();
+  });
+
+  it('uses only the manager Topic poll across multiple nonterminal intervals', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent')],
+      topicCompletionAfterPolls: 4,
+    });
+    renderApp('/topics');
+    await screen.findByText('AI Agent');
+    const topicGetsBeforeRefresh = requests.filter(({ url, method }) => url.endsWith('/topics') && method === 'GET').length;
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新 AI Agent' }));
+    await act(async () => Promise.resolve());
+    for (let interval = 1; interval <= 3; interval += 1) {
+      await act(async () => vi.advanceTimersByTimeAsync(1_500));
+      const topicGets = requests.filter(({ url, method }) => url.endsWith('/topics') && method === 'GET').length;
+      expect(topicGets - topicGetsBeforeRefresh).toBe(interval);
+      expect(screen.getByRole('button', { name: '刷新 AI Agent' })).toBeDisabled();
+    }
+  });
+
+  it('preserves background Topic polling when there is no manual refresh session', async () => {
+    vi.useFakeTimers();
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent', runSummary('scheduled-running', 'running'))],
+    });
+    renderApp('/topics');
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(screen.getByText('AI Agent')).toBeVisible();
+    const topicGetsBeforeInterval = requests.filter(({ url, method }) => url.endsWith('/topics') && method === 'GET').length;
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    const topicGetsAfterInterval = requests.filter(({ url, method }) => url.endsWith('/topics') && method === 'GET').length;
+    expect(topicGetsAfterInterval - topicGetsBeforeInterval).toBe(1);
+  });
+
+  it('keeps a Topic row locked on stale synchronization and retries it explicitly', async () => {
+    installFetchMock({ topics: [topic('topic-1', 'AI Agent')], topicCompletionCount: 2 });
+    const { client } = renderApp('/topics');
+    await screen.findByText('AI Agent');
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+      .mockRejectedValueOnce(new Error('cache offline'))
+      .mockResolvedValueOnce(undefined);
+    vi.useFakeTimers();
+
+    const refresh = screen.getByRole('button', { name: '刷新 AI Agent' });
+    fireEvent.click(refresh);
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    expect(refresh).toBeDisabled();
+    expect(screen.getByLabelText('刷新结果')).toHaveTextContent('AI Agent：刷新结果已生成，但发现内容尚未同步');
+    const retry = screen.getByRole('button', { name: '重试同步 AI Agent' });
+    fireEvent.click(retry);
+    await act(async () => Promise.resolve());
+
+    expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(refresh).toBeEnabled();
+    expect(screen.getByLabelText('刷新结果')).toHaveTextContent('AI Agent：刷新完成，新增 2 条内容');
+  });
+
+  it('disables and spins only the clicked Topic row while preserving other actions', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent'), topic('topic-2', 'TypeScript')],
+      topicCompletionCount: 2,
+    });
+    renderApp('/topics');
+    await screen.findByText('AI Agent');
+    vi.useFakeTimers();
+
+    const first = screen.getByRole('button', { name: '刷新 AI Agent' });
+    const second = screen.getByRole('button', { name: '刷新 TypeScript' });
+    fireEvent.click(first);
+
+    expect(first).toBeDisabled();
+    expect(first.querySelector('svg')).toHaveClass('spin');
+    expect(second).toBeEnabled();
+    expect(second.querySelector('svg')).not.toHaveClass('spin');
+
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(screen.getByLabelText('刷新结果')).toHaveTextContent('刷新完成，新增 2 条内容');
+  });
+
+  it('retains and announces keyed completion messages across sequential Topic rows', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent'), topic('topic-2', 'TypeScript')],
+      topicCompletionCount: 2,
+    });
+    renderApp('/topics');
+    await screen.findByText('AI Agent');
+    const liveRegion = screen.getByLabelText('刷新结果');
+    vi.useFakeTimers();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新 AI Agent' }));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(liveRegion).toHaveTextContent('AI Agent：刷新完成，新增 2 条内容');
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新 TypeScript' }));
+    expect(liveRegion).toHaveTextContent('AI Agent：刷新完成，新增 2 条内容');
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+
+    expect(screen.getByLabelText('刷新结果')).toBe(liveRegion);
+    expect(liveRegion).toHaveTextContent('AI Agent：刷新完成，新增 2 条内容');
+    expect(liveRegion).toHaveTextContent('TypeScript：刷新完成，新增 2 条内容');
+    expect(requests.filter(({ url, method }) => url.includes('/topics/') && method === 'POST')).toHaveLength(2);
+  });
+
+  it('submits one keyword and keeps schedule, expanded terms, errors, and source status', async () => {
+    const created = topic('topic-created', 'AI Agent', runSummary('initial', 'queued'));
+    const existing = {
+      ...topic('topic-1', 'TypeScript'),
+      lastError: { code: 'AI_NOT_CONFIGURED', message: '尚未配置 OpenRouter Key' },
+    };
+    installFetchMock({
+      topics: [existing],
+      created,
+      sources: [
+        { id: 'hacker-news', label: 'Hacker News', category: 'community', status: 'enabled' },
+        { id: 'twitterapi-io', label: 'X', category: 'social', status: 'not_configured' },
+      ],
+    });
+    renderApp('/topics');
+
     fireEvent.change(screen.getByLabelText('主题关键词'), { target: { value: 'AI Agent' } });
     fireEvent.click(screen.getByRole('button', { name: '创建主题' }));
-    await waitFor(() => expect(requests.find((request) => request.url.endsWith('/topics') && request.body)?.body).toEqual({ keyword: 'AI Agent' }));
-    expect(await screen.findByText('AI Agent')).toBeVisible();
-  });
-
-  it('shows AI_NOT_CONFIGURED without losing existing content', async () => {
-    installFetchMock([{
-      id: 'topic-1', userId: 'user-a', keyword: 'AI Agent', expandedTerms: [],
-      createdAt: '2026-07-24T07:00:00.000Z', lastRunAt: '2026-07-24T08:00:00.000Z',
-      nextRunAt: '2026-07-24T20:00:00.000Z', scheduleIntervalHours: 12,
-      runStatus: 'failed', lastError: { code: 'AI_NOT_CONFIGURED', message: '尚未配置 OpenRouter Key' },
-    }], [discoveryItem]);
-    renderApp('/');
-    expect(await screen.findByText('尚未配置 OpenRouter Key')).toBeVisible();
-    expect(screen.getByText(discoveryItem.title)).toBeVisible();
-  });
-
-  it('switches between recent and all retained history', async () => {
-    installFetchMock([], [discoveryItem]);
-    renderApp('/');
-
-    expect(await screen.findByText('X')).toBeVisible();
-    fireEvent.click(screen.getByRole('button', { name: '全部历史' }));
-
-    await waitFor(() => expect(requests.some((request) => (
-      request.url.includes('/feed?') && request.url.includes('range=all')
-    ))).toBe(true));
-  });
-
-  it('shows automatic schedule and safe connector states', async () => {
-    installFetchMock([{
-      id: 'topic-1', userId: 'user-a', keyword: 'AI Agent', expandedTerms: [],
-      createdAt: '2026-07-24T07:00:00.000Z', lastRunAt: '2026-07-24T08:00:00.000Z',
-      nextRunAt: '2026-07-28T08:00:00.000Z', scheduleIntervalHours: 12,
-      runStatus: 'succeeded', lastError: null,
-    }], [], undefined, [
-      { id: 'hacker-news', label: 'Hacker News', category: 'community', status: 'enabled' },
-      { id: 'twitterapi-io', label: 'X', category: 'social', status: 'not_configured' },
-    ]);
-    renderApp('/topics');
-
-    expect(await screen.findByText(/每 12 小时/)).toBeVisible();
-    expect(screen.getByText(/下次自动更新/)).toBeVisible();
+    await waitFor(() => expect(requests.find(({ url, method }) => (
+      url.endsWith('/topics') && method === 'POST'
+    ))?.body).toEqual({ keyword: 'AI Agent' }));
+    expect((await screen.findAllByText(/每 12 小时/)).length).toBeGreaterThan(0);
+    expect(screen.getByText('TypeScript news')).toBeVisible();
+    expect(screen.getByText('尚未配置 OpenRouter Key')).toBeVisible();
     expect(await screen.findByText('Hacker News')).toBeVisible();
     expect(screen.getByText('已启用')).toBeVisible();
     expect(screen.getByText('待配置')).toBeVisible();
+  });
+
+  it('defines stable refresh dimensions and a static reduced-motion state', () => {
+    const css = readFileSync('apps/web/src/styles.css', 'utf8');
+    expect(css).toMatch(/\.refresh-button\s*\{[^}]*width:\s*38px;[^}]*height:\s*38px;/s);
+    expect(css).toMatch(/\.pull-indicator\s*\{[^}]*height:\s*32px;/s);
+    expect(css).toContain('@keyframes refresh-spin');
+    expect(css).toMatch(/prefers-reduced-motion:\s*reduce[\s\S]*\.spin\s*\{[^}]*animation:\s*none/s);
   });
 });

@@ -90,6 +90,7 @@ function setup(overrides: Partial<RefreshCoordinatorOptions> = {}, strict = fals
     pollIntervalMs: 1_500,
     maxConsecutivePollFailures: 2,
     confirmationTimeoutMs: 60_000,
+    synchronizationTimeoutMs: 2_000,
     ...overrides,
   };
   const wrapper = strict
@@ -394,9 +395,42 @@ describe('useRefreshCoordinator', () => {
     expect(refetchTrendStatus).not.toHaveBeenCalled();
   });
 
-  it('finalizes and allows another start when Feed invalidation never settles', async () => {
-    const never = new Promise<never>(() => undefined);
-    const invalidateFeed = vi.fn(() => never);
+  it('waits for Feed synchronization before reporting normal completion', async () => {
+    let resolveSynchronization!: () => void;
+    const invalidateFeed = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSynchronization = resolve;
+    }));
+    const harness = setup({
+      topics: [topic('topic-1')],
+      selectedTopicId: 'topic-1',
+      invalidateFeed,
+    });
+    const completion = begin(harness.result);
+    let settled = false;
+    void completion.then(() => { settled = true; });
+    await act(async () => Promise.resolve());
+    harness.setSnapshots([topic('topic-1', run('first-run', 'succeeded', undefined, 2))], trend());
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    expect(invalidateFeed).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+    expect(harness.result.current).toMatchObject({ active: true, synchronizing: true });
+    expect(harness.result.current.notification).toBeNull();
+
+    await act(async () => resolveSynchronization());
+    await expect(completion).resolves.toMatchObject({ message: '刷新完成，新增 2 条内容' });
+    expect(harness.result.current).toMatchObject({
+      active: false,
+      synchronizing: false,
+      synchronizationStale: false,
+    });
+  });
+
+  it('exposes retryable stale synchronization and restores the exact outcome after retry', async () => {
+    const invalidateFeed = vi.fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error('cache offline'))
+      .mockResolvedValueOnce(undefined);
     const harness = setup({
       topics: [topic('topic-1')],
       selectedTopicId: 'topic-1',
@@ -404,17 +438,59 @@ describe('useRefreshCoordinator', () => {
     });
     const completion = begin(harness.result);
     await act(async () => Promise.resolve());
-    harness.setSnapshots([topic('topic-1', run('first-run', 'succeeded'))], trend());
+    harness.setSnapshots([topic('topic-1', run('first-run', 'succeeded', undefined, 2))], trend());
 
     await act(async () => vi.advanceTimersByTimeAsync(1_500));
 
+    await expect(completion).resolves.toMatchObject({
+      kind: 'warning',
+      message: '刷新结果已生成，但发现内容尚未同步',
+    });
+    expect(harness.result.current).toMatchObject({
+      active: false,
+      synchronizing: false,
+      synchronizationStale: true,
+    });
+
+    let retried = false;
+    await act(async () => { retried = await harness.result.current.retrySynchronization(); });
+
+    expect(retried).toBe(true);
+    expect(invalidateFeed).toHaveBeenCalledTimes(2);
+    expect(harness.result.current.synchronizationStale).toBe(false);
+    expect(harness.result.current.notification).toMatchObject({
+      kind: 'success',
+      message: '刷新完成，新增 2 条内容',
+    });
+  });
+
+  it('times out hanging Feed synchronization and allows another refresh', async () => {
+    const never = new Promise<never>(() => undefined);
+    const invalidateFeed = vi.fn(() => never);
+    const harness = setup({
+      topics: [topic('topic-1')],
+      selectedTopicId: 'topic-1',
+      invalidateFeed,
+      synchronizationTimeoutMs: 2_000,
+    });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+    harness.setSnapshots([topic('topic-1', run('first-run', 'succeeded'))], trend());
+
+    await act(async () => vi.advanceTimersByTimeAsync(3_500));
+
     expect(invalidateFeed).toHaveBeenCalledTimes(1);
     expect(harness.result.current.active).toBe(false);
-    await expect(completion).resolves.toMatchObject({ message: '刷新完成，暂无新增内容' });
+    expect(harness.result.current.synchronizationStale).toBe(true);
+    await expect(completion).resolves.toMatchObject({
+      message: '刷新结果已生成，但发现内容尚未同步',
+    });
 
     void begin(harness.result);
     await act(async () => Promise.resolve());
     expect(harness.options.refreshTopic).toHaveBeenCalledTimes(2);
+    expect(harness.result.current.synchronizationStale).toBe(false);
+    await expect(harness.result.current.retrySynchronization()).resolves.toBe(false);
   });
 
   it('contains synchronous polling throws and terminates safely', async () => {
