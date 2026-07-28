@@ -23,6 +23,66 @@ describe('configuration', () => {
     });
   });
 
+  it('provides safe trend monitor defaults', () => {
+    expect(parseConfig({})).toMatchObject({
+      TREND_MONITOR_ENABLED: true,
+      TREND_INTERVAL_HOURS: 4,
+      TREND_X_WOEIDS: [1],
+      TREND_YOUTUBE_REGION: 'US',
+      TREND_REDDIT_COMMUNITIES: [
+        'MachineLearning',
+        'LocalLLaMA',
+        'programming',
+        'technology',
+      ],
+      TREND_GOOGLE_RSS_URLS: [],
+    });
+  });
+
+  it('parses explicit trend monitor configuration', () => {
+    expect(parseConfig({
+      TREND_MONITOR_ENABLED: 'false',
+      TREND_INTERVAL_HOURS: '12',
+      TREND_X_WOEIDS: '1, 23424977',
+      TREND_YOUTUBE_REGION: 'CA',
+      TREND_REDDIT_COMMUNITIES: 'MachineLearning, tech-news, local_ai',
+      TREND_GOOGLE_RSS_URLS: 'https://example.com/trends.xml, https://example.org/rss',
+    })).toMatchObject({
+      TREND_MONITOR_ENABLED: false,
+      TREND_INTERVAL_HOURS: 12,
+      TREND_X_WOEIDS: [1, 23424977],
+      TREND_YOUTUBE_REGION: 'CA',
+      TREND_REDDIT_COMMUNITIES: ['MachineLearning', 'tech-news', 'local_ai'],
+      TREND_GOOGLE_RSS_URLS: [
+        'https://example.com/trends.xml',
+        'https://example.org/rss',
+      ],
+    });
+  });
+
+  it('rejects trend intervals outside the configured bounds', () => {
+    expect(() => parseConfig({ TREND_INTERVAL_HOURS: '1' })).toThrow();
+    expect(() => parseConfig({ TREND_INTERVAL_HOURS: '25' })).toThrow();
+  });
+
+  it.each(['0', '-1', '1.5', 'worldwide', '1,0'])('rejects invalid trend WOEIDs: %s', (value) => {
+    expect(() => parseConfig({ TREND_X_WOEIDS: value })).toThrow();
+  });
+
+  it.each(['us', 'USA', 'U1', ' U S '])('rejects invalid YouTube region codes: %s', (value) => {
+    expect(() => parseConfig({ TREND_YOUTUBE_REGION: value })).toThrow();
+  });
+
+  it('rejects Reddit community paths', () => {
+    expect(() => parseConfig({ TREND_REDDIT_COMMUNITIES: 'r/programming' })).toThrow();
+    expect(() => parseConfig({ TREND_REDDIT_COMMUNITIES: 'programming/news' })).toThrow();
+  });
+
+  it('rejects non-HTTPS trend RSS URLs', () => {
+    expect(() => parseConfig({ TREND_GOOGLE_RSS_URLS: 'http://example.com/trends.xml' })).toThrow();
+    expect(() => parseConfig({ TREND_GOOGLE_RSS_URLS: 'ftp://example.com/trends.xml' })).toThrow();
+  });
+
   it('defaults to OpenRouter auto routing and web search', () => {
     expect(parseConfig({ NODE_ENV: 'development', AI_API_KEY: 'secret' })).toMatchObject({
       AI_API_KEY: 'secret',

@@ -17,6 +17,32 @@ const rssFeedUrls = z.preprocess(
   z.array(z.url()).default([]),
 );
 
+const trendWoeids = z.preprocess(
+  (value) => typeof value === 'string'
+    ? value.split(',').map((woeid) => woeid.trim()).filter(Boolean)
+    : value,
+  z.array(z.coerce.number().int().positive()).min(1).default([1]),
+);
+
+const trendRedditCommunities = z.preprocess(
+  (value) => typeof value === 'string'
+    ? value.split(',').map((community) => community.trim()).filter(Boolean)
+    : value,
+  z.array(z.string().regex(/^[A-Za-z0-9_-]+$/)).min(1).default([
+    'MachineLearning',
+    'LocalLLaMA',
+    'programming',
+    'technology',
+  ]),
+);
+
+const trendGoogleRssUrls = z.preprocess(
+  (value) => typeof value === 'string'
+    ? value.split(',').map((url) => url.trim()).filter(Boolean)
+    : value,
+  z.array(z.url().refine((url) => new URL(url).protocol === 'https:')).default([]),
+);
+
 const baseConfigSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
@@ -52,6 +78,15 @@ const baseConfigSchema = z.object({
     .enum(['true', 'false'])
     .default('true')
     .transform((value) => value === 'true'),
+  TREND_MONITOR_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  TREND_INTERVAL_HOURS: z.coerce.number().int().min(2).max(24).default(4),
+  TREND_X_WOEIDS: trendWoeids,
+  TREND_YOUTUBE_REGION: z.string().regex(/^[A-Z]{2}$/).default('US'),
+  TREND_REDDIT_COMMUNITIES: trendRedditCommunities,
+  TREND_GOOGLE_RSS_URLS: trendGoogleRssUrls,
   RUN_LIVE_AI_TESTS: z
     .enum(['0', '1'])
     .default('0')
