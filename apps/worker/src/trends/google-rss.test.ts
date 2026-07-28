@@ -53,6 +53,7 @@ describe('GoogleRssTrendSource', () => {
       <rss xmlns:ht="https://trends.google.com/trending/rss" version="2.0"><channel>
         <item><title>AI Agents</title><ht:approx_traffic>200+</ht:approx_traffic><link>https://trends.google.com/trending/rss?geo=US</link><pubDate>Mon, 27 Jul 2026 12:00:00 GMT</pubDate></item>
         <item><title>Local Models</title><ht:approx_traffic>500+</ht:approx_traffic><link>https://trends.google.com/trending/rss?geo=US</link><pubDate>Mon, 27 Jul 2026 13:00:00 GMT</pubDate></item>
+        <item><title>${'x'.repeat(501)}</title><link>https://trends.google.com/trending/rss?geo=US</link><pubDate>Mon, 27 Jul 2026 14:00:00 GMT</pubDate></item>
       </channel></rss>`;
     const source = sourceWith(
       ['https://trends.google.com/trending/rss?geo=US'],
@@ -69,6 +70,24 @@ describe('GoogleRssTrendSource', () => {
       'https://trends.google.com/trends/explore?geo=US&q=AI+Agents',
       'https://trends.google.com/trends/explore?geo=US&q=Local+Models',
     ]);
+  });
+
+  it('decodes only predefined and numeric XML references for title identity and URL', async () => {
+    const xml = `<?xml version="1.0"?><rss version="2.0"><channel>
+      <item><title>R&amp;D &#x1F680;</title><link>https://trends.google.com/trending/rss?geo=US</link><pubDate>Mon, 27 Jul 2026 12:00:00 GMT</pubDate></item>
+    </channel></rss>`;
+    const source = sourceWith(
+      ['https://trends.google.com/trending/rss?geo=US'],
+      vi.fn().mockResolvedValue(xmlResponse(xml)) as typeof fetch,
+    );
+
+    const result = await source.collect(window, new AbortController().signal);
+
+    expect(result.candidates[0]).toMatchObject({
+      title: 'R&D 🚀',
+      externalId: 'US:r&d 🚀',
+    });
+    expect(new URL(result.candidates[0]!.url).searchParams.get('q')).toBe('R&D 🚀');
   });
 
   it('is enabled only for configured HTTPS feeds', () => {
@@ -106,6 +125,19 @@ describe('GoogleRssTrendSource', () => {
       code: 'TREND_SOURCE_RESPONSE_INVALID',
     });
     expect(redirectRequest).toHaveBeenCalledOnce();
+
+    const downgradeResponse = new Response('', {
+      status: 302,
+      headers: { location: 'http://example.com/feed.xml' },
+    });
+    const cancel = vi.spyOn(downgradeResponse.body!, 'cancel');
+    const downgradeRequest = vi.fn().mockResolvedValue(downgradeResponse);
+    const downgrade = sourceWith(['https://example.com/feed.xml'], downgradeRequest as typeof fetch);
+    await expect(downgrade.collect(window, new AbortController().signal)).rejects.toMatchObject({
+      code: 'TREND_SOURCE_RESPONSE_INVALID',
+    });
+    expect(downgradeRequest).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('rejects oversized XML and maps 429 without exposing response bodies', async () => {

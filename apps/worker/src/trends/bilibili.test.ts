@@ -16,6 +16,12 @@ describe('BilibiliTrendSource', () => {
       bvid: 123, title: 'Malformed sibling', pubdate: 1785196800,
     }, {
       bvid: 'BV1blank', title: '  ', pubdate: 1785196800,
+    }, {
+      bvid: 'BV1extreme', title: 'Extreme date', pubdate: Number.MAX_SAFE_INTEGER,
+    }, {
+      bvid: `BV${'x'.repeat(501)}`, title: 'Overlong ID', pubdate: 1785196800,
+    }, {
+      bvid: 'BV1longtitle', title: 'x'.repeat(501), pubdate: 1785196800,
     }] } }), { status: 200 }));
     const signal = new AbortController().signal;
 
@@ -23,7 +29,7 @@ describe('BilibiliTrendSource', () => {
 
     expect(fetcher).toHaveBeenCalledWith(
       'https://api.bilibili.com/x/web-interface/popular?pn=1&ps=20',
-      { headers: { accept: 'application/json', 'user-agent': 'LetterMate/0.1' }, signal },
+      { headers: { accept: 'application/json', 'user-agent': 'LetterMate/0.1' }, redirect: 'error', signal },
     );
     expect(result).toEqual({ requestCount: 1, candidates: [{
       sourceId: 'bilibili-trends', platform: 'Bilibili', externalId: 'BV1xx411c7mD',

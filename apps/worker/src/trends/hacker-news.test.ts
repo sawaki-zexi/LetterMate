@@ -26,7 +26,7 @@ describe('HackerNewsTrendSource', () => {
       'https://hacker-news.firebaseio.com/v0/item/101.json',
       'https://hacker-news.firebaseio.com/v0/item/102.json',
     ]);
-    expect(fetcher.mock.calls.every(([, init]) => init.signal === signal)).toBe(true);
+    expect(fetcher.mock.calls.every(([, init]) => init.signal === signal && init.redirect === 'error')).toBe(true);
     expect(result).toEqual({ requestCount: 3, candidates: [
       { sourceId: 'hacker-news-trends', platform: 'Hacker News', externalId: '101', title: 'A new runtime', url: 'https://example.com/runtime', publishedAt: '2026-07-28T00:00:00.000Z' },
       { sourceId: 'hacker-news-trends', platform: 'Hacker News', externalId: '102', title: 'Ask HN: local agents?', url: 'https://news.ycombinator.com/item?id=102', publishedAt: '2026-07-28T00:01:00.000Z' },
@@ -53,6 +53,24 @@ describe('HackerNewsTrendSource', () => {
     });
     const malformed = new HackerNewsTrendSource(vi.fn().mockResolvedValue(new Response(JSON.stringify({ ids: [1] }), { status: 200 })) as typeof fetch);
     await expect(malformed.collect(window, new AbortController().signal)).rejects.toMatchObject({ code: 'TREND_SOURCE_RESPONSE_INVALID' });
+  });
+
+  it('skips extreme dates and overlong fields while keeping a valid sibling', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify([1, 2, 3, 4]), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1, type: 'story', title: 'Extreme', time: Number.MAX_SAFE_INTEGER }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 2, type: 'story', title: 'x'.repeat(501), time: 1785196800 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 3, type: 'story', title: 'Long URL', url: `https://example.com/${'x'.repeat(2_100)}`, time: 1785196800 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 4, type: 'story', title: 'Valid sibling', time: 1785196800 }), { status: 200 }));
+    const result = await new HackerNewsTrendSource(fetcher as typeof fetch).collect(
+      { ...window, requestBudget: 5 }, new AbortController().signal,
+    );
+
+    expect(result.candidates).toEqual([{
+      sourceId: 'hacker-news-trends', platform: 'Hacker News', externalId: '4',
+      title: 'Valid sibling', url: 'https://news.ycombinator.com/item?id=4',
+      publishedAt: '2026-07-28T00:00:00.000Z',
+    }]);
   });
 
   it('rejects an oversized JSON response before parsing it', async () => {

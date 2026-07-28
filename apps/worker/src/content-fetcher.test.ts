@@ -23,6 +23,23 @@ describe('ContentFetcher', () => {
     expect(request.mock.calls[0]![1]).toMatchObject({ redirect: 'manual' });
   });
 
+  it('rejects a raw-text redirect that downgrades an HTTPS-only policy before a second request', async () => {
+    const redirect = new Response('', {
+      status: 302,
+      headers: { location: 'http://example.com/feed.xml' },
+    });
+    const cancel = vi.spyOn(redirect.body!, 'cancel');
+    const request = vi.fn().mockResolvedValue(redirect);
+    const fetcher = new ContentFetcher({ resolveHostname: publicResolver }, request as typeof fetch);
+
+    await expect(fetcher.fetchRawText('https://example.com/feed.xml', {
+      acceptedContentTypes: ['application/rss+xml'],
+      allowedProtocols: ['https:'],
+    })).rejects.toMatchObject({ code: 'UNSAFE_SOURCE_URL' });
+    expect(request).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it('extracts substantive HTML text and removes navigation noise', async () => {
     const fetcher = new ContentFetcher({ resolveHostname: publicResolver }, vi.fn().mockResolvedValue(
       makeResponse('<html><head><title>Article</title><script>bad()</script></head><body><nav>Menu</nav><main><h1>Article</h1><p>Substantive body text.</p></main><form>Ads</form></body></html>'),

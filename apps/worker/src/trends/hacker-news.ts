@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createTrendCandidate, isoFromUnixSeconds } from './candidate.js';
 import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
@@ -45,14 +46,18 @@ export class HackerNewsTrendSource implements TrendSource {
           url = parsedUrl.toString();
         } catch { continue; }
       }
-      candidates.push({
+      const publishedAt = isoFromUnixSeconds(story.time);
+      if (publishedAt === null) continue;
+      const candidate = createTrendCandidate({
         sourceId: this.id,
         platform: this.label,
         externalId: String(story.id),
         title,
         url,
-        publishedAt: new Date(story.time * 1_000).toISOString(),
+        publishedAt,
       });
+      if (!candidate) continue;
+      candidates.push(candidate);
       if (candidates.length >= window.maxCandidates) break;
     }
     return { candidates, requestCount };
@@ -60,7 +65,7 @@ export class HackerNewsTrendSource implements TrendSource {
 
   private async request(url: string, signal: AbortSignal): Promise<unknown> {
     let response: Response;
-    try { response = await this.fetcher(url, { signal }); }
+    try { response = await this.fetcher(url, { redirect: 'error', signal }); }
     catch {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'Hacker News collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Hacker News is temporarily unavailable', true);

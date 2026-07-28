@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MAX_TREND_EXTERNAL_ID_LENGTH, MAX_TREND_TITLE_LENGTH, MAX_TREND_URL_LENGTH } from './candidate.js';
 import {
   TrendSourceError,
   type TrendCollectionSummary,
@@ -22,9 +23,9 @@ const isoTimestamp = z.string().refine((value) => {
 const candidateSchema = z.object({
   sourceId: z.string().trim().min(1).max(100),
   platform: z.string().trim().min(1).max(100),
-  externalId: z.string().trim().min(1).max(500),
-  title: z.string().trim().min(1).max(500),
-  url: z.string().trim().min(1),
+  externalId: z.string().trim().min(1).max(MAX_TREND_EXTERNAL_ID_LENGTH),
+  title: z.string().trim().min(1).max(MAX_TREND_TITLE_LENGTH),
+  url: z.string().trim().min(1).max(MAX_TREND_URL_LENGTH),
   publishedAt: isoTimestamp.nullable(),
 }).strict();
 
@@ -255,8 +256,11 @@ export class TrendSourceRegistry {
       const result = results[index];
       const accountedCount = accountedCounts[index] ?? 0;
       if (accountedCount > 0 || result) requestCounts[source.id] = accountedCount;
+      if (result) successfulSourceIds.push(source.id);
+    }
+    for (const { index } of allocations) {
+      const result = results[index];
       if (result) {
-        successfulSourceIds.push(source.id);
         queues.push([...result.candidates]);
       }
     }

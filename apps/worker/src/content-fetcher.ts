@@ -16,6 +16,7 @@ export interface FetchedText { finalUrl: string; title: string | null; text: str
 export interface FetchedRawText { finalUrl: string; text: string; contentType: string }
 export interface RawTextFetchOptions {
   acceptedContentTypes: readonly string[];
+  allowedProtocols?: readonly ('http:' | 'https:')[];
   signal?: AbortSignal;
   onRequest?: () => void;
 }
@@ -54,12 +55,14 @@ export class ContentFetcher {
   async fetchRawText(inputUrl: string, options: RawTextFetchOptions): Promise<FetchedRawText> {
     if (options.acceptedContentTypes.length === 0) throw new Error('acceptedContentTypes must not be empty');
     const acceptedContentTypes = new Set(options.acceptedContentTypes.map((value) => value.toLowerCase()));
+    const allowedProtocols = new Set(options.allowedProtocols ?? ['http:', 'https:']);
+    if (allowedProtocols.size === 0) throw new Error('allowedProtocols must not be empty');
     const parentSignal = options.signal;
     let current = inputUrl; const visited = new Set<string>();
     for (let redirects = 0; redirects <= this.maxRedirects; redirects += 1) {
       if (visited.has(current)) throw new ContentFetchError('TOO_MANY_REDIRECTS', 'Source redirect loop detected');
       visited.add(current);
-      const target = await this.assertSafeUrl(current);
+      const target = await this.assertSafeUrl(current, allowedProtocols);
       const controller = new AbortController();
       let timedOut = false;
       const abort = () => controller.abort();
@@ -115,10 +118,10 @@ export class ContentFetcher {
     throw new ContentFetchError('TOO_MANY_REDIRECTS', 'Source has too many redirects');
   }
 
-  private async assertSafeUrl(value: string): Promise<SafeTarget> {
+  private async assertSafeUrl(value: string, allowedProtocols: ReadonlySet<string>): Promise<SafeTarget> {
     let url: URL; try { url = new URL(value); } catch { throw new ContentFetchError('UNSAFE_SOURCE_URL', 'Source URL is invalid'); }
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || unsafeHostname.has(hostname.toLowerCase())) throw new ContentFetchError('UNSAFE_SOURCE_URL', 'Source URL is not public HTTP(S)');
+    if (!allowedProtocols.has(url.protocol) || url.username || url.password || unsafeHostname.has(hostname.toLowerCase())) throw new ContentFetchError('UNSAFE_SOURCE_URL', 'Source URL is not public HTTP(S)');
     let addresses: string[];
     if (isIP(hostname)) addresses = [hostname];
     else {

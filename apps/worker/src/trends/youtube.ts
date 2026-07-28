@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createTrendCandidate } from './candidate.js';
 import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
@@ -72,7 +73,7 @@ export class YouTubeTrendSource implements TrendSource {
       const item = itemResult.data;
       const title = item.snippet.title.trim();
       if (!title) continue;
-      candidates.push({
+      const candidate = createTrendCandidate({
         sourceId: this.id,
         platform: this.label,
         externalId: item.id,
@@ -80,6 +81,8 @@ export class YouTubeTrendSource implements TrendSource {
         url: `https://www.youtube.com/watch?v=${item.id}`,
         publishedAt: item.snippet.publishedAt,
       });
+      if (!candidate) continue;
+      candidates.push(candidate);
       if (candidates.length >= window.maxCandidates) break;
     }
     return { candidates, requestCount: 1 };
@@ -87,7 +90,7 @@ export class YouTubeTrendSource implements TrendSource {
 
   private async request(url: string, signal: AbortSignal): Promise<unknown> {
     let response: Response;
-    try { response = await this.fetcher(url, { signal }); }
+    try { response = await this.fetcher(url, { redirect: 'error', signal }); }
     catch {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'YouTube collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'YouTube is temporarily unavailable', true);

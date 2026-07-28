@@ -1,5 +1,6 @@
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { ContentFetchError, ContentFetcher } from '../content-fetcher.js';
+import { createTrendCandidate } from './candidate.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 type XmlObject = Record<string, unknown>;
@@ -10,15 +11,40 @@ const parser = new XMLParser({
   parseTagValue: false,
   processEntities: false,
 });
+const predefinedEntities: Record<string, string> = {
+  '&amp;': '&',
+  '&lt;': '<',
+  '&gt;': '>',
+  '&quot;': '"',
+  '&apos;': "'",
+};
+const decodeSafeXmlReferences = (value: string): string => value.replace(
+  /&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9A-Fa-f]+);/g,
+  (reference) => {
+    const predefined = predefinedEntities[reference];
+    if (predefined !== undefined) return predefined;
+    const hexadecimal = reference.startsWith('&#x');
+    const codePoint = Number.parseInt(reference.slice(hexadecimal ? 3 : 2, -1), hexadecimal ? 16 : 10);
+    if (
+      !Number.isInteger(codePoint) ||
+      codePoint < 1 ||
+      codePoint > 0x10FFFF ||
+      (codePoint >= 0xD800 && codePoint <= 0xDFFF)
+    ) return '\uFFFD';
+    return String.fromCodePoint(codePoint);
+  },
+);
 const asObject = (value: unknown): XmlObject | null => typeof value === 'object' && value !== null && !Array.isArray(value)
   ? value as XmlObject : null;
 const asArray = (value: unknown): unknown[] => value === undefined ? [] : Array.isArray(value) ? value : [value];
 const asText = (value: unknown): string | null => {
-  if (typeof value === 'string') return value.trim() || null;
+  if (typeof value === 'string') return decodeSafeXmlReferences(value).trim() || null;
   const object = asObject(value);
   if (!object) return null;
   for (const key of ['#text', '@_href']) {
-    if (typeof object[key] === 'string' && object[key].trim()) return object[key].trim();
+    if (typeof object[key] === 'string' && object[key].trim()) {
+      return decodeSafeXmlReferences(object[key]).trim();
+    }
   }
   return null;
 };
@@ -102,6 +128,7 @@ export class GoogleRssTrendSource implements TrendSource {
           'application/xml',
           'text/xml',
         ],
+        allowedProtocols: ['https:'],
         onRequest: () => {
           recordRegistryRequest?.();
           requestCount += 1;
@@ -150,7 +177,7 @@ export class GoogleRssTrendSource implements TrendSource {
       const exploreUrl = new URL('https://trends.google.com/trends/explore');
       exploreUrl.searchParams.set('q', title);
       if (geo) exploreUrl.searchParams.set('geo', geo);
-      candidates.push({
+      const candidate = createTrendCandidate({
         sourceId: this.id,
         platform: this.label,
         externalId: asText(item.guid) ?? `${geo ?? 'GLOBAL'}:${normalizedIdentityTitle(title)}`,
@@ -158,6 +185,8 @@ export class GoogleRssTrendSource implements TrendSource {
         url: exploreUrl.toString(),
         publishedAt: isoDate(asText(item.pubDate) ?? asText(item.published) ?? asText(item.date)),
       });
+      if (!candidate) continue;
+      candidates.push(candidate);
       if (candidates.length >= limit) break;
     }
     return candidates;

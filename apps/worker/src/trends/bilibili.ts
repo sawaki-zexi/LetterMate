@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createTrendCandidate, isoFromUnixSeconds } from './candidate.js';
 import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
@@ -47,14 +48,18 @@ export class BilibiliTrendSource implements TrendSource {
       const item = itemResult.data;
       const title = cleanTitle(item.title);
       if (!title) continue;
-      candidates.push({
+      const publishedAt = item.pubdate === 0 ? null : isoFromUnixSeconds(item.pubdate);
+      if (item.pubdate !== 0 && publishedAt === null) continue;
+      const candidate = createTrendCandidate({
         sourceId: this.id,
         platform: this.label,
         externalId: item.bvid,
         title,
         url: `https://www.bilibili.com/video/${item.bvid}`,
-        publishedAt: item.pubdate === 0 ? null : new Date(item.pubdate * 1_000).toISOString(),
+        publishedAt,
       });
+      if (!candidate) continue;
+      candidates.push(candidate);
       if (candidates.length >= window.maxCandidates) break;
     }
     return { candidates, requestCount: 1 };
@@ -63,7 +68,11 @@ export class BilibiliTrendSource implements TrendSource {
   private async request(url: string, signal: AbortSignal): Promise<unknown> {
     let response: Response;
     try {
-      response = await this.fetcher(url, { headers: { accept: 'application/json', 'user-agent': 'LetterMate/0.1' }, signal });
+      response = await this.fetcher(url, {
+        headers: { accept: 'application/json', 'user-agent': 'LetterMate/0.1' },
+        redirect: 'error',
+        signal,
+      });
     } catch {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'Bilibili collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Bilibili is temporarily unavailable', true);

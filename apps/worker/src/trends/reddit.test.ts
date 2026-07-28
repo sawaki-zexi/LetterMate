@@ -28,17 +28,17 @@ describe('RedditTrendSource', () => {
 
     expect(fetcher).toHaveBeenCalledTimes(3);
     expect(fetcher.mock.calls[0]).toEqual(['https://www.reddit.com/api/v1/access_token', {
-      method: 'POST', body: 'grant_type=client_credentials', signal,
+      method: 'POST', body: 'grant_type=client_credentials', redirect: 'error', signal,
       headers: {
         authorization: `Basic ${Buffer.from('client-id:client-secret').toString('base64')}`,
         'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'LetterMate/0.1',
       },
     }]);
     expect(fetcher.mock.calls.slice(1).map(([rawUrl, init]) => ({
-      url: String(rawUrl), authorization: init.headers.authorization, signal: init.signal,
+      url: String(rawUrl), authorization: init.headers.authorization, redirect: init.redirect, signal: init.signal,
     }))).toEqual([
-      { url: 'https://oauth.reddit.com/r/programming/hot?limit=25&raw_json=1', authorization: 'Bearer temporary-token', signal },
-      { url: 'https://oauth.reddit.com/r/technology/hot?limit=25&raw_json=1', authorization: 'Bearer temporary-token', signal },
+      { url: 'https://oauth.reddit.com/r/programming/hot?limit=25&raw_json=1', authorization: 'Bearer temporary-token', redirect: 'error', signal },
+      { url: 'https://oauth.reddit.com/r/technology/hot?limit=25&raw_json=1', authorization: 'Bearer temporary-token', redirect: 'error', signal },
     ]);
     expect(result).toEqual({ requestCount: 3, candidates: [
       { sourceId: 'reddit-trends', platform: 'Reddit', externalId: 't3_abc', title: 'programming hot post', url: 'https://www.reddit.com/r/programming/comments/abc/hot_post/', publishedAt: '2026-07-28T00:00:00.000Z' },
@@ -129,5 +129,33 @@ describe('RedditTrendSource', () => {
       code: 'TREND_SOURCE_RESPONSE_INVALID', message: 'Reddit returned an invalid response',
     });
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it('skips extreme dates and overlong fields while keeping a valid sibling', async () => {
+    const post = (overrides: Record<string, unknown>) => ({
+      kind: 't3',
+      data: {
+        id: 'post', name: 't3_post', title: 'Post',
+        permalink: '/r/programming/comments/post/post/', created_utc: 1785196800,
+        ...overrides,
+      },
+    });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: 'token', token_type: 'bearer', expires_in: 3600 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: { children: [
+        post({ id: 'extreme', name: 't3_extreme', created_utc: Number.MAX_SAFE_INTEGER }),
+        post({ id: 'long', name: `t3_${'x'.repeat(501)}`, title: 'x'.repeat(501) }),
+        post({ id: 'valid', name: 't3_valid', title: 'Valid sibling', permalink: '/r/programming/comments/valid/valid/' }),
+      ] } }), { status: 200 }));
+
+    const result = await new RedditTrendSource({
+      clientId: 'id', clientSecret: 'secret', communities: ['programming'],
+    }, fetcher as typeof fetch).collect(window, new AbortController().signal);
+
+    expect(result.candidates).toEqual([{
+      sourceId: 'reddit-trends', platform: 'Reddit', externalId: 't3_valid',
+      title: 'Valid sibling', url: 'https://www.reddit.com/r/programming/comments/valid/valid/',
+      publishedAt: '2026-07-28T00:00:00.000Z',
+    }]);
   });
 });

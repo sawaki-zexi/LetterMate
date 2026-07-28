@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createTrendCandidate, isoFromUnixSeconds } from './candidate.js';
 import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
@@ -89,14 +90,18 @@ export class RedditTrendSource implements TrendSource {
           permalink.hostname !== 'www.reddit.com' ||
           !permalink.pathname.toLowerCase().startsWith(`/r/${community.toLowerCase()}/`)
         ) continue;
-        candidates.push({
+        const publishedAt = isoFromUnixSeconds(post.created_utc);
+        if (publishedAt === null) continue;
+        const candidate = createTrendCandidate({
           sourceId: this.id,
           platform: this.label,
           externalId: post.name,
           title,
           url: permalink.toString(),
-          publishedAt: new Date(post.created_utc * 1_000).toISOString(),
+          publishedAt,
         });
+        if (!candidate) continue;
+        candidates.push(candidate);
         if (candidates.length >= window.maxCandidates) break;
       }
       if (candidates.length >= window.maxCandidates) break;
@@ -106,7 +111,7 @@ export class RedditTrendSource implements TrendSource {
 
   private async request(url: string, init: RequestInit): Promise<unknown> {
     let response: Response;
-    try { response = await this.fetcher(url, init); }
+    try { response = await this.fetcher(url, { ...init, redirect: 'error' }); }
     catch {
       if (init.signal?.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'Reddit collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Reddit is temporarily unavailable', true);

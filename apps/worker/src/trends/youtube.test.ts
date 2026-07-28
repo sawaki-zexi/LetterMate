@@ -19,6 +19,9 @@ describe('YouTubeTrendSource', () => {
     }, {
       id: 'blankTitle',
       snippet: { title: '  ', publishedAt: '2026-07-27T12:00:00Z' },
+    }, {
+      id: 'longTitle',
+      snippet: { title: 'x'.repeat(501), publishedAt: '2026-07-27T12:00:00Z' },
     }] }), { status: 200 }));
     const signal = new AbortController().signal;
     const result = await new YouTubeTrendSource({ apiKey: 'private-key', region: 'JP', maxResults: 20 }, fetcher as typeof fetch)
@@ -31,7 +34,7 @@ describe('YouTubeTrendSource', () => {
     expect(Object.fromEntries(url.searchParams)).toEqual({
       part: 'snippet,statistics', chart: 'mostPopular', regionCode: 'JP', maxResults: '20', key: 'private-key',
     });
-    expect(init).toEqual({ signal });
+    expect(init).toEqual({ redirect: 'error', signal });
     expect(result).toEqual({ requestCount: 1, candidates: [{
       sourceId: 'youtube-trends', platform: 'YouTube', externalId: 'abc_DEF-123',
       title: 'Agent runtime demo', url: 'https://www.youtube.com/watch?v=abc_DEF-123',

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createTrendCandidate } from './candidate.js';
 import { readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
@@ -59,7 +60,7 @@ export class TwitterApiIoTrendSource implements TrendSource {
         const externalId = trend.id === undefined || trend.id === null ? query : String(trend.id);
         const searchUrl = new URL('https://x.com/search');
         searchUrl.searchParams.set('q', title);
-        candidates.push({
+        const candidate = createTrendCandidate({
           sourceId: this.id,
           platform: this.label,
           externalId,
@@ -67,6 +68,8 @@ export class TwitterApiIoTrendSource implements TrendSource {
           url: searchUrl.toString(),
           publishedAt: null,
         });
+        if (!candidate) continue;
+        candidates.push(candidate);
         if (candidates.length >= window.maxCandidates) break;
       }
       if (candidates.length >= window.maxCandidates) break;
@@ -77,7 +80,7 @@ export class TwitterApiIoTrendSource implements TrendSource {
   private async request(url: string, apiKey: string, signal: AbortSignal): Promise<unknown> {
     let response: Response;
     try {
-      response = await this.fetcher(url, { headers: { 'x-api-key': apiKey }, signal });
+      response = await this.fetcher(url, { headers: { 'x-api-key': apiKey }, redirect: 'error', signal });
     } catch {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'TwitterAPI.io collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'TwitterAPI.io is temporarily unavailable', true);

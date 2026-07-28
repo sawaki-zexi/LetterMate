@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { TrendSourceRegistry } from './registry.js';
 import { RedditTrendSource } from './reddit.js';
+import { TwitterApiIoTrendSource } from './twitterapi-io.js';
 import {
   TrendSourceError,
   type TrendSeedCandidate,
@@ -207,6 +208,27 @@ describe('TrendSourceRegistry', () => {
     });
   });
 
+  it('accounts one sanitized request when a fixed API returns a redirect', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response('private redirect body', {
+      status: 302,
+      headers: { location: 'https://redirect.example/leak' },
+    }));
+    const twitter = new TwitterApiIoTrendSource({ apiKey: 'private-key', woeids: [1] }, fetcher as typeof fetch);
+    const registry = new TrendSourceRegistry([twitter], { concurrency: 1, timeoutMs: 1_000 });
+
+    const result = await registry.collect(window);
+
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls[0]![1]).toMatchObject({ redirect: 'error' });
+    expect(result).toMatchObject({
+      requestCount: 1,
+      requestCounts: { 'twitter-trends': 1 },
+      failures: [{ sourceId: 'twitter-trends', code: 'TREND_SOURCE_UNAVAILABLE' }],
+    });
+    expect(JSON.stringify(result)).not.toContain('private');
+    expect(JSON.stringify(result)).not.toContain('redirect.example');
+  });
+
   it('allocates only useful minimum request budgets', async () => {
     const received: Array<[string, number]> = [];
     const costSource = (id: string, minimumRequestBudget: number): TrendSource => ({
@@ -244,6 +266,24 @@ describe('TrendSourceRegistry', () => {
     await registry.collect({ ...window, requestBudget: 1 });
 
     expect(called).toEqual(['one', 'two', 'three']);
+  });
+
+  it('rotates the first emitted candidate when a small cap admits one source at a time', async () => {
+    const emitting = (id: string): TrendSource => source(id, { collect: async () => ({
+      candidates: [candidate(id, id)], requestCount: 1,
+    }) });
+    const registry = new TrendSourceRegistry([
+      emitting('one'), emitting('two'), emitting('three'),
+    ], { concurrency: 3, timeoutMs: 1_000 });
+
+    const first = await registry.collect({ ...window, maxCandidates: 1, requestBudget: 3 });
+    const second = await registry.collect({ ...window, maxCandidates: 1, requestBudget: 3 });
+    const third = await registry.collect({ ...window, maxCandidates: 1, requestBudget: 3 });
+
+    expect([first, second, third].map((result) => result.candidates[0]?.sourceId)).toEqual([
+      'one', 'two', 'three',
+    ]);
+    expect(first.successfulSourceIds).toEqual(['one', 'two', 'three']);
   });
 
   it('rejects duplicate IDs and invalid options or windows', async () => {

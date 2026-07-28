@@ -13,6 +13,8 @@ describe('TwitterApiIoTrendSource', () => {
       { name: '#AgenticAI', query: '%23AgenticAI', tweet_volume: 1200 },
       { name: 123, query: 'invalid' },
       { name: '  ' },
+      { name: 'x'.repeat(501), query: 'overlong-title' },
+      { id: 'x'.repeat(501), name: 'Overlong ID' },
     ] }), { status: 200 }));
     const signal = new AbortController().signal;
     const source = new TwitterApiIoTrendSource({ apiKey: 'private-key', woeids: [1, 23424977] }, fetcher as typeof fetch);
@@ -22,7 +24,7 @@ describe('TwitterApiIoTrendSource', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher).toHaveBeenCalledWith(
       'https://api.twitterapi.io/twitter/trends?woeid=1&count=30',
-      { headers: { 'x-api-key': 'private-key' }, signal },
+      { headers: { 'x-api-key': 'private-key' }, redirect: 'error', signal },
     );
     expect(result).toEqual({ requestCount: 1, candidates: [{
       sourceId: 'twitter-trends', platform: 'X Trends', externalId: '%23AgenticAI',
