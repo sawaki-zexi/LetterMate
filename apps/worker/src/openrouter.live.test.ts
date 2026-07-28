@@ -1,5 +1,7 @@
+import { validateSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it } from 'vitest';
-import { validateDiscoveryResult } from '@lettermate/domain';
+import { OpenRouterSearchConnector } from './connectors/openrouter-search.js';
+import type { SourceQueryPlan } from './connectors/types.js';
 import { OpenRouterAiGateway } from './openrouter-gateway.js';
 
 try {
@@ -12,24 +14,39 @@ const apiKey = process.env.AI_API_KEY;
 const enabled = process.env.RUN_LIVE_AI_TESTS === '1' && Boolean(apiKey);
 
 describe.skipIf(!enabled)('OpenRouter live discovery', () => {
-  it('returns citation-backed Chinese discoveries', async () => {
+  it('expands a topic and returns citation-backed web candidates', async () => {
+    const model = process.env.AI_MODEL ?? 'openrouter/auto';
     const gateway = new OpenRouterAiGateway({
       apiKey: apiKey!,
-      model: process.env.AI_MODEL ?? 'openrouter/auto',
+      model,
       webSearch: true,
       timeoutMs: 120_000,
     });
     const expanded = await gateway.expandTopic({ keyword: '人工智能' });
-    const result = await gateway.discover({
+    const windowEnd = new Date();
+    const windowStart = new Date(windowEnd.getTime() - 30 * 24 * 60 * 60 * 1_000);
+    const plan: SourceQueryPlan = {
       keyword: '人工智能',
-      expandedTerms: [...expanded.terms, ...expanded.searchQueries],
-      lookbackDays: 30,
-      now: new Date().toISOString(),
+      expandedTerms: expanded.terms,
+      queries: expanded.searchQueries.slice(0, 3),
+      sourceTypes: ['web'],
+      windowStart: windowStart.toISOString(),
+      windowEnd: windowEnd.toISOString(),
+      maxCandidates: 10,
+    };
+    const connector = new OpenRouterSearchConnector({
+      apiKey: apiKey!,
+      model,
+      webSearch: true,
+      timeoutMs: 120_000,
     });
-    const valid = validateDiscoveryResult(result);
+    const result = await connector.search(plan, new AbortController().signal);
+    const valid = result.candidates.map(validateSourceCandidate);
+
+    expect(expanded.terms.length).toBeGreaterThan(0);
+    expect(expanded.searchQueries.length).toBeGreaterThan(0);
     expect(valid.length).toBeGreaterThan(0);
-    expect(valid.every((item) => ['hot', 'quality'].includes(item.kind))).toBe(true);
-    expect(valid.every((item) => item.summary.length > 0 && item.reason.length > 0)).toBe(true);
-    expect(valid.every((item) => item.sourceUrls.every((url) => URL.canParse(url)))).toBe(true);
+    expect(valid.every((candidate) => candidate.proof.kind === 'ai_citation')).toBe(true);
+    expect(valid.every((candidate) => candidate.proof.connectorId === connector.id)).toBe(true);
   }, 180_000);
 });

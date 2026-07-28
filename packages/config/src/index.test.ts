@@ -15,6 +15,14 @@ describe('configuration', () => {
     });
   });
 
+  it('provides bounded discovery execution defaults', () => {
+    expect(parseConfig({})).toMatchObject({
+      DISCOVERY_RUN_TIMEOUT_MS: 600_000,
+      DISCOVERY_CONNECTOR_CONCURRENCY: 4,
+      DISCOVERY_SCHEDULER_ENABLED: true,
+    });
+  });
+
   it('defaults to OpenRouter auto routing and web search', () => {
     expect(parseConfig({ NODE_ENV: 'development', AI_API_KEY: 'secret' })).toMatchObject({
       AI_API_KEY: 'secret',
@@ -36,5 +44,77 @@ describe('configuration', () => {
 
   it('rejects ambiguous web search configuration', () => {
     expect(() => parseConfig({ AI_WEB_SEARCH: 'yes' })).toThrow();
+  });
+
+  it('accepts optional connector configuration', () => {
+    expect(
+      parseConfig({
+        TWITTERAPI_IO_API_KEY: 'x-key',
+        GITHUB_TOKEN: 'github-token',
+        YOUTUBE_API_KEY: 'youtube-key',
+        REDDIT_CLIENT_ID: 'reddit-client',
+        REDDIT_CLIENT_SECRET: 'reddit-secret',
+        SEARCH_PROVIDER: 'search-provider',
+        SEARCH_API_KEY: 'search-key',
+        SEARCH_API_BASE_URL: 'https://search.example.com/v1',
+      }),
+    ).toMatchObject({
+      TWITTERAPI_IO_API_KEY: 'x-key',
+      GITHUB_TOKEN: 'github-token',
+      YOUTUBE_API_KEY: 'youtube-key',
+      REDDIT_CLIENT_ID: 'reddit-client',
+      REDDIT_CLIENT_SECRET: 'reddit-secret',
+      SEARCH_PROVIDER: 'search-provider',
+      SEARCH_API_KEY: 'search-key',
+      SEARCH_API_BASE_URL: 'https://search.example.com/v1',
+    });
+  });
+
+  it('parses and validates configured RSS feed URLs', () => {
+    expect(parseConfig({
+      DISCOVERY_RSS_FEED_URLS: 'https://example.com/feed.xml, https://example.org/rss',
+    }).DISCOVERY_RSS_FEED_URLS).toEqual([
+      'https://example.com/feed.xml',
+      'https://example.org/rss',
+    ]);
+    expect(() => parseConfig({
+      DISCOVERY_RSS_FEED_URLS: 'https://example.com/feed.xml,not-a-url',
+    })).toThrow();
+  });
+
+  it('treats empty optional connector configuration as absent', () => {
+    expect(
+      parseConfig({
+        TWITTERAPI_IO_API_KEY: '',
+        SEARCH_API_BASE_URL: '',
+      }),
+    ).toMatchObject({
+      TWITTERAPI_IO_API_KEY: undefined,
+      SEARCH_API_BASE_URL: undefined,
+    });
+  });
+
+  it('validates discovery execution bounds and search URLs', () => {
+    expect(() => parseConfig({ DISCOVERY_RUN_TIMEOUT_MS: '59999' })).toThrow();
+    expect(() => parseConfig({ DISCOVERY_RUN_TIMEOUT_MS: '900001' })).toThrow();
+    expect(() => parseConfig({ DISCOVERY_CONNECTOR_CONCURRENCY: '0' })).toThrow();
+    expect(() => parseConfig({ DISCOVERY_CONNECTOR_CONCURRENCY: '17' })).toThrow();
+    expect(() => parseConfig({ SEARCH_API_BASE_URL: 'not-a-url' })).toThrow();
+  });
+
+  it('parses an explicitly disabled discovery scheduler', () => {
+    expect(parseConfig({ DISCOVERY_SCHEDULER_ENABLED: 'false' }).DISCOVERY_SCHEDULER_ENABLED).toBe(
+      false,
+    );
+  });
+
+  it('does not require optional connector keys in production', () => {
+    expect(() =>
+      parseConfig({
+        NODE_ENV: 'production',
+        SESSION_SECRET: 's'.repeat(32),
+        CSRF_SECRET: 'c'.repeat(32),
+      }),
+    ).not.toThrow();
   });
 });

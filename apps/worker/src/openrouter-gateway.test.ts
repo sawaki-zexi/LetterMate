@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { validateSourceCandidate } from '@lettermate/domain';
 import { AiGatewayError } from './ai-gateway.js';
 import { OpenRouterAiGateway } from './openrouter-gateway.js';
 
@@ -24,60 +25,46 @@ const makeGateway = (fetcher: typeof fetch) =>
   );
 
 describe('OpenRouterAiGateway', () => {
-  it('sends the web plugin and normalizes URL citations', async () => {
-    const fetcher = vi.fn().mockResolvedValue(
-      openRouterResponse(
-        JSON.stringify({
-          items: [
-            {
-              kind: 'hot',
-              title: 'Release',
-              summary: '这是中文摘要。',
-              reason: '近期讨论明显增加。',
-              sourceUrls: ['https://example.com/release'],
-              publishedAt: null,
-            },
-          ],
-        }),
-        [
-          {
-            type: 'url_citation',
-            url_citation: { url: 'https://example.com/release', title: 'Release' },
-          },
-          { type: 'unsupported_annotation' },
-        ],
-      ),
-    );
-
-    const result = await makeGateway(fetcher).discover({
-      keyword: 'AI Agent',
-      expandedTerms: ['智能体'],
-      lookbackDays: 7,
-      now: '2026-07-24T08:00:00.000Z',
+  it('assesses only supplied candidates without web search', async () => {
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ decisions: [{
+      id: 'https://example.com/article', accepted: true, kind: 'quality', reason: 'substantive',
+    }] })));
+    const result = await makeGateway(fetcher).evaluateCandidates({
+      keyword: 'AI agents', candidates: [{
+        id: 'https://example.com/article', url: 'https://example.com/article', sourceType: 'web',
+        platform: 'Example', title: 'Article', text: 'Detailed article body.', authorName: null,
+        authorHandle: null, publishedAt: null,
+      }],
     });
 
-    expect(result.citations).toEqual(['https://example.com/release']);
-    expect(result.items[0]).toMatchObject({ kind: 'hot', summary: '这是中文摘要。' });
-    expect(fetcher).toHaveBeenCalledOnce();
-    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('https://openrouter.ai/api/v1/chat/completions');
-    expect(JSON.parse(String(init.body))).toMatchObject({
-      model: 'openrouter/auto',
-      max_tokens: 8_192,
-      provider: { require_parameters: true },
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: 'discovery_result',
-          strict: true,
-          schema: {
-            required: ['items'],
-          },
-        },
-      },
-      plugins: [{ id: 'web' }],
+    expect(result).toEqual([{ id: 'https://example.com/article', accepted: true, kind: 'quality', reason: 'substantive' }]);
+    const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
+    expect(body.plugins).toBeUndefined();
+    expect(body.response_format.json_schema.name).toBe('candidate_assessment');
+  });
+
+  it('composes source-aware Chinese items from accepted candidates', async () => {
+    const source = validateSourceCandidate({
+      connectorId: 'github', sourceType: 'code', platform: 'GitHub', externalId: 'node-1',
+      url: 'https://github.com/org/repo/releases/tag/v2', title: 'Version 2', content: 'Migration notes.',
+      excerpt: null, authorName: null, authorHandle: 'org', publishedAt: null, language: 'en', engagement: {},
+      proof: { kind: 'api_record', connectorId: 'github', externalId: 'node-1' },
     });
-    expect(init.headers).toMatchObject({ authorization: 'Bearer secret-key' });
+    const item = {
+      kind: 'quality', title: 'Version 2', summary: '包含迁移说明。', reason: '提供了具体变更。',
+      sourceUrls: [source.canonicalUrl], publishedAt: null, sourceType: 'code', platform: 'GitHub',
+      authorName: null, authorHandle: 'org', externalId: 'node-1', provenanceKind: 'api_record',
+    };
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ items: [item] })));
+
+    await expect(makeGateway(fetcher).composeItems({
+      keyword: 'agent runtime', candidates: [{
+        candidate: source, assessment: { id: source.canonicalUrl, accepted: true, kind: 'quality', reason: 'new' },
+      }],
+    })).resolves.toEqual([item]);
+    const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
+    expect(body.plugins).toBeUndefined();
+    expect(body.response_format.json_schema.name).toBe('discovery_composition');
   });
 
   it('expands one keyword without asking the user for synonyms', async () => {
@@ -110,6 +97,21 @@ describe('OpenRouterAiGateway', () => {
       },
     });
     expect(body.messages.at(-1).content).toContain('AI Agent');
+  });
+
+  it('propagates a parent abort signal to the active OpenRouter request', async () => {
+    const fetcher = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    }));
+    const parent = new AbortController();
+
+    const pending = makeGateway(fetcher as typeof fetch).expandTopic({ keyword: 'AI', signal: parent.signal });
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const requestSignal = (fetcher.mock.calls[0]![1] as RequestInit).signal;
+    parent.abort();
+
+    expect(requestSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toMatchObject({ code: 'AI_UPSTREAM_UNAVAILABLE' });
   });
 
   it('retries invalid JSON exactly once with a correction instruction', async () => {

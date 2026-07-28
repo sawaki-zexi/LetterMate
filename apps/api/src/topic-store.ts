@@ -27,13 +27,18 @@ export interface TopicStore {
   createTopic(userId: string, keyword: string, normalizedKeyword: string): Promise<Topic>;
   listTopics(userId: string): Promise<Topic[]>;
   findTopic(userId: string, id: string): Promise<Topic | null>;
-  queueRefresh(userId: string, id: string): Promise<Topic | null>;
+  queueRefresh(userId: string, id: string): Promise<QueueRefreshResult | null>;
   listFeed(
     userId: string,
-    filter: { topicId?: string; kind?: DiscoveryKind },
+    filter: { topicId?: string; kind?: DiscoveryKind; since?: Date },
   ): Promise<DiscoveryItem[]>;
   findItem(userId: string, id: string): Promise<DiscoveryItem | null>;
   close(): Promise<void>;
+}
+
+export interface QueueRefreshResult {
+  topic: Topic;
+  shouldEnqueue: boolean;
 }
 
 function mapTopic(topic: PrismaTopic): Topic {
@@ -45,6 +50,8 @@ function mapTopic(topic: PrismaTopic): Topic {
     expandedTerms: topic.expandedTerms,
     createdAt: topic.createdAt.toISOString(),
     lastRunAt: topic.lastRunAt?.toISOString() ?? null,
+    nextRunAt: topic.nextRunAt?.toISOString() ?? null,
+    scheduleIntervalHours: topic.scheduleIntervalHours,
     runStatus: topic.runStatus,
     lastError: error.success ? error.data : null,
   });
@@ -61,6 +68,12 @@ function mapItem(item: PrismaDiscoveryItem): DiscoveryItem {
     sourceUrls: item.sourceUrls,
     publishedAt: item.publishedAt?.toISOString() ?? null,
     discoveredAt: item.discoveredAt.toISOString(),
+    sourceType: item.sourceType,
+    platform: item.platform,
+    authorName: item.authorName,
+    authorHandle: item.authorHandle,
+    externalId: item.externalId,
+    provenanceKind: item.provenanceKind,
   });
 }
 
@@ -115,23 +128,53 @@ export class PrismaTopicStore implements TopicStore {
     return topic ? mapTopic(topic) : null;
   }
 
-  async queueRefresh(userId: string, id: string): Promise<Topic | null> {
-    const owned = await this.prisma.topic.findFirst({ where: { id, userId }, select: { id: true } });
-    if (!owned) return null;
-    const topic = await this.prisma.topic.update({
-      where: { id },
-      data: { runStatus: 'queued', lastError: Prisma.DbNull },
+  async queueRefresh(userId: string, id: string): Promise<QueueRefreshResult | null> {
+    return this.prisma.$transaction(async (transaction) => {
+      let topic = await transaction.topic.findFirst({ where: { id, userId } });
+      if (!topic) return null;
+
+      if (topic.runStatus === 'running') {
+        const pending = await transaction.topic.updateMany({
+          where: { id, userId, runStatus: 'running', manualRefreshPending: false },
+          data: { manualRefreshPending: true, lastError: Prisma.DbNull },
+        });
+        topic = await transaction.topic.findFirst({ where: { id, userId } });
+        if (!topic) return null;
+        if (pending.count === 1) {
+          return { topic: mapTopic(topic), shouldEnqueue: true };
+        }
+        if (topic.runStatus === 'running' || topic.runStatus === 'queued') {
+          return { topic: mapTopic(topic), shouldEnqueue: false };
+        }
+      }
+
+      if (topic.runStatus === 'queued') {
+        return { topic: mapTopic(topic), shouldEnqueue: false };
+      }
+
+      const queued = await transaction.topic.updateMany({
+        where: { id, userId, runStatus: { in: ['succeeded', 'failed'] } },
+        data: { runStatus: 'queued', lastError: Prisma.DbNull },
+      });
+      topic = await transaction.topic.findFirst({ where: { id, userId } });
+      if (!topic) return null;
+      return { topic: mapTopic(topic), shouldEnqueue: queued.count === 1 };
     });
-    return mapTopic(topic);
   }
 
   async listFeed(
     userId: string,
-    filter: { topicId?: string; kind?: DiscoveryKind },
+    filter: { topicId?: string; kind?: DiscoveryKind; since?: Date },
   ): Promise<DiscoveryItem[]> {
     const items = await this.prisma.discoveryItem.findMany({
       where: {
         ...(filter.kind ? { kind: filter.kind } : {}),
+        ...(filter.since ? {
+          OR: [
+            { publishedAt: { gte: filter.since } },
+            { publishedAt: null, discoveredAt: { gte: filter.since } },
+          ],
+        } : {}),
         topic: {
           userId,
           ...(filter.topicId ? { id: filter.topicId } : {}),
@@ -157,6 +200,7 @@ export class PrismaTopicStore implements TopicStore {
 export class MemoryTopicStore implements TopicStore {
   private readonly topics: Topic[] = [];
   private readonly items: DiscoveryItem[] = [];
+  private readonly pendingManualRefreshes = new Set<string>();
 
   async createTopic(
     userId: string,
@@ -178,6 +222,8 @@ export class MemoryTopicStore implements TopicStore {
       expandedTerms: [],
       createdAt: new Date().toISOString(),
       lastRunAt: null,
+      nextRunAt: null,
+      scheduleIntervalHours: 12,
       runStatus: 'queued',
       lastError: null,
     };
@@ -196,17 +242,26 @@ export class MemoryTopicStore implements TopicStore {
     return topic ? structuredClone(topic) : null;
   }
 
-  async queueRefresh(userId: string, id: string): Promise<Topic | null> {
+  async queueRefresh(userId: string, id: string): Promise<QueueRefreshResult | null> {
     const topic = this.topics.find((candidate) => candidate.userId === userId && candidate.id === id);
     if (!topic) return null;
+    if (topic.runStatus === 'running') {
+      const shouldEnqueue = !this.pendingManualRefreshes.has(id);
+      this.pendingManualRefreshes.add(id);
+      topic.lastError = null;
+      return { topic: structuredClone(topic), shouldEnqueue };
+    }
+    if (topic.runStatus === 'queued') {
+      return { topic: structuredClone(topic), shouldEnqueue: false };
+    }
     topic.runStatus = 'queued';
     topic.lastError = null;
-    return structuredClone(topic);
+    return { topic: structuredClone(topic), shouldEnqueue: true };
   }
 
   async listFeed(
     userId: string,
-    filter: { topicId?: string; kind?: DiscoveryKind },
+    filter: { topicId?: string; kind?: DiscoveryKind; since?: Date },
   ): Promise<DiscoveryItem[]> {
     const topicIds = new Set(
       this.topics.filter((topic) => topic.userId === userId).map((topic) => topic.id),
@@ -216,7 +271,8 @@ export class MemoryTopicStore implements TopicStore {
         (item) =>
           topicIds.has(item.topicId) &&
           (!filter.topicId || item.topicId === filter.topicId) &&
-          (!filter.kind || item.kind === filter.kind),
+          (!filter.kind || item.kind === filter.kind) &&
+          (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()),
       )
       .sort((left, right) =>
         (right.publishedAt ?? right.discoveredAt).localeCompare(
@@ -243,6 +299,8 @@ export class MemoryTopicStore implements TopicStore {
       expandedTerms: [],
       createdAt: new Date().toISOString(),
       lastRunAt: null,
+      nextRunAt: null,
+      scheduleIntervalHours: 12,
       runStatus: 'succeeded',
       lastError: null,
     };
@@ -250,7 +308,11 @@ export class MemoryTopicStore implements TopicStore {
     return structuredClone(topic);
   }
 
-  seedItem(topicId: string, kind: DiscoveryKind): DiscoveryItem {
+  seedItem(
+    topicId: string,
+    kind: DiscoveryKind,
+    timestamps: { publishedAt?: string | null; discoveredAt?: string } = {},
+  ): DiscoveryItem {
     const id = randomUUID();
     const item: DiscoveryItem = {
       id,
@@ -260,8 +322,14 @@ export class MemoryTopicStore implements TopicStore {
       summary: '中文摘要',
       reason: kind === 'hot' ? '近期讨论集中' : '内容深入且可复现',
       sourceUrls: [`https://example.com/${id}`],
-      publishedAt: null,
-      discoveredAt: new Date().toISOString(),
+      publishedAt: timestamps.publishedAt ?? null,
+      discoveredAt: timestamps.discoveredAt ?? new Date().toISOString(),
+      sourceType: 'web',
+      platform: 'Web',
+      authorName: null,
+      authorHandle: null,
+      externalId: null,
+      provenanceKind: 'ai_citation',
     };
     this.items.push(item);
     return structuredClone(item);
@@ -285,6 +353,7 @@ export class MemoryTopicStore implements TopicStore {
     topic.runStatus = 'succeeded';
     topic.lastRunAt = new Date().toISOString();
     topic.lastError = null;
+    this.pendingManualRefreshes.delete(topicId);
     for (const candidate of result.items) {
       const primary = canonicalizeUrl(candidate.sourceUrls[0]!);
       const existing = this.items.find(

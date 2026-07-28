@@ -5,6 +5,18 @@ const optionalNonEmptyString = z.preprocess(
   z.string().trim().min(1).optional(),
 );
 
+const optionalUrl = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  z.url().optional(),
+);
+
+const rssFeedUrls = z.preprocess(
+  (value) => typeof value === 'string'
+    ? value.split(',').map((url) => url.trim()).filter(Boolean)
+    : value,
+  z.array(z.url()).default([]),
+);
+
 const baseConfigSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
@@ -20,6 +32,26 @@ const baseConfigSchema = z.object({
     .default('true')
     .transform((value) => value === 'true'),
   AI_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(180_000).default(60_000),
+  TWITTERAPI_IO_API_KEY: optionalNonEmptyString,
+  GITHUB_TOKEN: optionalNonEmptyString,
+  YOUTUBE_API_KEY: optionalNonEmptyString,
+  REDDIT_CLIENT_ID: optionalNonEmptyString,
+  REDDIT_CLIENT_SECRET: optionalNonEmptyString,
+  SEARCH_PROVIDER: optionalNonEmptyString,
+  SEARCH_API_KEY: optionalNonEmptyString,
+  SEARCH_API_BASE_URL: optionalUrl,
+  DISCOVERY_RSS_FEED_URLS: rssFeedUrls,
+  DISCOVERY_RUN_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(60_000)
+    .max(900_000)
+    .default(600_000),
+  DISCOVERY_CONNECTOR_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
+  DISCOVERY_SCHEDULER_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
   RUN_LIVE_AI_TESTS: z
     .enum(['0', '1'])
     .default('0')

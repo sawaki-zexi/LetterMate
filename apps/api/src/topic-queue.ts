@@ -4,6 +4,7 @@ import {
 } from '@lettermate/contracts';
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
+import { randomUUID } from 'node:crypto';
 
 export interface TopicQueue {
   enqueue(data: DiscoveryJobData): Promise<void>;
@@ -18,7 +19,9 @@ export class BullTopicQueue implements TopicQueue {
 
   async enqueue(data: DiscoveryJobData): Promise<void> {
     await this.queue.add('refresh', data, {
-      jobId: `topic-${data.topicId}`,
+      jobId: data.trigger === 'manual'
+        ? `manual-${data.topicId}-${randomUUID()}`
+        : `${data.trigger}-${data.topicId}`,
       attempts: 3,
       backoff: { type: 'custom' },
       removeOnComplete: true,

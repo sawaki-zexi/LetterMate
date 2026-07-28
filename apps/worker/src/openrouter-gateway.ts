@@ -1,12 +1,14 @@
 import {
   discoveryCandidateSchema,
-  type DiscoveryResult,
 } from '@lettermate/contracts';
 import { z } from 'zod';
 import {
   AiGatewayError,
   type AiGateway,
   type ExpandedTopic,
+  type CompositionCandidate,
+  type QualityAssessment,
+  type QualityAssessmentCandidate,
 } from './ai-gateway.js';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -19,6 +21,38 @@ const expansionSchema = z.object({
 const discoveryContentSchema = z.object({
   items: z.array(discoveryCandidateSchema).max(30),
 });
+
+const assessmentSchema = z.object({
+  decisions: z.array(z.object({
+    id: z.string().min(1),
+    accepted: z.boolean(),
+    kind: z.enum(['hot', 'quality']).nullable(),
+    reason: z.string().trim().min(1).max(500),
+  })).max(30),
+});
+
+const assessmentJsonSchema = {
+  type: 'object',
+  properties: {
+    decisions: {
+      type: 'array',
+      maxItems: 30,
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', minLength: 1 },
+          accepted: { type: 'boolean' },
+          kind: { anyOf: [{ type: 'string', enum: ['hot', 'quality'] }, { type: 'null' }] },
+          reason: { type: 'string', minLength: 1, maxLength: 500 },
+        },
+        required: ['id', 'accepted', 'kind', 'reason'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['decisions'],
+  additionalProperties: false,
+} as const;
 
 const expansionJsonSchema = {
   type: 'object',
@@ -65,8 +99,17 @@ const discoveryJsonSchema = {
               { type: 'null' },
             ],
           },
+          sourceType: { type: 'string', enum: ['web', 'feed', 'social', 'video', 'community', 'code', 'paper'] },
+          platform: { type: 'string', minLength: 1 },
+          authorName: { anyOf: [{ type: 'string', minLength: 1 }, { type: 'null' }] },
+          authorHandle: { anyOf: [{ type: 'string', minLength: 1 }, { type: 'null' }] },
+          externalId: { anyOf: [{ type: 'string', minLength: 1 }, { type: 'null' }] },
+          provenanceKind: { type: 'string', enum: ['ai_citation', 'api_record', 'feed_entry', 'fetched_page'] },
         },
-        required: ['kind', 'title', 'summary', 'reason', 'sourceUrls', 'publishedAt'],
+        required: [
+          'kind', 'title', 'summary', 'reason', 'sourceUrls', 'publishedAt',
+          'sourceType', 'platform', 'authorName', 'authorHandle', 'externalId', 'provenanceKind',
+        ],
         additionalProperties: false,
       },
     },
@@ -83,14 +126,6 @@ const openRouterMessageSchema = z.object({
 
 const openRouterResponseSchema = z.object({
   choices: z.array(z.object({ message: openRouterMessageSchema })).min(1),
-});
-
-const citationSchema = z.object({
-  type: z.literal('url_citation'),
-  url_citation: z.object({
-    url: z.url(),
-    title: z.string().optional(),
-  }),
 });
 
 type ChatMessage = {
@@ -169,7 +204,7 @@ export class OpenRouterAiGateway implements AiGateway {
     private readonly fetcher: typeof fetch = fetch,
   ) {}
 
-  async expandTopic(input: { keyword: string }): Promise<ExpandedTopic> {
+  async expandTopic(input: { keyword: string; signal?: AbortSignal }): Promise<ExpandedTopic> {
     const messages: ChatMessage[] = [
       {
         role: 'system',
@@ -190,6 +225,7 @@ export class OpenRouterAiGateway implements AiGateway {
         schema: expansionJsonSchema,
         maxTokens: 1_024,
       },
+      input.signal,
     );
     return {
       terms: unique(data.terms),
@@ -197,45 +233,48 @@ export class OpenRouterAiGateway implements AiGateway {
     };
   }
 
-  async discover(input: {
+  async evaluateCandidates(input: {
     keyword: string;
-    expandedTerms: string[];
-    lookbackDays: number;
-    now: string;
-  }): Promise<DiscoveryResult> {
-    const messages: ChatMessage[] = [
-      {
-        role: 'system',
-        content:
-          'Use web search to find real recent material for the topic. Return JSON only as {"items": [...]}. Every item must contain kind (hot or quality), title, a concise Chinese summary, a Chinese reason, sourceUrls copied exactly from search sources, and publishedAt as an ISO timestamp or null. Use hot for clear recent attention growth or clustered updates; use quality for substantive new material. If both apply, use hot. Never invent a URL or date. Return an empty items array when nothing qualifies.',
-      },
-      {
-        role: 'user',
-        content: [
-          `Topic: ${input.keyword}`,
-          `Related terms and search expressions: ${input.expandedTerms.join(' | ')}`,
-          `Current time: ${input.now}`,
-          `Only consider the last ${input.lookbackDays} days.`,
-        ].join('\n'),
-      },
-    ];
-    const { data, message } = await this.completeStructured(
-      messages,
+    candidates: QualityAssessmentCandidate[];
+    signal?: AbortSignal;
+  }): Promise<QualityAssessment[]> {
+    const { data } = await this.completeStructured(
+      [
+        {
+          role: 'system',
+          content:
+            'Assess each supplied discovery candidate. Return one decision for every candidate ID. Accept only relevant, substantive, original, timely, and understandable material. Use hot for clear recent attention or important releases; otherwise quality. Rejected items must use kind null. Do not use external knowledge or invent candidates.',
+        },
+        { role: 'user', content: JSON.stringify({ topic: input.keyword, candidates: input.candidates }) },
+      ],
+      assessmentSchema,
+      false,
+      { name: 'candidate_assessment', schema: assessmentJsonSchema, maxTokens: 4_096 },
+      input.signal,
+    );
+    return data.decisions;
+  }
+
+  async composeItems(input: {
+    keyword: string;
+    candidates: CompositionCandidate[];
+    signal?: AbortSignal;
+  }): Promise<z.infer<typeof discoveryCandidateSchema>[]> {
+    const { data } = await this.completeStructured(
+      [
+        {
+          role: 'system',
+          content:
+            'Create concise Chinese discovery items only from the supplied accepted candidates. Preserve source URLs and source metadata exactly. Explain why each item is worth reading. Never add a URL, date, author, platform, external ID, or provenance value that is not in the input.',
+        },
+        { role: 'user', content: JSON.stringify({ topic: input.keyword, candidates: input.candidates }) },
+      ],
       discoveryContentSchema,
-      true,
-      {
-        name: 'discovery_result',
-        schema: discoveryJsonSchema,
-        maxTokens: 8_192,
-      },
+      false,
+      { name: 'discovery_composition', schema: discoveryJsonSchema, maxTokens: 8_192 },
+      input.signal,
     );
-    const citations = unique(
-      message.annotations.flatMap((annotation) => {
-        const parsed = citationSchema.safeParse(annotation);
-        return parsed.success ? [parsed.data.url_citation.url] : [];
-      }),
-    );
-    return { items: data.items, citations };
+    return data.items;
   }
 
   private async completeStructured<T>(
@@ -243,8 +282,9 @@ export class OpenRouterAiGateway implements AiGateway {
     schema: z.ZodType<T>,
     useWeb: boolean,
     output: StructuredOutput,
+    signal?: AbortSignal,
   ): Promise<{ data: T; message: OpenRouterMessage }> {
-    const first = await this.complete(messages, useWeb, output);
+    const first = await this.complete(messages, useWeb, output, signal);
     const firstData = parseStructured(first.content, schema);
     if (firstData !== null) return { data: firstData, message: first };
 
@@ -257,7 +297,7 @@ export class OpenRouterAiGateway implements AiGateway {
           'The previous response was invalid. Return only valid JSON matching the requested object shape, with every required field and no Markdown.',
       },
     ];
-    const second = await this.complete(correction, useWeb, output);
+    const second = await this.complete(correction, useWeb, output, signal);
     const secondData = parseStructured(second.content, schema);
     if (secondData !== null) return { data: secondData, message: second };
 
@@ -272,8 +312,12 @@ export class OpenRouterAiGateway implements AiGateway {
     messages: ChatMessage[],
     useWeb: boolean,
     output: StructuredOutput,
+    parentSignal?: AbortSignal,
   ): Promise<OpenRouterMessage> {
     const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (parentSignal?.aborted) controller.abort();
+    else parentSignal?.addEventListener('abort', abort, { once: true });
     const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
       const response = await this.fetcher(OPENROUTER_URL, {
@@ -328,6 +372,7 @@ export class OpenRouterAiGateway implements AiGateway {
       throw new AiGatewayError('AI_UPSTREAM_UNAVAILABLE', 'OpenRouter 暂时不可用', true);
     } finally {
       clearTimeout(timeout);
+      parentSignal?.removeEventListener('abort', abort);
     }
   }
 }

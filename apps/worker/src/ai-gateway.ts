@@ -1,18 +1,47 @@
-import type { DiscoveryResult } from '@lettermate/contracts';
+import type { DiscoveryCandidate, DiscoveryKind, SourceType } from '@lettermate/contracts';
+import type { ValidatedSourceCandidate } from '@lettermate/domain';
 
 export interface ExpandedTopic {
   terms: string[];
   searchQueries: string[];
 }
 
+export interface QualityAssessmentCandidate {
+  id: string;
+  url: string;
+  sourceType: SourceType;
+  platform: string;
+  title: string | null;
+  text: string;
+  authorName: string | null;
+  authorHandle: string | null;
+  publishedAt: string | null;
+}
+
+export interface QualityAssessment {
+  id: string;
+  accepted: boolean;
+  kind: DiscoveryKind | null;
+  reason: string;
+}
+
+export interface CompositionCandidate {
+  candidate: ValidatedSourceCandidate;
+  assessment: QualityAssessment;
+}
+
 export interface AiGateway {
-  expandTopic(input: { keyword: string }): Promise<ExpandedTopic>;
-  discover(input: {
+  expandTopic(input: { keyword: string; signal?: AbortSignal }): Promise<ExpandedTopic>;
+  evaluateCandidates(input: {
     keyword: string;
-    expandedTerms: string[];
-    lookbackDays: number;
-    now: string;
-  }): Promise<DiscoveryResult>;
+    candidates: QualityAssessmentCandidate[];
+    signal?: AbortSignal;
+  }): Promise<QualityAssessment[]>;
+  composeItems(input: {
+    keyword: string;
+    candidates: CompositionCandidate[];
+    signal?: AbortSignal;
+  }): Promise<DiscoveryCandidate[]>;
 }
 
 export type AiGatewayErrorCode =

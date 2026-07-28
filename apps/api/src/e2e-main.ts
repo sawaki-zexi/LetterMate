@@ -15,6 +15,12 @@ const queue: TopicQueue = {
         reason: '包含实现细节与原始数据。',
         sourceUrls: ['https://example.com/agent-guide'],
         publishedAt: '2026-07-24T06:30:00.000Z',
+        sourceType: 'web',
+        platform: 'Example',
+        authorName: 'Example Author',
+        authorHandle: null,
+        externalId: null,
+        provenanceKind: 'ai_citation',
       }],
     });
   },

@@ -1,8 +1,9 @@
-import type { DiscoveryJobData } from '@lettermate/contracts';
+import type { DiscoveryJobData, DiscoverySourceStatus } from '@lettermate/contracts';
 import type { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createApiApp } from './app.js';
+import { configuredDiscoverySources, createApiApp } from './app.js';
+import { parseConfig } from '@lettermate/config';
 import { MemoryTopicStore } from './topic-store.js';
 import type { TopicQueue } from './topic-queue.js';
 
@@ -20,11 +21,21 @@ describe('AI discovery API', () => {
   let app: INestApplication;
   let store: MemoryTopicStore;
   let queue: RecordingQueue;
+  const discoverySources: DiscoverySourceStatus[] = [
+    { id: 'openrouter-search', label: 'OpenRouter Web Search', category: 'web', status: 'enabled' },
+    { id: 'twitterapi-io', label: 'X', category: 'social', status: 'not_configured' },
+  ];
 
   beforeEach(async () => {
     store = new MemoryTopicStore();
     queue = new RecordingQueue();
-    app = await createApiApp({ store, queue, aiConfigured: true });
+    app = await createApiApp({
+      store,
+      queue,
+      aiConfigured: true,
+      discoverySources,
+      now: () => new Date('2026-07-27T12:00:00.000Z'),
+    });
   });
 
   afterEach(async () => {
@@ -44,7 +55,11 @@ describe('AI discovery API', () => {
       runStatus: 'queued',
       expandedTerms: [],
     });
-    expect(queue.jobs).toEqual([{ topicId: response.body.id, userId: 'user-a' }]);
+    expect(queue.jobs).toEqual([{
+      topicId: response.body.id,
+      userId: 'user-a',
+      trigger: 'initial',
+    }]);
   });
 
   it('rejects equivalent duplicate keywords for one user', async () => {
@@ -106,7 +121,11 @@ describe('AI discovery API', () => {
       .post(`/api/v1/topics/${own.id}/refresh`)
       .set('x-user-id', 'user-a')
       .expect(202);
-    expect(queue.jobs).toContainEqual({ topicId: own.id, userId: 'user-a' });
+    expect(queue.jobs).toContainEqual({
+      topicId: own.id,
+      userId: 'user-a',
+      trigger: 'manual',
+    });
   });
 
   it('isolates feed and item details by user', async () => {
@@ -134,6 +153,63 @@ describe('AI discovery API', () => {
 
     expect(response.body).toHaveLength(1);
     expect(response.body[0].kind).toBe('hot');
+  });
+
+  it('defaults the feed to 90 days and supports all retained history', async () => {
+    const topic = store.seedTopic('user-a', 'History');
+    store.seedItem(topic.id, 'quality', {
+      publishedAt: '2020-01-01T00:00:00.000Z',
+      discoveredAt: '2020-01-02T00:00:00.000Z',
+    });
+    store.seedItem(topic.id, 'hot', {
+      publishedAt: '2026-07-26T00:00:00.000Z',
+      discoveredAt: '2026-07-26T01:00:00.000Z',
+    });
+
+    const recent = await request(app.getHttpServer())
+      .get('/api/v1/feed')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    const all = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+
+    expect(recent.body).toHaveLength(1);
+    expect(recent.body[0].kind).toBe('hot');
+    expect(all.body).toHaveLength(2);
+  });
+
+  it('returns safe source configuration states without credentials', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/api/v1/discovery-sources')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+
+    expect(response.body).toEqual(discoverySources);
+    expect(JSON.stringify(response.body)).not.toMatch(/key|secret|token/i);
+  });
+
+  it('derives source states from safe server configuration only', () => {
+    const statuses = configuredDiscoverySources(parseConfig({
+      AI_API_KEY: 'openrouter-secret',
+      TWITTERAPI_IO_API_KEY: 'twitter-secret',
+      DISCOVERY_RSS_FEED_URLS: 'https://example.com/feed.xml',
+    }));
+
+    expect(statuses).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'twitterapi-io', status: 'enabled' }),
+      expect.objectContaining({ id: 'rss', status: 'enabled' }),
+      expect.objectContaining({ id: 'youtube', status: 'not_configured' }),
+    ]));
+    expect(JSON.stringify(statuses)).not.toMatch(/openrouter-secret|twitter-secret/);
+  });
+
+  it('rejects an invalid feed range', async () => {
+    await request(app.getHttpServer())
+      .get('/api/v1/feed?range=forever')
+      .set('x-user-id', 'user-a')
+      .expect(400);
   });
 
   it('returns a trace id for invalid keyword input', async () => {

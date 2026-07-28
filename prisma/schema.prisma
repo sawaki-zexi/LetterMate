@@ -19,6 +19,29 @@ enum RunStatus {
   failed
 }
 
+enum DiscoveryTrigger {
+  initial
+  manual
+  scheduled
+}
+
+enum SourceType {
+  web
+  feed
+  social
+  video
+  community
+  code
+  paper
+}
+
+enum ProvenanceKind {
+  ai_citation
+  api_record
+  feed_entry
+  fetched_page
+}
+
 model User {
   id           String    @id @default(uuid())
   email        String    @unique
@@ -41,24 +64,34 @@ model Session {
 }
 
 model Topic {
-  id                String          @id @default(uuid())
-  userId            String
-  keyword           String
-  normalizedKeyword String
-  expandedTerms     String[]        @default([])
-  createdAt         DateTime        @default(now())
-  lastRunAt         DateTime?
-  runStatus         RunStatus       @default(queued)
-  lastError         Json?
-  user              User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  items             DiscoveryItem[]
+  id                    String          @id @default(uuid())
+  userId                String
+  keyword               String
+  normalizedKeyword     String
+  expandedTerms         String[]        @default([])
+  createdAt             DateTime        @default(now())
+  lastRunAt             DateTime?
+  runStatus             RunStatus       @default(queued)
+  lastError             Json?
+  nextRunAt             DateTime?
+  scheduleIntervalHours Int             @default(12)
+  productiveRunStreak   Int             @default(0)
+  emptyRunStreak        Int             @default(0)
+  activeRunId           String?
+  runLeaseUntil         DateTime?
+  manualRefreshPending  Boolean         @default(false)
+  user                  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items                 DiscoveryItem[]
+  runs                  DiscoveryRun[]
 
   @@unique([userId, normalizedKeyword])
   @@index([userId, createdAt])
+  @@index([nextRunAt, runStatus])
+  @@index([runStatus, runLeaseUntil])
 }
 
 model DiscoveryItem {
-  id                  String        @id @default(uuid())
+  id                  String         @id @default(uuid())
   topicId             String
   kind                DiscoveryKind
   title               String
@@ -67,10 +100,34 @@ model DiscoveryItem {
   sourceUrls          String[]
   canonicalPrimaryUrl String
   publishedAt         DateTime?
-  discoveredAt        DateTime      @default(now())
-  updatedAt           DateTime      @updatedAt
-  topic               Topic         @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  discoveredAt        DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  sourceType          SourceType     @default(web)
+  platform            String         @default("Web")
+  authorName          String?
+  authorHandle        String?
+  externalId          String?
+  provenanceKind      ProvenanceKind @default(ai_citation)
+  topic               Topic          @relation(fields: [topicId], references: [id], onDelete: Cascade)
 
   @@unique([topicId, canonicalPrimaryUrl])
   @@index([topicId, publishedAt, discoveredAt])
+}
+
+model DiscoveryRun {
+  id               String           @id @default(uuid())
+  topicId          String
+  trigger          DiscoveryTrigger
+  status           RunStatus        @default(queued)
+  startedAt        DateTime         @default(now())
+  finishedAt       DateTime?
+  connectorSummary Json?
+  candidateCount   Int              @default(0)
+  acceptedCount    Int              @default(0)
+  newItemCount     Int              @default(0)
+  error            Json?
+  topic            Topic            @relation(fields: [topicId], references: [id], onDelete: Cascade)
+
+  @@index([topicId, startedAt])
+  @@index([status, startedAt])
 }
