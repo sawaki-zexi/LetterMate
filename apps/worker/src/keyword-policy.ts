@@ -1,6 +1,7 @@
 export interface KeywordPolicy {
   exactPhrase: string;
   aliases: string[];
+  requiredTermGroups?: string[][];
 }
 
 export interface KeywordCandidateText {
@@ -39,8 +40,13 @@ const containsAlias = (value: string, alias: string): boolean => {
 };
 
 const textMatchesPolicy = (value: string, policy: KeywordPolicy): boolean => {
-  if (policy.aliases.length === 0) return false;
   const normalized = normalizeText(value);
+  if (policy.requiredTermGroups !== undefined) {
+    return policy.requiredTermGroups.length > 0 && policy.requiredTermGroups.every(
+      (aliases) => aliases.some((alias) => containsAlias(normalized, alias)),
+    );
+  }
+  if (policy.aliases.length === 0) return false;
   return policy.aliases.some((alias) => containsAlias(normalized, alias));
 };
 
@@ -58,6 +64,24 @@ export const buildKeywordPolicy = (keyword: string): KeywordPolicy => {
   return { exactPhrase, aliases };
 };
 
+export const buildRequiredKeywordPolicy = (
+  requiredTerms: readonly string[],
+  queryPhrase?: string,
+): KeywordPolicy => {
+  const groups: string[][] = [];
+  const seen = new Set<string>();
+  for (const term of requiredTerms) {
+    const policy = buildKeywordPolicy(term);
+    if (seen.has(policy.exactPhrase)) continue;
+    seen.add(policy.exactPhrase);
+    groups.push(policy.aliases);
+  }
+  if (groups.length === 0) throw new Error('At least one required term is needed');
+  const phrase = queryPhrase?.trim() || requiredTerms.join(' ');
+  const base = buildKeywordPolicy(phrase);
+  return { ...base, requiredTermGroups: groups };
+};
+
 export const filterQueriesForPolicy = (
   queries: readonly string[],
   policy: KeywordPolicy,
@@ -66,5 +90,9 @@ export const filterQueriesForPolicy = (
 export const candidateMatchesKeyword = (
   candidate: KeywordCandidateText,
   policy: KeywordPolicy,
-): boolean => [candidate.title, candidate.content]
-  .some((value) => value !== null && textMatchesPolicy(value, policy));
+): boolean => textMatchesPolicy(
+  [candidate.title, candidate.content]
+    .filter((value): value is string => value !== null)
+    .join(' '),
+  policy,
+);

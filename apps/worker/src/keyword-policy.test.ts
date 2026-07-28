@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildKeywordPolicy,
+  buildRequiredKeywordPolicy,
   candidateMatchesKeyword,
   filterQueriesForPolicy,
 } from './keyword-policy.js';
@@ -87,5 +88,33 @@ describe('keyword policy', () => {
       exactPhrase: '智能体',
       aliases: ['智能体'],
     });
+  });
+
+  it('requires every precise identifier group while allowing deterministic aliases per group', () => {
+    const policy = buildRequiredKeywordPolicy(['OpenAI', 'gpt-5.7'], 'OpenAI gpt-5.7 release');
+
+    expect(candidateMatchesKeyword({
+      title: 'OpenAI publishes GPT 5.7 release notes',
+      content: null,
+    }, policy)).toBe(true);
+    expect(candidateMatchesKeyword({
+      title: 'GPT-5.7 release notes from another lab',
+      content: null,
+    }, policy)).toBe(false);
+    expect(candidateMatchesKeyword({
+      title: 'OpenAI publishes GPT-5.7.1 release notes',
+      content: null,
+    }, policy)).toBe(false);
+  });
+
+  it('normalizes and deduplicates required identifiers and rejects degenerate terms', () => {
+    expect(buildRequiredKeywordPolicy([' OpenAI ', 'openai', 'GPT-5.7'])).toMatchObject({
+      requiredTermGroups: [
+        ['openai'],
+        ['gpt-5.7', 'gpt 5.7', 'gpt5.7'],
+      ],
+    });
+    expect(() => buildRequiredKeywordPolicy(['---'])).toThrow(/letter or number/i);
+    expect(() => buildRequiredKeywordPolicy([])).toThrow(/required term/i);
   });
 });

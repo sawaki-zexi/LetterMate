@@ -31,7 +31,25 @@ export interface CompositionCandidate {
   assessment: QualityAssessment;
 }
 
+export interface TrendSeedClassificationInput {
+  id: string;
+  title: string;
+  platform: string;
+  sourceUrl: string;
+}
+
+export interface TrendSeedDecision {
+  id: string;
+  accepted: boolean;
+  query: string | null;
+  requiredTerms: string[];
+}
+
 export interface AiGateway {
+  classifyTrendSeeds(input: {
+    seeds: TrendSeedClassificationInput[];
+    signal?: AbortSignal;
+  }): Promise<TrendSeedDecision[]>;
   expandTopic(input: { keyword: string; signal?: AbortSignal }): Promise<ExpandedTopic>;
   evaluateCandidates(input: {
     keyword: string;
