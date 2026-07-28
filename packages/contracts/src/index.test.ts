@@ -19,6 +19,23 @@ import {
   trendStatusSchema,
 } from './index.js';
 
+const feedItemFixture = {
+  id: 'item-1',
+  kind: 'hot' as const,
+  title: 'Project update',
+  summary: 'Chinese summary',
+  reason: 'Recent primary-source announcement',
+  sourceUrls: ['https://example.com/project'],
+  publishedAt: '2026-07-27T08:00:00.000Z',
+  discoveredAt: '2026-07-27T08:05:00.000Z',
+  sourceType: 'web' as const,
+  platform: 'Example',
+  authorName: null,
+  authorHandle: null,
+  externalId: '123',
+  provenanceKind: 'fetched_page' as const,
+};
+
 describe('AI discovery contracts', () => {
   it('shares one stable discovery queue name', () => {
     expect(discoveryQueueName).toBe('topic-discovery');
@@ -94,19 +111,55 @@ describe('AI discovery contracts', () => {
     expect(() => feedOriginSchema.parse('keyword')).toThrow();
   });
 
-  it('accepts public run summaries and rejects invalid item counts', () => {
-    const run = runSummarySchema.parse({
+  it('accepts authoritative run summaries for every status', () => {
+    const baseRun = {
       id: 'run-1',
       trigger: 'manual',
-      status: 'succeeded',
       startedAt: '2026-07-28T00:00:00.000Z',
-      finishedAt: '2026-07-28T00:01:00.000Z',
-      newItemCount: 3,
-    });
+    } as const;
+    const runs = [
+      { ...baseRun, status: 'queued' as const, finishedAt: null, newItemCount: null },
+      { ...baseRun, status: 'running' as const, finishedAt: null, newItemCount: null },
+      {
+        ...baseRun,
+        status: 'succeeded' as const,
+        finishedAt: '2026-07-28T00:01:00.000Z',
+        newItemCount: 3,
+      },
+      {
+        ...baseRun,
+        status: 'failed' as const,
+        finishedAt: '2026-07-28T00:01:00.000Z',
+        newItemCount: null,
+      },
+    ];
 
-    expect(run).toMatchObject({ newItemCount: 3 });
-    expect(() => runSummarySchema.parse({ ...run, newItemCount: -1 })).toThrow();
-    expect(() => runSummarySchema.parse({ ...run, newItemCount: 1.5 })).toThrow();
+    expect(runs.map((run) => runSummarySchema.parse(run).status)).toEqual([
+      'queued',
+      'running',
+      'succeeded',
+      'failed',
+    ]);
+  });
+
+  it.each([
+    ['queued with a finish time', { status: 'queued', finishedAt: '2026-07-28T00:01:00.000Z', newItemCount: null }],
+    ['queued with a count', { status: 'queued', finishedAt: null, newItemCount: 0 }],
+    ['running with a finish time', { status: 'running', finishedAt: '2026-07-28T00:01:00.000Z', newItemCount: null }],
+    ['running with a count', { status: 'running', finishedAt: null, newItemCount: 0 }],
+    ['succeeded without a finish time', { status: 'succeeded', finishedAt: null, newItemCount: 1 }],
+    ['succeeded without a count', { status: 'succeeded', finishedAt: '2026-07-28T00:01:00.000Z', newItemCount: null }],
+    ['succeeded with a negative count', { status: 'succeeded', finishedAt: '2026-07-28T00:01:00.000Z', newItemCount: -1 }],
+    ['succeeded with a fractional count', { status: 'succeeded', finishedAt: '2026-07-28T00:01:00.000Z', newItemCount: 1.5 }],
+    ['failed without a finish time', { status: 'failed', finishedAt: null, newItemCount: null }],
+    ['failed with a count', { status: 'failed', finishedAt: '2026-07-28T00:01:00.000Z', newItemCount: 1 }],
+  ])('rejects impossible run state: %s', (_label, state) => {
+    expect(() => runSummarySchema.parse({
+      id: 'run-1',
+      trigger: 'manual',
+      startedAt: '2026-07-28T00:00:00.000Z',
+      ...state,
+    })).toThrow();
   });
 
   it('accepts scheduled topics with a constrained interval', () => {
@@ -181,24 +234,8 @@ describe('AI discovery contracts', () => {
   });
 
   it('discriminates topic and trend feed items by origin', () => {
-    const baseItem = {
-      id: 'item-1',
-      kind: 'hot' as const,
-      title: 'Project update',
-      summary: 'Chinese summary',
-      reason: 'Recent primary-source announcement',
-      sourceUrls: ['https://example.com/project'],
-      publishedAt: '2026-07-27T08:00:00.000Z',
-      discoveredAt: '2026-07-27T08:05:00.000Z',
-      sourceType: 'web' as const,
-      platform: 'Example',
-      authorName: null,
-      authorHandle: null,
-      externalId: '123',
-      provenanceKind: 'fetched_page' as const,
-    };
-    const topicItem = { ...baseItem, origin: 'topic' as const, topicId: 'topic-1' };
-    const trendItem = { ...baseItem, origin: 'trend' as const, topicId: null };
+    const topicItem = { ...feedItemFixture, origin: 'topic' as const, topicId: 'topic-1' };
+    const trendItem = { ...feedItemFixture, origin: 'trend' as const, topicId: null };
 
     expect(topicFeedItemSchema.parse(topicItem).origin).toBe('topic');
     expect(trendFeedItemSchema.parse(trendItem).origin).toBe('trend');
@@ -206,6 +243,74 @@ describe('AI discovery contracts', () => {
     expect(feedItemSchema.parse(trendItem).topicId).toBeNull();
     expect(() => feedItemSchema.parse({ ...topicItem, topicId: null })).toThrow();
     expect(() => feedItemSchema.parse({ ...trendItem, topicId: 'topic-1' })).toThrow();
+  });
+
+  it('accepts only HTTP(S) citations and feed source URLs', () => {
+    const httpUrls = ['http://example.com/source', 'https://example.com/source'];
+
+    expect(discoveryResultSchema.parse({ citations: httpUrls, items: [] }).citations).toEqual(
+      httpUrls,
+    );
+    for (const sourceUrl of httpUrls) {
+      const topicItem = {
+        ...feedItemFixture,
+        sourceUrls: [sourceUrl],
+        origin: 'topic' as const,
+        topicId: 'topic-1',
+      };
+      const trendItem = {
+        ...feedItemFixture,
+        sourceUrls: [sourceUrl],
+        origin: 'trend' as const,
+        topicId: null,
+      };
+
+      expect(topicFeedItemSchema.parse(topicItem).sourceUrls).toEqual([sourceUrl]);
+      expect(trendFeedItemSchema.parse(trendItem).sourceUrls).toEqual([sourceUrl]);
+      expect(feedItemSchema.parse(topicItem).sourceUrls).toEqual([sourceUrl]);
+      expect(feedItemSchema.parse(trendItem).sourceUrls).toEqual([sourceUrl]);
+    }
+  });
+
+  it.each([
+    'javascript:alert(1)',
+    'data:text/plain,unsafe',
+    'file:///tmp/unsafe',
+    'ftp://example.com/unsafe',
+  ])('rejects non-HTTP(S) citations and feed source URLs: %s', (sourceUrl) => {
+    const topicItem = {
+      ...feedItemFixture,
+      sourceUrls: [sourceUrl],
+      origin: 'topic' as const,
+      topicId: 'topic-1',
+    };
+    const trendItem = {
+      ...feedItemFixture,
+      sourceUrls: [sourceUrl],
+      origin: 'trend' as const,
+      topicId: null,
+    };
+
+    expect(() => discoveryResultSchema.parse({ citations: [sourceUrl], items: [] })).toThrow();
+    expect(() => topicFeedItemSchema.parse(topicItem)).toThrow();
+    expect(() => trendFeedItemSchema.parse(trendItem)).toThrow();
+    expect(() => feedItemSchema.parse(topicItem)).toThrow();
+    expect(() => feedItemSchema.parse(trendItem)).toThrow();
+  });
+
+  it('rejects unknown keys at public Task 1 DTO boundaries', () => {
+    const topicItem = { ...feedItemFixture, origin: 'topic' as const, topicId: 'topic-1' };
+    const trendItem = { ...feedItemFixture, origin: 'trend' as const, topicId: null };
+
+    expect(() => trendJobDataSchema.parse({
+      userId: 'user-a',
+      trigger: 'manual',
+      internalJobId: 'secret',
+    })).toThrow();
+    expect(() => topicFeedItemSchema.parse({ ...topicItem, internalRank: 1 })).toThrow();
+    expect(() => trendFeedItemSchema.parse({ ...trendItem, internalRank: 1 })).toThrow();
+    expect(() => feedItemSchema.parse({ ...topicItem, internalRank: 1 })).toThrow();
+    expect(() => feedItemSchema.parse({ ...trendItem, internalRank: 1 })).toThrow();
   });
 
   it('accepts only the public trend monitor status shape', () => {
@@ -227,6 +332,23 @@ describe('AI discovery contracts', () => {
     expect(trendStatusSchema.parse(status)).toEqual(status);
     expect(() => trendStatusSchema.parse({ ...status, intervalHours: 1 })).toThrow();
     expect(() => trendStatusSchema.parse({ ...status, leaseToken: 'internal-secret' })).toThrow();
+    expect(() => trendStatusSchema.parse({
+      ...status,
+      lastRun: { ...status.lastRun, connectorFailures: [] },
+    })).toThrow();
+    expect(() => topicSchema.parse({
+      id: 'topic-1',
+      userId: 'user-1',
+      keyword: 'AI agents',
+      expandedTerms: [],
+      createdAt: '2026-07-27T00:00:00.000Z',
+      lastRunAt: null,
+      nextRunAt: null,
+      scheduleIntervalHours: 12,
+      runStatus: 'running',
+      lastError: null,
+      lastRun: { ...status.lastRun, connectorFailures: [] },
+    })).toThrow();
   });
 
   it('accepts connector status without trust classifications', () => {

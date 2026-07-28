@@ -17,6 +17,9 @@ export const sourceTypeSchema = z.enum([
 export const discoveryTriggerSchema = z.enum(['initial', 'manual', 'scheduled']);
 export const feedRangeSchema = z.enum(['1d', '3d', '7d', '30d', '90d', 'all']);
 export const feedOriginSchema = z.enum(['all', 'topic', 'trend']);
+export const httpUrlSchema = z.url().refine((url) => /^https?:\/\//i.test(url), {
+  message: 'URL must use HTTP or HTTPS',
+});
 export const provenanceKindSchema = z.enum([
   'ai_citation',
   'api_record',
@@ -40,14 +43,38 @@ export const safeErrorSchema = z.object({
   message: z.string().min(1),
 });
 
-export const runSummarySchema = z.object({
+const runSummaryBaseShape = {
   id: z.string().min(1),
   trigger: discoveryTriggerSchema,
-  status: runStatusSchema,
   startedAt: z.iso.datetime(),
-  finishedAt: z.iso.datetime().nullable(),
-  newItemCount: z.number().int().nonnegative().nullable(),
-});
+};
+
+export const runSummarySchema = z.discriminatedUnion('status', [
+  z.strictObject({
+    ...runSummaryBaseShape,
+    status: z.literal('queued'),
+    finishedAt: z.null(),
+    newItemCount: z.null(),
+  }),
+  z.strictObject({
+    ...runSummaryBaseShape,
+    status: z.literal('running'),
+    finishedAt: z.null(),
+    newItemCount: z.null(),
+  }),
+  z.strictObject({
+    ...runSummaryBaseShape,
+    status: z.literal('succeeded'),
+    finishedAt: z.iso.datetime(),
+    newItemCount: z.number().int().nonnegative(),
+  }),
+  z.strictObject({
+    ...runSummaryBaseShape,
+    status: z.literal('failed'),
+    finishedAt: z.iso.datetime(),
+    newItemCount: z.null(),
+  }),
+]);
 
 export const topicSchema = z.object({
   id: z.string().min(1),
@@ -76,7 +103,7 @@ export const discoveryCandidateSchema = z.object({
   title: z.string().trim().min(1).max(300),
   summary: z.string().trim().min(1).max(1_000),
   reason: z.string().trim().min(1).max(500),
-  sourceUrls: z.array(z.url()).min(1).max(8),
+  sourceUrls: z.array(httpUrlSchema).min(1).max(8),
   publishedAt: z.iso.datetime().nullable(),
   sourceType: sourceTypeSchema,
   platform: z.string().trim().min(1),
@@ -88,7 +115,7 @@ export const discoveryCandidateSchema = z.object({
 
 export const discoveryResultSchema = z.object({
   items: z.array(discoveryCandidateSchema).max(30),
-  citations: z.array(z.url()).max(100),
+  citations: z.array(httpUrlSchema).max(100),
 });
 
 export const discoveryItemSchema = discoveryCandidateSchema.extend({
@@ -100,12 +127,12 @@ export const discoveryItemSchema = discoveryCandidateSchema.extend({
 export const topicFeedItemSchema = discoveryItemSchema.extend({
   origin: z.literal('topic'),
   topicId: z.string().min(1),
-});
+}).strict();
 
 export const trendFeedItemSchema = discoveryItemSchema.omit({ topicId: true }).extend({
   origin: z.literal('trend'),
   topicId: z.null(),
-});
+}).strict();
 
 export const feedItemSchema = z.discriminatedUnion('origin', [
   topicFeedItemSchema,
@@ -118,7 +145,7 @@ export const discoveryJobDataSchema = z.object({
   trigger: discoveryTriggerSchema,
 });
 
-export const trendJobDataSchema = z.object({
+export const trendJobDataSchema = z.strictObject({
   userId: z.string().min(1),
   trigger: discoveryTriggerSchema,
 });
