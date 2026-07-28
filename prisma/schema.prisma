@@ -151,6 +151,7 @@ model TrendMonitor {
 
   @@index([nextRunAt, runStatus])
   @@index([runStatus, runLeaseUntil])
+  @@unique([id, userId])
 }
 
 model TrendRun {
@@ -166,12 +167,13 @@ model TrendRun {
   newItemCount   Int              @default(0)
   error          Json?
   user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  monitor        TrendMonitor     @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  monitor        TrendMonitor     @relation(fields: [monitorId, userId], references: [id, userId], onDelete: Cascade)
   seeds          TrendSeed[]
   radarItems     RadarItem[]
 
   @@index([userId, status, startedAt])
   @@index([monitorId, startedAt])
+  @@unique([id, userId])
 }
 
 model TrendSeed {
@@ -186,9 +188,9 @@ model TrendSeed {
   fingerprint     String
   publishedAt     DateTime?
   discoveredAt    DateTime @default(now())
-  normalizedQuery String
+  normalizedQuery String?
   user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  run             TrendRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  run             TrendRun @relation(fields: [runId, userId], references: [id, userId], onDelete: Cascade)
 
   @@index([userId, fingerprint, discoveredAt])
   @@index([runId, discoveredAt])
@@ -214,7 +216,7 @@ model RadarItem {
   externalId          String?
   provenanceKind      ProvenanceKind @default(ai_citation)
   user                User           @relation(fields: [userId], references: [id], onDelete: Cascade)
-  run                 TrendRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  run                 TrendRun       @relation(fields: [runId, userId], references: [id, userId], onDelete: Cascade)
 
   @@unique([userId, canonicalPrimaryUrl])
   @@index([userId, publishedAt, discoveredAt])

@@ -57,6 +57,7 @@ describe('multi-source Prisma schema', () => {
     });
     expect(fieldNames('User')).toEqual(expect.arrayContaining(['trendMonitor', 'trendRuns', 'trendSeeds', 'radarItems']));
     expect(uniqueConstraints('TrendMonitor')).toContainEqual(['userId']);
+    expect(uniqueConstraints('TrendMonitor')).toContainEqual(['id', 'userId']);
   });
 
   it('persists trend runs and seeds without rankings, scores, payloads, or trust metadata', () => {
@@ -79,8 +80,18 @@ describe('multi-source Prisma schema', () => {
         ))).toBe(false);
       }
     }
-    expect(relation('TrendRun', 'monitor')).toMatchObject({ relationOnDelete: 'Cascade' });
-    expect(relation('TrendSeed', 'run')).toMatchObject({ relationOnDelete: 'Cascade' });
+    expect(relation('TrendRun', 'monitor')).toMatchObject({
+      relationFromFields: ['monitorId', 'userId'],
+      relationToFields: ['id', 'userId'],
+      relationOnDelete: 'Cascade',
+    });
+    expect(uniqueConstraints('TrendRun')).toContainEqual(['id', 'userId']);
+    expect(relation('TrendSeed', 'run')).toMatchObject({
+      relationFromFields: ['runId', 'userId'],
+      relationToFields: ['id', 'userId'],
+      relationOnDelete: 'Cascade',
+    });
+    expect(relation('TrendSeed', 'normalizedQuery')).toMatchObject({ isRequired: false });
   });
 
   it('stores user-visible radar discovery fields with per-user URL deduplication', () => {
@@ -90,7 +101,11 @@ describe('multi-source Prisma schema', () => {
       'authorName', 'authorHandle', 'externalId', 'provenanceKind',
     ]));
     expect(uniqueConstraints('RadarItem')).toContainEqual(['userId', 'canonicalPrimaryUrl']);
-    expect(relation('RadarItem', 'run')).toMatchObject({ relationOnDelete: 'Cascade' });
+    expect(relation('RadarItem', 'run')).toMatchObject({
+      relationFromFields: ['runId', 'userId'],
+      relationToFields: ['id', 'userId'],
+      relationOnDelete: 'Cascade',
+    });
   });
 
   it('migrates monitors, trend records, and operational indexes for existing users', () => {
@@ -103,33 +118,61 @@ describe('multi-source Prisma schema', () => {
     for (const tableName of ['TrendMonitor', 'TrendRun', 'TrendSeed', 'RadarItem']) {
       expect(normalizedMigration).toContain(`CREATE TABLE "${tableName}"`);
     }
-    for (const indexName of [
-      'TrendMonitor_userId_key',
-      'TrendMonitor_nextRunAt_runStatus_idx',
-      'TrendMonitor_runStatus_runLeaseUntil_idx',
-      'TrendRun_userId_status_startedAt_idx',
-      'TrendRun_monitorId_startedAt_idx',
-      'TrendSeed_userId_fingerprint_discoveredAt_idx',
-      'TrendSeed_runId_discoveredAt_idx',
-      'RadarItem_userId_canonicalPrimaryUrl_key',
-      'RadarItem_userId_publishedAt_discoveredAt_idx',
-      'RadarItem_runId_discoveredAt_idx',
+    for (const [indexName, tableName, columns] of [
+      ['TrendMonitor_userId_key', 'TrendMonitor', ['userId']],
+      ['TrendMonitor_id_userId_key', 'TrendMonitor', ['id', 'userId']],
+      ['TrendRun_id_userId_key', 'TrendRun', ['id', 'userId']],
+      ['RadarItem_userId_canonicalPrimaryUrl_key', 'RadarItem', ['userId', 'canonicalPrimaryUrl']],
     ]) {
-      expect(normalizedMigration).toMatch(new RegExp(`CREATE(?: UNIQUE)? INDEX "${indexName}" ON`));
+      expect(normalizedMigration).toMatch(new RegExp(
+        `CREATE UNIQUE INDEX "${indexName}" ON "${tableName}"\\("${columns.join('", "')}"\\);`,
+      ));
+    }
+    for (const [indexName, tableName, columns] of [
+      ['TrendMonitor_nextRunAt_runStatus_idx', 'TrendMonitor', ['nextRunAt', 'runStatus']],
+      ['TrendMonitor_runStatus_runLeaseUntil_idx', 'TrendMonitor', ['runStatus', 'runLeaseUntil']],
+      ['TrendRun_userId_status_startedAt_idx', 'TrendRun', ['userId', 'status', 'startedAt']],
+      ['TrendRun_monitorId_startedAt_idx', 'TrendRun', ['monitorId', 'startedAt']],
+      ['TrendSeed_userId_fingerprint_discoveredAt_idx', 'TrendSeed', ['userId', 'fingerprint', 'discoveredAt']],
+      ['TrendSeed_runId_discoveredAt_idx', 'TrendSeed', ['runId', 'discoveredAt']],
+      ['RadarItem_userId_publishedAt_discoveredAt_idx', 'RadarItem', ['userId', 'publishedAt', 'discoveredAt']],
+      ['RadarItem_runId_discoveredAt_idx', 'RadarItem', ['runId', 'discoveredAt']],
+    ]) {
+      expect(normalizedMigration).toMatch(new RegExp(
+        `CREATE INDEX "${indexName}" ON "${tableName}"\\("${columns.join('", "')}"\\);`,
+      ));
     }
     for (const [tableName, constraintName] of [
       ['TrendMonitor', 'TrendMonitor_userId_fkey'],
       ['TrendRun', 'TrendRun_userId_fkey'],
-      ['TrendRun', 'TrendRun_monitorId_fkey'],
       ['TrendSeed', 'TrendSeed_userId_fkey'],
-      ['TrendSeed', 'TrendSeed_runId_fkey'],
       ['RadarItem', 'RadarItem_userId_fkey'],
-      ['RadarItem', 'RadarItem_runId_fkey'],
     ]) {
-      expect(normalizedMigration).toMatch(new RegExp(
-        `ALTER TABLE "${tableName}" ADD CONSTRAINT "${constraintName}" FOREIGN KEY \\([^;]+ ON DELETE CASCADE ON UPDATE CASCADE;`,
-      ));
+      expect(normalizedMigration).toContain(
+        `ALTER TABLE "${tableName}" ADD CONSTRAINT "${constraintName}" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;`,
+      );
     }
+    for (const [tableName, constraintName, childColumns, parentTable] of [
+      ['TrendRun', 'TrendRun_monitorId_userId_fkey', ['monitorId', 'userId'], 'TrendMonitor'],
+      ['TrendSeed', 'TrendSeed_runId_userId_fkey', ['runId', 'userId'], 'TrendRun'],
+      ['RadarItem', 'RadarItem_runId_userId_fkey', ['runId', 'userId'], 'TrendRun'],
+    ]) {
+      expect(normalizedMigration).toContain(
+        `ALTER TABLE "${tableName}" ADD CONSTRAINT "${constraintName}" FOREIGN KEY ("${childColumns.join('", "')}") REFERENCES "${parentTable}"("id", "userId") ON DELETE CASCADE ON UPDATE CASCADE;`,
+      );
+    }
+    expect(normalizedMigration).toMatch(
+      /CREATE TABLE "TrendMonitor" \([^;]*"runStatus" "RunStatus" NOT NULL DEFAULT 'queued',[^;]*"nextRunAt" TIMESTAMP\(3\) NOT NULL DEFAULT CURRENT_TIMESTAMP,[^;]*"intervalHours" INTEGER NOT NULL DEFAULT 4,[^;]*"manualRefreshPending" BOOLEAN NOT NULL DEFAULT false,/,
+    );
+    expect(normalizedMigration).toMatch(
+      /CREATE TABLE "TrendRun" \([^;]*"trigger" "DiscoveryTrigger" NOT NULL,[^;]*"status" "RunStatus" NOT NULL DEFAULT 'queued',[^;]*"candidateCount" INTEGER NOT NULL DEFAULT 0,[^;]*"acceptedCount" INTEGER NOT NULL DEFAULT 0,[^;]*"newItemCount" INTEGER NOT NULL DEFAULT 0,/,
+    );
+    expect(normalizedMigration).toMatch(
+      /CREATE TABLE "TrendSeed" \([^;]*"normalizedQuery" TEXT,[^;]*CONSTRAINT "TrendSeed_pkey"/,
+    );
+    expect(normalizedMigration).toMatch(
+      /CREATE TABLE "RadarItem" \([^;]*"sourceUrls" TEXT\[\] NOT NULL,[^;]*"provenanceKind" "ProvenanceKind" NOT NULL DEFAULT 'ai_citation',/,
+    );
     expect(normalizedMigration).toMatch(
       /INSERT INTO "TrendMonitor" \("id", "userId", "runStatus", "nextRunAt", "intervalHours", "manualRefreshPending"\) SELECT .+ "id", 'queued', NOW\(\), 4, false FROM "User";/,
     );

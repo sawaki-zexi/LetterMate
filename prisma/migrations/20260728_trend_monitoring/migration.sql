@@ -43,7 +43,7 @@ CREATE TABLE "TrendSeed" (
     "fingerprint" TEXT NOT NULL,
     "publishedAt" TIMESTAMP(3),
     "discoveredAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "normalizedQuery" TEXT NOT NULL,
+    "normalizedQuery" TEXT,
 
     CONSTRAINT "TrendSeed_pkey" PRIMARY KEY ("id")
 );
@@ -76,6 +76,9 @@ CREATE TABLE "RadarItem" (
 CREATE UNIQUE INDEX "TrendMonitor_userId_key" ON "TrendMonitor"("userId");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "TrendMonitor_id_userId_key" ON "TrendMonitor"("id", "userId");
+
+-- CreateIndex
 CREATE INDEX "TrendMonitor_nextRunAt_runStatus_idx" ON "TrendMonitor"("nextRunAt", "runStatus");
 
 -- CreateIndex
@@ -86,6 +89,9 @@ CREATE INDEX "TrendRun_userId_status_startedAt_idx" ON "TrendRun"("userId", "sta
 
 -- CreateIndex
 CREATE INDEX "TrendRun_monitorId_startedAt_idx" ON "TrendRun"("monitorId", "startedAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "TrendRun_id_userId_key" ON "TrendRun"("id", "userId");
 
 -- CreateIndex
 CREATE INDEX "TrendSeed_userId_fingerprint_discoveredAt_idx" ON "TrendSeed"("userId", "fingerprint", "discoveredAt");
@@ -109,19 +115,19 @@ ALTER TABLE "TrendMonitor" ADD CONSTRAINT "TrendMonitor_userId_fkey" FOREIGN KEY
 ALTER TABLE "TrendRun" ADD CONSTRAINT "TrendRun_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "TrendRun" ADD CONSTRAINT "TrendRun_monitorId_fkey" FOREIGN KEY ("monitorId") REFERENCES "TrendMonitor"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "TrendRun" ADD CONSTRAINT "TrendRun_monitorId_userId_fkey" FOREIGN KEY ("monitorId", "userId") REFERENCES "TrendMonitor"("id", "userId") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "TrendSeed" ADD CONSTRAINT "TrendSeed_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "TrendSeed" ADD CONSTRAINT "TrendSeed_runId_fkey" FOREIGN KEY ("runId") REFERENCES "TrendRun"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "TrendSeed" ADD CONSTRAINT "TrendSeed_runId_userId_fkey" FOREIGN KEY ("runId", "userId") REFERENCES "TrendRun"("id", "userId") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "RadarItem" ADD CONSTRAINT "RadarItem_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "RadarItem" ADD CONSTRAINT "RadarItem_runId_fkey" FOREIGN KEY ("runId") REFERENCES "TrendRun"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "RadarItem" ADD CONSTRAINT "RadarItem_runId_userId_fkey" FOREIGN KEY ("runId", "userId") REFERENCES "TrendRun"("id", "userId") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- Backfill one monitor for every existing user. PostgreSQL's core md5 function avoids requiring a UUID extension.
 INSERT INTO "TrendMonitor" ("id", "userId", "runStatus", "nextRunAt", "intervalHours", "manualRefreshPending")
