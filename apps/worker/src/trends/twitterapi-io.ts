@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { createTrendCandidate } from './candidate.js';
-import { readBoundedJson } from './http.js';
+import { cancelResponseBody, readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const trendSchema = z.object({
@@ -85,11 +85,14 @@ export class TwitterApiIoTrendSource implements TrendSource {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'TwitterAPI.io collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'TwitterAPI.io is temporarily unavailable', true);
     }
-    if (response.status === 401 || response.status === 403) {
-      throw new TrendSourceError('TREND_SOURCE_AUTH_FAILED', 'TwitterAPI.io credentials are unavailable', false);
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      if (response.status === 401 || response.status === 403) {
+        throw new TrendSourceError('TREND_SOURCE_AUTH_FAILED', 'TwitterAPI.io credentials are unavailable', false);
+      }
+      if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'TwitterAPI.io rate limit reached', true);
+      throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'TwitterAPI.io is temporarily unavailable', response.status >= 500);
     }
-    if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'TwitterAPI.io rate limit reached', true);
-    if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'TwitterAPI.io is temporarily unavailable', response.status >= 500);
     try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 

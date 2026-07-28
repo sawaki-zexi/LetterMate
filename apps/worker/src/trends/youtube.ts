@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { createTrendCandidate } from './candidate.js';
-import { readBoundedJson } from './http.js';
+import { cancelResponseBody, readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const rfc3339Timestamp = /^(\d{4})-(\d{2})-(\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
@@ -95,9 +95,12 @@ export class YouTubeTrendSource implements TrendSource {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'YouTube collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'YouTube is temporarily unavailable', true);
     }
-    if (response.status === 401 || response.status === 403) throw new TrendSourceError('TREND_SOURCE_AUTH_FAILED', 'YouTube credentials are unavailable', false);
-    if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'YouTube rate limit reached', true);
-    if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'YouTube is temporarily unavailable', response.status >= 500);
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      if (response.status === 401 || response.status === 403) throw new TrendSourceError('TREND_SOURCE_AUTH_FAILED', 'YouTube credentials are unavailable', false);
+      if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'YouTube rate limit reached', true);
+      throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'YouTube is temporarily unavailable', response.status >= 500);
+    }
     try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 

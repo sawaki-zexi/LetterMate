@@ -75,10 +75,13 @@ describe('YouTubeTrendSource', () => {
     await expect(malformed.collect(window, new AbortController().signal)).resolves.toEqual({
       candidates: [], requestCount: 1,
     });
-    const denied = new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, vi.fn().mockResolvedValue(new Response('secret body', { status: 403 })) as typeof fetch);
+    const deniedResponse = new Response('secret body', { status: 403 });
+    const cancel = vi.spyOn(deniedResponse.body!, 'cancel');
+    const denied = new YouTubeTrendSource({ apiKey: 'key', region: 'US' }, vi.fn().mockResolvedValue(deniedResponse) as typeof fetch);
     await expect(denied.collect(window, new AbortController().signal)).rejects.toMatchObject({
       code: 'TREND_SOURCE_AUTH_FAILED', message: 'YouTube credentials are unavailable',
     });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('rejects an oversized JSON response before parsing it', async () => {

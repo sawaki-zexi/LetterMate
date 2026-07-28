@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { createTrendCandidate, isoFromUnixSeconds } from './candidate.js';
-import { readBoundedJson } from './http.js';
+import { cancelResponseBody, readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSeedCandidate, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const storyIdsSchema = z.array(z.number().int().positive()).max(500);
@@ -70,8 +70,11 @@ export class HackerNewsTrendSource implements TrendSource {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'Hacker News collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Hacker News is temporarily unavailable', true);
     }
-    if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'Hacker News rate limit reached', true);
-    if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Hacker News is temporarily unavailable', response.status >= 500);
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'Hacker News rate limit reached', true);
+      throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Hacker News is temporarily unavailable', response.status >= 500);
+    }
     try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 

@@ -111,12 +111,15 @@ describe('RedditTrendSource', () => {
   });
 
   it('sanitizes OAuth and listing failures', async () => {
+    const response = new Response('private token body', { status: 401 });
+    const cancel = vi.spyOn(response.body!, 'cancel');
     const source = new RedditTrendSource({ clientId: 'private-id', clientSecret: 'private-secret', communities: ['programming'] }, vi.fn()
-      .mockResolvedValue(new Response('private token body', { status: 401 })) as typeof fetch);
+      .mockResolvedValue(response) as typeof fetch);
     let error: unknown;
     try { await source.collect(window, new AbortController().signal); } catch (caught) { error = caught; }
     expect(error).toMatchObject({ code: 'TREND_SOURCE_AUTH_FAILED', message: 'Reddit credentials are unavailable' });
     expect(String(error)).not.toContain('private');
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('rejects an oversized OAuth JSON response before parsing it', async () => {

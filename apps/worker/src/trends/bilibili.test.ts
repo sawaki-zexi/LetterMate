@@ -53,10 +53,13 @@ describe('BilibiliTrendSource', () => {
       new Response(JSON.stringify({ code: -412, message: 'private response' }), { status: 200 }),
     ) as typeof fetch);
     await expect(rejected.collect(window, new AbortController().signal)).rejects.toMatchObject({ code: 'TREND_SOURCE_RESPONSE_INVALID' });
-    const unavailable = new BilibiliTrendSource({}, vi.fn().mockResolvedValue(new Response('body', { status: 503 })) as typeof fetch);
+    const unavailableResponse = new Response('body', { status: 503 });
+    const cancel = vi.spyOn(unavailableResponse.body!, 'cancel');
+    const unavailable = new BilibiliTrendSource({}, vi.fn().mockResolvedValue(unavailableResponse) as typeof fetch);
     await expect(unavailable.collect(window, new AbortController().signal)).rejects.toMatchObject({
       code: 'TREND_SOURCE_UNAVAILABLE', message: 'Bilibili is temporarily unavailable',
     });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('rejects an oversized JSON response before parsing it', async () => {

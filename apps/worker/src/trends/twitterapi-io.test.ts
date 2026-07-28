@@ -36,15 +36,18 @@ describe('TwitterApiIoTrendSource', () => {
 
   it('is enabled only with a configured key and maps failures without exposing it', async () => {
     expect(new TwitterApiIoTrendSource({ apiKey: undefined, woeids: [1] }).isEnabled()).toBe(false);
+    const response = new Response('private upstream body', { status: 401 });
+    const cancel = vi.spyOn(response.body!, 'cancel');
     const source = new TwitterApiIoTrendSource({ apiKey: 'top-secret', woeids: [1] }, vi.fn()
-      .mockResolvedValue(new Response('private upstream body', { status: 401 })) as typeof fetch);
+      .mockResolvedValue(response) as typeof fetch);
 
-    await expect(source.collect(window, new AbortController().signal)).rejects.toEqual(
-      expect.objectContaining<Partial<TrendSourceError>>({
-        code: 'TREND_SOURCE_AUTH_FAILED', message: 'TwitterAPI.io credentials are unavailable',
-      }),
-    );
-    await expect(source.collect(window, new AbortController().signal)).rejects.not.toThrow('top-secret');
+    let error: unknown;
+    try { await source.collect(window, new AbortController().signal); } catch (caught) { error = caught; }
+    expect(error).toEqual(expect.objectContaining<Partial<TrendSourceError>>({
+      code: 'TREND_SOURCE_AUTH_FAILED', message: 'TwitterAPI.io credentials are unavailable',
+    }));
+    expect(String(error)).not.toContain('top-secret');
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('does not request or emit candidates when either output or request budget is zero', async () => {

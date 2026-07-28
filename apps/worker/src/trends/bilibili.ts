@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { createTrendCandidate, isoFromUnixSeconds } from './candidate.js';
-import { readBoundedJson } from './http.js';
+import { cancelResponseBody, readBoundedJson } from './http.js';
 import { TrendSourceError, type TrendSource, type TrendSourceResult, type TrendWindow } from './types.js';
 
 const responseSchema = z.object({
@@ -77,8 +77,11 @@ export class BilibiliTrendSource implements TrendSource {
       if (signal.aborted) throw new TrendSourceError('TREND_SOURCE_ABORTED', 'Bilibili collection was aborted', true);
       throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Bilibili is temporarily unavailable', true);
     }
-    if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'Bilibili rate limit reached', true);
-    if (!response.ok) throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Bilibili is temporarily unavailable', response.status >= 500);
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      if (response.status === 429) throw new TrendSourceError('TREND_SOURCE_RATE_LIMITED', 'Bilibili rate limit reached', true);
+      throw new TrendSourceError('TREND_SOURCE_UNAVAILABLE', 'Bilibili is temporarily unavailable', response.status >= 500);
+    }
     try { return await readBoundedJson(response); } catch { throw this.invalid(); }
   }
 

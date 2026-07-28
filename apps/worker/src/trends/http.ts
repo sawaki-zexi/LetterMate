@@ -5,6 +5,10 @@ export class BoundedResponseError extends Error {
   }
 }
 
+export async function cancelResponseBody(response: Response): Promise<void> {
+  try { await response.body?.cancel(); } catch { /* Preserve the caller's safe status error. */ }
+}
+
 const rejectOversized = async (response: Response): Promise<never> => {
   await response.body?.cancel();
   throw new BoundedResponseError('Response body exceeds the size limit');

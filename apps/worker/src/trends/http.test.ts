@@ -1,7 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
-import { BoundedResponseError, readBoundedJson } from './http.js';
+import { BoundedResponseError, cancelResponseBody, readBoundedJson } from './http.js';
 
 describe('bounded trend HTTP responses', () => {
+  it('cancels a failed response body exactly once and swallows cancellation errors', async () => {
+    const response = new Response('failed body');
+    const cancel = vi.spyOn(response.body!, 'cancel').mockRejectedValue(new Error('private cancel failure'));
+
+    await expect(cancelResponseBody(response)).resolves.toBeUndefined();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it('rejects a declared JSON body larger than the configured limit without parsing it', async () => {
     const response = new Response('{"private":"body"}', {
       headers: { 'content-length': '1000', 'content-type': 'application/json' },

@@ -83,11 +83,12 @@ describe('HackerNewsTrendSource', () => {
   });
 
   it('maps HTTP 429 to the shared rate-limit failure code', async () => {
-    const source = new HackerNewsTrendSource(vi.fn().mockResolvedValue(
-      new Response('private body', { status: 429 }),
-    ) as typeof fetch);
+    const response = new Response('private body', { status: 429 });
+    const cancel = vi.spyOn(response.body!, 'cancel');
+    const source = new HackerNewsTrendSource(vi.fn().mockResolvedValue(response) as typeof fetch);
     await expect(source.collect(window, new AbortController().signal)).rejects.toMatchObject({
       code: 'TREND_SOURCE_RATE_LIMITED', retryable: true,
     });
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });

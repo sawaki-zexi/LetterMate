@@ -209,16 +209,19 @@ describe('TrendSourceRegistry', () => {
   });
 
   it('accounts one sanitized request when a fixed API returns a redirect', async () => {
-    const fetcher = vi.fn().mockResolvedValue(new Response('private redirect body', {
+    const redirectResponse = new Response('private redirect body', {
       status: 302,
       headers: { location: 'https://redirect.example/leak' },
-    }));
+    });
+    const cancel = vi.spyOn(redirectResponse.body!, 'cancel');
+    const fetcher = vi.fn().mockResolvedValue(redirectResponse);
     const twitter = new TwitterApiIoTrendSource({ apiKey: 'private-key', woeids: [1] }, fetcher as typeof fetch);
     const registry = new TrendSourceRegistry([twitter], { concurrency: 1, timeoutMs: 1_000 });
 
     const result = await registry.collect(window);
 
     expect(fetcher).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls[0]![1]).toMatchObject({ redirect: 'error' });
     expect(result).toMatchObject({
       requestCount: 1,
