@@ -1,6 +1,6 @@
 import { parseConfig } from '@lettermate/config';
 import { describe, expect, it } from 'vitest';
-import { createSourceConnectors } from './runtime.js';
+import { createSourceConnectors, createTrendSources } from './runtime.js';
 
 describe('worker connector runtime', () => {
   it('registers every approved source without requiring optional credentials', () => {
@@ -53,5 +53,41 @@ describe('worker connector runtime', () => {
       'youtube',
       'reddit',
     ]));
+  });
+});
+
+describe('worker trend source runtime', () => {
+  it('constructs every trend source while enabling only credential-free defaults', () => {
+    const sources = createTrendSources(parseConfig({ TREND_MONITOR_ENABLED: 'false' }));
+
+    expect(sources.map(({ id }) => id)).toEqual([
+      'twitter-trends',
+      'hacker-news-trends',
+      'youtube-trends',
+      'reddit-trends',
+      'bilibili-trends',
+      'google-trends-rss',
+    ]);
+    expect(sources.filter((source) => source.isEnabled()).map(({ id }) => id)).toEqual([
+      'hacker-news-trends',
+      'bilibili-trends',
+    ]);
+  });
+
+  it('uses existing server configuration to enable optional trend sources', () => {
+    const sources = createTrendSources(parseConfig({
+      TWITTERAPI_IO_API_KEY: 'twitter-key',
+      YOUTUBE_API_KEY: 'youtube-key',
+      REDDIT_CLIENT_ID: 'reddit-id',
+      REDDIT_CLIENT_SECRET: 'reddit-secret',
+      TREND_X_WOEIDS: '1,23424977',
+      TREND_YOUTUBE_REGION: 'CA',
+      TREND_REDDIT_COMMUNITIES: 'programming,technology',
+      TREND_GOOGLE_RSS_URLS: 'https://example.com/trends.xml',
+    }));
+
+    expect(sources.filter((source) => source.isEnabled()).map(({ id }) => id)).toEqual(
+      sources.map(({ id }) => id),
+    );
   });
 });

@@ -11,6 +11,13 @@ import { SearchProviderConnector } from './connectors/search-provider.js';
 import { TwitterApiIoConnector } from './connectors/twitterapi-io.js';
 import type { SourceConnector } from './connectors/types.js';
 import { YouTubeConnector } from './connectors/youtube.js';
+import { BilibiliTrendSource } from './trends/bilibili.js';
+import { GoogleRssTrendSource } from './trends/google-rss.js';
+import { HackerNewsTrendSource } from './trends/hacker-news.js';
+import { RedditTrendSource } from './trends/reddit.js';
+import { TwitterApiIoTrendSource } from './trends/twitterapi-io.js';
+import type { TrendSource } from './trends/types.js';
+import { YouTubeTrendSource } from './trends/youtube.js';
 
 export function createSourceConnectors(
   config: AppConfig,
@@ -40,5 +47,29 @@ export function createSourceConnectors(
     }, fetcher),
     new BlueskyConnector(fetcher),
     new BilibiliConnector({}, fetcher),
+  ];
+}
+
+export function createTrendSources(
+  config: AppConfig,
+  fetcher: typeof fetch = fetch,
+): TrendSource[] {
+  return [
+    new TwitterApiIoTrendSource({
+      apiKey: config.TWITTERAPI_IO_API_KEY,
+      woeids: config.TREND_X_WOEIDS,
+    }, fetcher),
+    new HackerNewsTrendSource(fetcher),
+    new YouTubeTrendSource({
+      apiKey: config.YOUTUBE_API_KEY,
+      region: config.TREND_YOUTUBE_REGION,
+    }, fetcher),
+    new RedditTrendSource({
+      clientId: config.REDDIT_CLIENT_ID,
+      clientSecret: config.REDDIT_CLIENT_SECRET,
+      communities: config.TREND_REDDIT_COMMUNITIES,
+    }, fetcher),
+    new BilibiliTrendSource({}, fetcher),
+    new GoogleRssTrendSource({ feedUrls: config.TREND_GOOGLE_RSS_URLS }, fetcher),
   ];
 }
