@@ -32,6 +32,18 @@ class RecordingTrendQueue implements TrendQueue {
   async close() {}
 }
 
+class FailOnceTrendQueue extends RecordingTrendQueue {
+  private failed = false;
+
+  override async enqueue(data: TrendJobData) {
+    if (!this.failed) {
+      this.failed = true;
+      throw new Error('Redis unavailable');
+    }
+    await super.enqueue(data);
+  }
+}
+
 describe('AI discovery API', () => {
   let app: INestApplication;
   let store: MemoryTopicStore;
@@ -282,12 +294,35 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(202);
 
-    expect(first.body).toMatchObject({
-      runStatus: 'queued', lastRun: { trigger: 'manual', status: 'queued' },
-    });
-    expect(second.body.lastRun.id).toBe(first.body.lastRun.id);
+    expect(first.body).toMatchObject({ runStatus: 'queued', lastRun: null });
+    expect(second.body.lastRun).toBeNull();
     expect(trendQueue.jobs).toEqual([{ userId: 'user-a', trigger: 'manual' }]);
     expect(JSON.stringify(first.body)).not.toMatch(/secret|token|connector|candidate/i);
+  });
+
+  it('compensates a rejected trend enqueue so the next refresh can retry', async () => {
+    const localStore = new MemoryTopicStore();
+    const localTrendQueue = new FailOnceTrendQueue();
+    const localApp = await createApiApp({
+      store: localStore,
+      queue: new RecordingQueue(),
+      trendQueue: localTrendQueue,
+      aiConfigured: true,
+      now: () => new Date('2026-07-27T12:00:00.000Z'),
+    });
+
+    await request(localApp.getHttpServer())
+      .post('/api/v1/trends/refresh')
+      .set('x-user-id', 'user-a')
+      .expect(500);
+    await request(localApp.getHttpServer())
+      .post('/api/v1/trends/refresh')
+      .set('x-user-id', 'user-a')
+      .expect(202)
+      .expect(({ body }) => expect(body.lastRun).toBeNull());
+
+    expect(localTrendQueue.jobs).toEqual([{ userId: 'user-a', trigger: 'manual' }]);
+    await localApp.close();
   });
 
   it('returns safe source configuration states without credentials', async () => {

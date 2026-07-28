@@ -208,7 +208,15 @@ class ApiController {
       userId, this.trendIntervalHours, this.now(),
     );
     if (refresh.shouldEnqueue) {
-      await this.trendQueue.enqueue({ userId, trigger: 'manual' });
+      try {
+        await this.trendQueue.enqueue({ userId, trigger: 'manual' });
+      } catch (error) {
+        if (refresh.registration) {
+          await this.store.compensateTrendRefresh(userId, refresh.registration)
+            .catch(() => false);
+        }
+        throw error;
+      }
     }
     return refresh.status;
   }
