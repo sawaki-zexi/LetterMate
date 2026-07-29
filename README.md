@@ -2,16 +2,19 @@
 
 [English](./README_EN.md)
 
-LetterMate 是个人信息发现工作台。用户只需输入一个主题关键词，系统会扩展中英文查询，从搜索引擎、RSS、社交平台、视频平台和技术社区召回近期内容，再通过统一的高精度质量管线生成带原始链接的中文摘要。
+LetterMate 是个人信息发现工作台。用户可以用一个完整关键词精准追踪新内容；系统也会从外部技术趋势榜单收集搜索种子。两类候选都经过多来源搜索、正文补全、事实支持过滤、去重和 AI 评审，最终在统一 Feed 中显示带原始链接的中文摘要。
 
 ## 当前能力
 
-- 多源连接器：OpenRouter Web Search、TwitterAPI.io（X）、RSS/Atom、Hacker News、arXiv、GitHub、Brave-compatible Search、YouTube、Reddit、Bluesky 和 Bilibili。
-- 统一质量管线：来源证明、时间过滤、正文补全、精确与近似去重、AI 批量评审和来源多样性约束。
-- 一手社交信息：原创帖、官方公告和作者线程可直接作为发现条目；转发和无新增信息内容会被过滤。
-- 自适应更新：创建主题后立即运行，之后按 6、12 或 24 小时自动更新；手动刷新不改变自动周期。
-- 永久保留发现历史：Feed 默认显示最近 90 天，可切换到全部历史。
-- 精度优先：通常返回 3-8 条，不合格时允许少于 3 条或空结果。
+- 精准关键词：保留产品名、项目名和版本段。`gpt-5.7` 不会宽化为一般 GPT/AI 内容，也不会匹配 `gpt-5.7.1`。
+- 主发现连接器：OpenRouter Web Search、TwitterAPI.io（X）、RSS/Atom、Hacker News、arXiv、GitHub、Brave-compatible Search、YouTube、Reddit、Bluesky 和 Bilibili。
+- 趋势输入：X/TwitterAPI.io、Hacker News、YouTube、Reddit、Bilibili 和 Google Trends RSS；它们只产生种子，不能直接产生 Feed 条目。
+- 高精度管线：技术垂直分类、多来源搜索、正文补全、核心事实支持门控、精确与近似去重、历史增量判断、来源多样性和中文摘要。
+- 两类调度：趋势默认每 4 小时运行；Topic 创建后立即运行，之后按 6、12 或 24 小时自适应更新。
+- 统一 Feed：`all | topic | trend` 来源筛选，`1d | 3d | 7d | 30d | 90d | all` 时间范围，默认 `30d`，并按自然时间分组。
+- 权威刷新反馈：点击或移动端顶部下拉后显示非阻塞进度，完成数量来自持久化运行摘要。
+
+趋势榜单出现不代表事实成立。只有找到支持核心事实的正文、一手平台记录、官方发布、代码 Release、论文或其他实质材料后，内容才可能入库。产品不显示可信分数、来源排名、证据数量、内部评分或“已核实”标签。
 
 ## 本地开发
 
@@ -26,7 +29,7 @@ npm run db:deploy
 npm run dev
 ```
 
-另开终端启动 Worker：
+另开终端启动 Worker；否则 API 入队的 Topic 和趋势任务不会被消费：
 
 ```powershell
 npm run dev -w @lettermate/worker
@@ -36,38 +39,46 @@ Web 地址为 [http://localhost:5173](http://localhost:5173)，API 默认为 `ht
 
 ## 配置
 
-`AI_API_KEY` 是创建和运行主题的基础要求，用于主题扩展、候选评审和最终摘要。其他密钥均为可选项，缺少时只禁用对应连接器，不影响其余渠道。真实密钥只能写入本地 `.env`，不得提交。
+以 `.env.example` 为准。所有 Key、Session/CSRF secret、私有 Feed URL 和授权头只允许 API/Worker 服务端读取。真实值只能写入未跟踪的本地 `.env`，不得提交。
 
 | 配置 | 用途 |
 | --- | --- |
-| `AI_API_KEY` | OpenRouter 服务端 Key |
-| `AI_MODEL` | OpenRouter 模型，默认 `openrouter/auto` |
-| `AI_WEB_SEARCH` | 是否启用 OpenRouter Web Search |
-| `TWITTERAPI_IO_API_KEY` | [TwitterAPI.io](https://twitterapi.io/) 的 X 搜索、原创帖和线程 |
-| `GITHUB_TOKEN` | 提高 GitHub API 配额；不配置仍可使用公共接口 |
-| `YOUTUBE_API_KEY` | YouTube Data API |
-| `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth API |
-| `SEARCH_PROVIDER` | 额外搜索服务；当前支持 `brave` |
-| `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search 凭据和可选兼容端点 |
-| `DISCOVERY_RSS_FEED_URLS` | 逗号分隔的 RSS/Atom Feed URL |
-| `DISCOVERY_RUN_TIMEOUT_MS` | 单次发现总时限，默认 10 分钟 |
-| `DISCOVERY_CONNECTOR_CONCURRENCY` | 连接器并发数，默认 4 |
-| `DISCOVERY_SCHEDULER_ENABLED` | 是否启用自动更新扫描 |
+| `DATABASE_URL`, `REDIS_URL` | PostgreSQL 和 Redis |
+| `SESSION_SECRET`, `CSRF_SECRET`, `WEB_ORIGIN` | 服务端会话、CSRF 和 Web Origin |
+| `AI_API_KEY`, `AI_MODEL`, `AI_WEB_SEARCH`, `AI_TIMEOUT_MS` | OpenRouter 扩展、分类、评审、生成和可选 Web Search |
+| `TWITTERAPI_IO_API_KEY` | TwitterAPI.io 的 X 搜索、线程和 Trends |
+| `GITHUB_TOKEN` | 可选 GitHub API 高配额 |
+| `YOUTUBE_API_KEY` | YouTube 搜索和 Most Popular |
+| `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth 搜索和社区 Hot |
+| `SEARCH_PROVIDER`, `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search 及可选兼容端点 |
+| `DISCOVERY_RSS_FEED_URLS` | 逗号分隔的主发现 RSS/Atom URL |
+| `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | 发现运行时限、连接器并发和 Topic 自动调度 |
+| `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | 趋势自动调度开关和周期，默认 4 小时 |
+| `TREND_X_WOEIDS` | X Trends 地区 ID，逗号分隔 |
+| `TREND_YOUTUBE_REGION` | YouTube 两位地区代码 |
+| `TREND_REDDIT_COMMUNITIES` | Reddit 社区名称，逗号分隔 |
+| `TREND_GOOGLE_RSS_URLS` | Google Trends HTTPS RSS URL，逗号分隔 |
 
-无需平台密钥即可使用 Hacker News、arXiv、Bluesky、Bilibili 和 GitHub 公共接口。RSS/Atom 不需要密钥，但需要配置 `DISCOVERY_RSS_FEED_URLS`。自动调度器每 10 分钟扫描到期主题，PostgreSQL 保存真实调度状态；连接器部分失败时仍使用成功渠道继续处理。
+Hacker News、arXiv、Bluesky 和 Bilibili 不需要平台 Key；GitHub 公共 API 无 Token 也可使用。RSS/Atom 和 Google Trends RSS 不需要 Key，但必须配置对应 URL。缺少其他可选凭据时只禁用对应渠道。
 
-## API 流程
+## API
 
-- `POST /api/v1/topics`：使用一个关键词创建主题并触发首次发现。
-- `GET /api/v1/topics`：返回扩展词、运行状态和下一次自动更新时间。
-- `POST /api/v1/topics/:id/refresh`：手动刷新，不改变自动更新周期。
-- `GET /api/v1/feed?range=recent|all&kind=hot|quality&topicId=...`：读取最近 90 天或全部历史。
-- `GET /api/v1/items/:id`：读取摘要、理由和原始链接。
-- `GET /api/v1/discovery-sources`：读取脱敏的连接器启用状态。
+- `POST /api/v1/topics`：创建完整关键词 Topic 并触发首次发现。
+- `GET /api/v1/topics`：读取 Topic 调度、状态和最新运行摘要。
+- `POST /api/v1/topics/:id/refresh`：登记 Topic 手动刷新。
+- `GET /api/v1/trends/status`：读取当前用户的安全趋势状态和最新运行摘要。
+- `POST /api/v1/trends/refresh`：登记趋势手动刷新。
+- `GET /api/v1/feed?range=1d|3d|7d|30d|90d|all&origin=all|topic|trend&kind=hot|quality&topicId=...`：读取统一 Feed；默认 `range=30d&origin=all`。
+- `GET /api/v1/items/:id`：读取 Topic 或趋势条目的摘要、理由和原始链接。
+- `GET /api/v1/discovery-sources`：读取脱敏连接器启用状态。
+
+指定 `topicId` 时不能使用 `origin=trend`。Feed 历史永久保留，时间范围只控制服务端查询窗口。
 
 ## 验证
 
 ```powershell
+npm run db:generate
+npm run db:deploy
 npm run lint
 npm run typecheck
 npm test
@@ -75,20 +86,23 @@ npm run build
 npm run test:e2e
 ```
 
-默认测试不访问外网。实时测试必须同时提供显式开关和对应 Key，且不会打印 Key：
+默认测试不访问外网。Live smoke test 必须同时提供开关和对应 Key：
 
 ```powershell
 $env:RUN_LIVE_AI_TESTS='1'
+# 同时设置 AI_API_KEY
 npm test -- apps/worker/src/openrouter.live.test.ts
 
 $env:RUN_LIVE_TWITTERAPI_IO_TESTS='1'
+# 同时设置 TWITTERAPI_IO_API_KEY
 npm test -- apps/worker/src/twitterapi-io.live.test.ts
 ```
 
-缺少实时凭据时，这两个测试会跳过。Playwright 使用确定性 Fake 流程覆盖桌面、平板、手机和 320px 紧凑视口。
+缺少 live 凭据时测试会跳过。Playwright 使用确定性 Fake 流程覆盖 1440px 桌面、平板、手机和 320px 紧凑视口。
 
 详细文档：
 
 - [产品需求](./docs/requirements.md)
 - [技术方案](./docs/design.md)
 - [多源发现详细设计](./docs/superpowers/specs/2026-07-27-lettermate-multi-source-discovery-design.md)
+- [刷新与趋势详细设计](./docs/superpowers/specs/2026-07-28-refresh-trend-monitoring-time-filters-design.md)

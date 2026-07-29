@@ -2,16 +2,19 @@
 
 [中文](./README.md)
 
-LetterMate is a personal discovery workspace. A user enters one topic keyword; the system expands Chinese and English queries, retrieves recent material from search, feeds, social platforms, video platforms, and technical communities, then applies one high-precision quality pipeline to produce Chinese summaries with original source links.
+LetterMate is a personal discovery workspace. Users can monitor one complete keyword precisely, while the system also collects search seeds from external technology trend lists. Both paths use multi-source search, content enrichment, fact-support gating, deduplication, and AI review before Chinese summaries with original links appear in one Feed.
 
 ## Features
 
-- Connectors for OpenRouter Web Search, TwitterAPI.io (X), RSS/Atom, Hacker News, arXiv, GitHub, Brave-compatible Search, YouTube, Reddit, Bluesky, and Bilibili.
-- Provenance validation, time filtering, content enrichment, exact and near deduplication, AI review, and source diversity controls.
-- Direct support for first-party social posts and author threads; reposts without new information are filtered.
-- Immediate first run followed by adaptive 6, 12, or 24-hour refreshes. Manual refresh does not alter the automatic schedule.
-- Discovery history is retained; Feed defaults to the latest 90 days and supports all history.
-- Precision over volume: 3-8 items is typical, but fewer or empty successful results are valid.
+- Precise keywords preserve product names, project names, and version segments. `gpt-5.7` is not broadened to generic GPT/AI material and does not match `gpt-5.7.1`.
+- Main discovery connectors: OpenRouter Web Search, TwitterAPI.io (X), RSS/Atom, Hacker News, arXiv, GitHub, Brave-compatible Search, YouTube, Reddit, Bluesky, and Bilibili.
+- Trend inputs: X/TwitterAPI.io, Hacker News, YouTube, Reddit, Bilibili, and Google Trends RSS. They produce seeds only, never direct Feed items.
+- One high-precision pipeline performs technology vertical classification, multi-source search, content enrichment, core fact-support gating, exact and near deduplication, historical novelty checks, source diversity, and Chinese composition.
+- Two schedules: trend monitoring runs every 4 hours by default; Topics run immediately after creation and then adapt to 6, 12, or 24 hours.
+- Unified Feed with `all | topic | trend` origins and `1d | 3d | 7d | 30d | 90d | all` ranges. The default is `30d`, and results are grouped by calendar time.
+- Authoritative refresh feedback: click or mobile pull refresh shows nonblocking progress, and completion counts come from persisted run summaries.
+
+A trend-list appearance is not proof. Content can be saved only after substantive pages, first-party platform records, official announcements, code releases, papers, or other material support its core facts. The product exposes no trust score, source ranking, evidence count, internal score, or verified label.
 
 ## Quick Start
 
@@ -26,7 +29,7 @@ npm run db:deploy
 npm run dev
 ```
 
-Start the worker in another terminal:
+Start the Worker in another terminal. Queued Topic and trend jobs are not consumed without it:
 
 ```powershell
 npm run dev -w @lettermate/worker
@@ -36,27 +39,46 @@ Open [http://localhost:5173](http://localhost:5173). The API defaults to `http:/
 
 ## Configuration
 
-`AI_API_KEY` is the base requirement for topic expansion, candidate assessment, and final composition. Every other credential is optional; an unavailable connector is skipped without disabling the remaining sources. Store real credentials only in the untracked local `.env` file.
+`.env.example` is authoritative. Every key, session/CSRF secret, private feed URL, and authorization header is server-only. Put real values only in the untracked local `.env`; never commit it.
 
 | Variable | Purpose |
 | --- | --- |
-| `AI_API_KEY`, `AI_MODEL`, `AI_WEB_SEARCH` | OpenRouter AI and optional Web Search |
-| `TWITTERAPI_IO_API_KEY` | [TwitterAPI.io](https://twitterapi.io/) X search, original posts, and threads |
+| `DATABASE_URL`, `REDIS_URL` | PostgreSQL and Redis |
+| `SESSION_SECRET`, `CSRF_SECRET`, `WEB_ORIGIN` | Server session, CSRF, and Web origin |
+| `AI_API_KEY`, `AI_MODEL`, `AI_WEB_SEARCH`, `AI_TIMEOUT_MS` | OpenRouter expansion, classification, assessment, composition, and optional Web Search |
+| `TWITTERAPI_IO_API_KEY` | TwitterAPI.io X search, threads, and Trends |
 | `GITHUB_TOKEN` | Optional higher GitHub API quota |
-| `YOUTUBE_API_KEY` | YouTube Data API |
-| `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth API |
-| `SEARCH_PROVIDER` | Additional search provider; currently `brave` |
-| `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search credential and optional endpoint |
-| `DISCOVERY_RSS_FEED_URLS` | Comma-separated RSS/Atom feed URLs |
-| `DISCOVERY_RUN_TIMEOUT_MS` | Overall discovery timeout; 10 minutes by default |
-| `DISCOVERY_CONNECTOR_CONCURRENCY` | Connector concurrency; 4 by default |
-| `DISCOVERY_SCHEDULER_ENABLED` | Enables automatic refresh scanning |
+| `YOUTUBE_API_KEY` | YouTube search and Most Popular |
+| `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth search and community Hot lists |
+| `SEARCH_PROVIDER`, `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search and optional compatible endpoint |
+| `DISCOVERY_RSS_FEED_URLS` | Comma-separated main-discovery RSS/Atom URLs |
+| `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | Discovery timeout, connector concurrency, and Topic scheduling |
+| `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | Trend scheduling switch and interval; 4 hours by default |
+| `TREND_X_WOEIDS` | Comma-separated X Trends location IDs |
+| `TREND_YOUTUBE_REGION` | Two-letter YouTube region |
+| `TREND_REDDIT_COMMUNITIES` | Comma-separated Reddit community names |
+| `TREND_GOOGLE_RSS_URLS` | Comma-separated Google Trends HTTPS RSS URLs |
 
-Hacker News, arXiv, Bluesky, Bilibili, and public GitHub access need no platform key. RSS/Atom needs feed URLs but no key. The scheduler scans due topics every 10 minutes, while PostgreSQL remains the scheduling source of truth.
+Hacker News, arXiv, Bluesky, and Bilibili need no platform key; public GitHub access works without a token. RSS/Atom and Google Trends RSS need configured URLs but no key. Missing optional credentials disable only their corresponding channels.
+
+## API
+
+- `POST /api/v1/topics`: create a complete-keyword Topic and trigger initial discovery.
+- `GET /api/v1/topics`: read Topic scheduling, status, and the latest run summary.
+- `POST /api/v1/topics/:id/refresh`: register a manual Topic refresh.
+- `GET /api/v1/trends/status`: read the current user's safe trend status and latest run summary.
+- `POST /api/v1/trends/refresh`: register a manual trend refresh.
+- `GET /api/v1/feed?range=1d|3d|7d|30d|90d|all&origin=all|topic|trend&kind=hot|quality&topicId=...`: read the unified Feed; defaults are `range=30d&origin=all`.
+- `GET /api/v1/items/:id`: read a Topic or trend item's summary, reason, and original links.
+- `GET /api/v1/discovery-sources`: read redacted connector availability.
+
+`topicId` cannot be combined with `origin=trend`. Feed history is retained permanently; the range controls only the server query window.
 
 ## Verification
 
 ```powershell
+npm run db:generate
+npm run db:deploy
 npm run lint
 npm run typecheck
 npm test
@@ -64,18 +86,23 @@ npm run build
 npm run test:e2e
 ```
 
-Tests do not access external services by default. Live smoke tests require both the explicit flag and corresponding key:
+Tests do not access external services by default. Live smoke tests require both the flag and matching key:
 
 ```powershell
 $env:RUN_LIVE_AI_TESTS='1'
+# Also set AI_API_KEY
 npm test -- apps/worker/src/openrouter.live.test.ts
 
 $env:RUN_LIVE_TWITTERAPI_IO_TESTS='1'
+# Also set TWITTERAPI_IO_API_KEY
 npm test -- apps/worker/src/twitterapi-io.live.test.ts
 ```
+
+Credential-gated tests skip when their live configuration is absent. Playwright uses a deterministic fake flow across 1440px desktop, tablet, mobile, and 320px compact viewports.
 
 Project documentation:
 
 - [Product requirements](./docs/requirements.md)
 - [Technical design](./docs/design.md)
 - [Detailed multi-source design](./docs/superpowers/specs/2026-07-27-lettermate-multi-source-discovery-design.md)
+- [Detailed refresh and trend design](./docs/superpowers/specs/2026-07-28-refresh-trend-monitoring-time-filters-design.md)

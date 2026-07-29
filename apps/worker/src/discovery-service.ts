@@ -76,6 +76,7 @@ function mapTopic(topic: PrismaTopic): Topic {
     scheduleIntervalHours: topic.scheduleIntervalHours,
     runStatus: topic.runStatus,
     lastError: parsedError.success ? parsedError.data : null,
+    lastRun: null,
   });
 }
 
