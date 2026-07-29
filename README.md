@@ -10,7 +10,7 @@ LetterMate 是个人信息发现工作台。用户可以用一个完整关键词
 - 主发现连接器：OpenRouter Web Search、TwitterAPI.io（X）、RSS/Atom、Hacker News、arXiv、GitHub、Brave-compatible Search、YouTube、Reddit、Bluesky 和 Bilibili。
 - 趋势输入：X/TwitterAPI.io、Hacker News、YouTube、Reddit、Bilibili 和 Google Trends RSS；它们只产生种子，不能直接产生 Feed 条目。
 - 高精度管线：技术垂直分类、多来源搜索、正文补全、核心事实支持门控、精确与近似去重、历史增量判断、来源多样性和中文摘要。
-- 两类调度：趋势默认每 4 小时运行；Topic 创建后立即运行，之后按 6、12 或 24 小时自适应更新。
+- 两类调度：缺少 TrendMonitor 时以默认 4 小时间隔创建，之后按其持久化周期运行；Topic 创建后立即运行，之后按 6、12 或 24 小时自适应更新。
 - 统一 Feed：`all | topic | trend` 来源筛选，`1d | 3d | 7d | 30d | 90d | all` 时间范围，默认 `30d`，并按自然时间分组。
 - 权威刷新反馈：点击或移动端顶部下拉后显示非阻塞进度，完成数量来自持久化运行摘要。
 
@@ -53,7 +53,7 @@ Web 地址为 [http://localhost:5173](http://localhost:5173)，API 默认为 `ht
 | `SEARCH_PROVIDER`, `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search 及可选兼容端点 |
 | `DISCOVERY_RSS_FEED_URLS` | 逗号分隔的主发现 RSS/Atom URL |
 | `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | 发现运行时限、连接器并发和 Topic 自动调度 |
-| `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | 趋势自动调度开关和周期，默认 4 小时 |
+| `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | 趋势自动调度开关；间隔默认 4 小时，仅用于创建缺失的 TrendMonitor。已有记录以持久化的 `intervalHours` 为准，环境变量变化不会修改它 |
 | `TREND_X_WOEIDS` | X Trends 地区 ID，逗号分隔 |
 | `TREND_YOUTUBE_REGION` | YouTube 两位地区代码 |
 | `TREND_REDDIT_COMMUNITIES` | Reddit 社区名称，逗号分隔 |

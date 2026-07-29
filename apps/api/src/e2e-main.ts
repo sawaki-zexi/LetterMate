@@ -20,8 +20,8 @@ const queue: TopicQueue = {
       items: [
         {
           kind: 'quality',
-          title: 'Agent 工程实践指南',
-          summary: '文章总结了可复现的工程方法。',
+          title: 'gpt-5.7 Agent 工程实践指南',
+          summary: '文章总结了围绕 gpt-5.7 的可复现工程方法。',
           reason: '包含实现细节与原始数据。',
           sourceUrls: ['https://example.com/agent-guide'],
           publishedAt: relativeCalendarDay(0),

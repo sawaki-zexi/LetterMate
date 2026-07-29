@@ -10,7 +10,7 @@ LetterMate is a personal discovery workspace. Users can monitor one complete key
 - Main discovery connectors: OpenRouter Web Search, TwitterAPI.io (X), RSS/Atom, Hacker News, arXiv, GitHub, Brave-compatible Search, YouTube, Reddit, Bluesky, and Bilibili.
 - Trend inputs: X/TwitterAPI.io, Hacker News, YouTube, Reddit, Bilibili, and Google Trends RSS. They produce seeds only, never direct Feed items.
 - One high-precision pipeline performs technology vertical classification, multi-source search, content enrichment, core fact-support gating, exact and near deduplication, historical novelty checks, source diversity, and Chinese composition.
-- Two schedules: trend monitoring runs every 4 hours by default; Topics run immediately after creation and then adapt to 6, 12, or 24 hours.
+- Two schedules: a missing TrendMonitor is provisioned with a 4-hour interval by default and then follows its persisted interval; Topics run immediately after creation and then adapt to 6, 12, or 24 hours.
 - Unified Feed with `all | topic | trend` origins and `1d | 3d | 7d | 30d | 90d | all` ranges. The default is `30d`, and results are grouped by calendar time.
 - Authoritative refresh feedback: click or mobile pull refresh shows nonblocking progress, and completion counts come from persisted run summaries.
 
@@ -53,7 +53,7 @@ Open [http://localhost:5173](http://localhost:5173). The API defaults to `http:/
 | `SEARCH_PROVIDER`, `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search and optional compatible endpoint |
 | `DISCOVERY_RSS_FEED_URLS` | Comma-separated main-discovery RSS/Atom URLs |
 | `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | Discovery timeout, connector concurrency, and Topic scheduling |
-| `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | Trend scheduling switch and interval; 4 hours by default |
+| `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | Trend scheduling switch; the interval defaults to 4 hours only when provisioning a missing TrendMonitor. An existing monitor's persisted `intervalHours` remains authoritative and environment changes do not mutate it |
 | `TREND_X_WOEIDS` | Comma-separated X Trends location IDs |
 | `TREND_YOUTUBE_REGION` | Two-letter YouTube region |
 | `TREND_REDDIT_COMMUNITIES` | Comma-separated Reddit community names |

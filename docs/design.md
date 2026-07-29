@@ -45,7 +45,7 @@ React Web 只调用 NestJS API。API 负责认证、用户边界、输入验证�
 | `apps/worker/src/discovery-service.ts` | Topic 发现编排和原子持久化 |
 | `apps/worker/src/trend-service.ts` | 趋势分类、再搜索、质量管线和 RadarItem 持久化 |
 | `apps/worker/src/scheduler.ts` | 6/12/24 小时 Topic 调度和租约 |
-| `apps/worker/src/trend-scheduler.ts` | 默认 4 小时 TrendMonitor 调度和租约 |
+| `apps/worker/src/trend-scheduler.ts` | 按持久化周期执行 TrendMonitor 调度和租约，并以默认 4 小时补建缺失记录 |
 | `packages/contracts` | API、Worker 与 Web 共用 DTO 和 Zod schema |
 | `packages/domain` | 来源证明、URL、质量门槛、去重和多样性规则 |
 | `packages/config` | 服务端环境配置解析与默认值 |
@@ -135,7 +135,7 @@ AI 只能引用已验证候选池中的 URL。外部抓取在每次请求和重�
 - `Topic`：完整关键词、扩展词、运行状态、`nextRunAt`、6/12/24 小时周期和最新安全运行摘要。
 - `DiscoveryRun`：Topic 触发方式、状态、开始/结束时间和实际新增数。
 - `DiscoveryItem`：Topic 所有的最终中文内容、原始 URL 和来源元数据。
-- `TrendMonitor`：用户唯一的趋势状态、默认 4 小时间隔、`nextRunAt`、租约和待处理手动刷新。
+- `TrendMonitor`：用户唯一的趋势状态、持久化 `intervalHours`、`nextRunAt`、租约和待处理手动刷新；缺失记录的间隔默认按 4 小时创建。
 - `TrendRun`：趋势触发方式、状态、候选/录取/新增数和安全错误。
 - `TrendSeed`：最小化来源、外部 ID、标题、URL、指纹和精准查询词。
 - `RadarItem`：用户所有的最终趋势内容，按 `(userId, canonicalPrimaryUrl)` 唯一。
@@ -146,7 +146,7 @@ Topic 和趋势完成事务都从实际插入数写入 `newItemCount`。运行�
 
 - 新 Topic 使用 `initial` 任务；手动刷新使用 `manual`；调度使用 `scheduled`。
 - Topic 首次成功后默认为 12 小时；连续两个高产定时运行缩短为 6 小时，连续两个空定时运行延长为 24 小时。
-- 每个用户的 TrendMonitor 默认每 4 小时运行，实际值来自 `TREND_INTERVAL_HOURS`。
+- `TREND_INTERVAL_HOURS` 默认为 4，只在缺少 TrendMonitor 时提供创建值；已有记录的持久化 `intervalHours` 是后续调度的权威值，环境变量变化不回写已有记录。
 - 两类 scheduler 每 10 分钟扫描，PostgreSQL `nextRunAt` 是真实状态，BullMQ job ID 确保幂等。
 - Topic 使用稳定 ±10% 抖动；手动运行不改变 Topic streak、Topic 自动周期或趋势自动周期。
 - Topic 和 TrendMonitor 都使用运行租约恢复 Worker 中断；同一目标最多一个运行，重复手动请求只保留一个 pending 刷新。
@@ -222,7 +222,7 @@ TREND_REDDIT_COMMUNITIES=MachineLearning,LocalLLaMA,programming,technology
 TREND_GOOGLE_RSS_URLS=
 ```
 
-`TREND_MONITOR_ENABLED=false` 只关闭自动趋势调度，不删除历史，也不禁用手动趋势处理。所有 Key、`SESSION_SECRET` 和 `CSRF_SECRET` 只供服务端读取。真实 `.env`、私有 Feed URL 和授权头不得提交。
+`TREND_MONITOR_ENABLED=false` 只关闭自动趋势调度，不删除历史，也不禁用手动趋势处理。`TREND_INTERVAL_HOURS` 默认为 4，且只用于创建缺失的 TrendMonitor；已有记录继续使用持久化的 `intervalHours`，环境变量变化不会修改它。所有 Key、`SESSION_SECRET` 和 `CSRF_SECRET` 只供服务端读取。真实 `.env`、私有 Feed URL 和授权头不得提交。
 
 ## 12. 运行与验证
 
