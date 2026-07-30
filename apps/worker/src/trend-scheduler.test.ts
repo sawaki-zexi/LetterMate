@@ -82,7 +82,7 @@ describe('PrismaTrendScheduleRepository', () => {
           { runLeaseUntil: { lte: now } },
         ],
       },
-      data: { nextRunAt: claimUntil, runStatus: 'queued', runLeaseUntil: claimUntil },
+      data: { runStatus: 'queued', runLeaseUntil: claimUntil },
     });
     expect(prisma.$transaction).toHaveBeenCalledOnce();
     expect(staleTransaction.trendRun.updateMany).toHaveBeenCalledOnce();
@@ -122,7 +122,7 @@ describe('PrismaTrendScheduleRepository', () => {
         runStatus: 'running', runLeaseUntil: staleAt,
       },
       data: {
-        nextRunAt: claimUntil, runStatus: 'queued', activeRunId: null,
+        nextRunAt: staleAt, runStatus: 'queued', activeRunId: null,
         runLeaseUntil: claimUntil,
       },
     });
@@ -155,10 +155,10 @@ describe('PrismaTrendScheduleRepository', () => {
     expect(prisma.trendMonitor.updateMany).toHaveBeenCalledWith({
       where: {
         id: 'monitor-1', userId: 'user-1', runStatus: 'queued', activeRunId: null,
-        nextRunAt: claimUntil, runLeaseUntil: claimUntil,
+        nextRunAt: dueAt, runLeaseUntil: claimUntil,
       },
       data: {
-        nextRunAt: dueAt, runStatus: 'failed', runLeaseUntil: null,
+        runStatus: 'failed', runLeaseUntil: null,
         lastError: {
           code: 'TREND_QUEUE_UNAVAILABLE',
           message: 'Trend discovery could not be queued',
@@ -228,7 +228,9 @@ describe('PrismaTrendScheduleRepository', () => {
     expect(monitor).toMatchObject({ activeRunId: null, runStatus: 'queued' });
 
     const repository = new PrismaTrendRepository(prisma as never, 10 * 60_000);
-    const recovered = await repository.claimRun('user-1', 'scheduled', now);
+    const recovered = await repository.claimRun({
+      userId: 'user-1', trigger: 'scheduled', dueAt: staleAt.toISOString(),
+    }, now);
     expect(recovered).toMatchObject({ state: 'claimed', monitorId: 'monitor-1' });
     if (recovered.state !== 'claimed') throw new Error('Expected a recovered scheduled run');
     expect(recovered.runId).not.toBe('manual-run');
@@ -273,13 +275,47 @@ describe('TrendScheduleService', () => {
     );
     expect(queue.add).toHaveBeenCalledWith(
       'scheduled-refresh',
-      { userId: 'user-1', trigger: 'scheduled' },
+      { userId: 'user-1', trigger: 'scheduled', dueAt: dueAt.toISOString() },
       expect.objectContaining({
         jobId: scheduledTrendJobId('monitor-1', dueAt),
         attempts: 3,
         backoff: { type: 'custom' },
+        removeOnComplete: { age: 3_600, count: 1_000 },
+        removeOnFail: { age: 604_800, count: 1_000 },
       }),
     );
+  });
+
+  it('re-enqueues one stable job across repeated scans after a long backlog', async () => {
+    const dueAt = new Date('2026-07-28T11:50:00.000Z');
+    const claims = [
+      { monitorId: 'monitor-1', userId: 'user-1', dueAt,
+        claimUntil: new Date('2026-07-28T12:10:00.000Z') },
+      { monitorId: 'monitor-1', userId: 'user-1', dueAt,
+        claimUntil: new Date('2026-07-28T12:21:00.000Z') },
+    ];
+    const repository = {
+      claimDueMonitors: vi.fn()
+        .mockResolvedValueOnce([claims[0]])
+        .mockResolvedValueOnce([claims[1]]),
+      releaseClaim: vi.fn(),
+    };
+    const distinctJobs = new Map<string, unknown>();
+    const queue = {
+      add: vi.fn(async (_name, data, options) => {
+        distinctJobs.set(options.jobId, data);
+      }),
+    };
+    const service = new TrendScheduleService(repository, queue);
+
+    await service.scan(now);
+    await service.scan(new Date('2026-07-28T12:11:00.000Z'));
+
+    expect(queue.add).toHaveBeenCalledTimes(2);
+    expect(distinctJobs).toEqual(new Map([[
+      scheduledTrendJobId('monitor-1', dueAt),
+      { userId: 'user-1', trigger: 'scheduled', dueAt: dueAt.toISOString() },
+    ]]));
   });
 
   it('releases only the failed enqueue claim, logs safely, and counts successful jobs', async () => {

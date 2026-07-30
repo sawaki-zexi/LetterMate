@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type {
   DiscoveryCandidate,
+  TrendJobData,
   DiscoveryTrigger,
   SafeError,
   SourceType,
@@ -35,6 +36,12 @@ export interface SanitizedTrendSeed {
   normalizedQuery: string | null;
 }
 
+export interface TrendSeedIdentities {
+  sourceExternal: Set<string>;
+  urls: Set<string>;
+  titles: Set<string>;
+}
+
 export type TrendRunClaim = {
   state: 'claimed';
   runId: string;
@@ -43,7 +50,7 @@ export type TrendRunClaim = {
   nextRunAt: Date;
 } | {
   state: 'active';
-  followUpManualRegistered: boolean;
+  followUpManualRunId: string | null;
 } | {
   state: 'missing';
 };
@@ -59,14 +66,27 @@ export interface CompleteTrendRunInput {
   finishedAt: Date;
 }
 
+export type LegacyTrendJobData = {
+  userId: string;
+  trigger: 'manual' | 'scheduled';
+};
+
+export type TrendExecutionJobData = TrendJobData | LegacyTrendJobData;
+
 export interface TrendRepository {
-  claimRun(userId: string, trigger: DiscoveryTrigger, startedAt: Date): Promise<TrendRunClaim>;
+  claimRun(job: TrendExecutionJobData, startedAt: Date): Promise<TrendRunClaim>;
   listRecentFingerprints(
     userId: string,
     fingerprints: string[],
     discoveredSince: Date,
     excludeRunId: string,
   ): Promise<Set<string>>;
+  listRecentSeedIdentities?(input: {
+    userId: string;
+    seeds: Array<Pick<SanitizedTrendSeed, 'sourceId' | 'externalId' | 'sourceUrl' | 'title'>>;
+    discoveredSince: Date;
+    excludeRunId: string;
+  }): Promise<TrendSeedIdentities>;
   saveSeeds(input: { runId: string; userId: string; seeds: SanitizedTrendSeed[] }): Promise<void>;
   updateSeedQueries(input: {
     runId: string;
@@ -76,7 +96,7 @@ export interface TrendRepository {
   listHistoryUrls(userId: string): Promise<string[]>;
   completeSuccess(input: CompleteTrendRunInput): Promise<{
     newItemCount: number;
-    followUpManual: boolean;
+    followUpManualRunId: string | null;
   }>;
   completeFailure(input: {
     runId: string;
@@ -86,8 +106,8 @@ export interface TrendRepository {
     error: SafeError;
     finishedAt: Date;
     status: 'queued' | 'failed';
-  }): Promise<{ followUpManual: boolean }>;
-  acknowledgeManualFollowUp(userId: string): Promise<boolean>;
+  }): Promise<{ followUpManualRunId: string | null }>;
+  acknowledgeManualFollowUp(userId: string, runId: string): Promise<boolean>;
 }
 
 const safeError = (error: unknown): SafeError => {
@@ -124,6 +144,11 @@ const fingerprintSeed = (seed: TrendSeedCandidate): string => createHash('sha256
     canonicalizeUrl(seed.url),
   ]))
   .digest('hex');
+
+const normalizedSeedTitle = (title: string): string => title.normalize('NFKC').trim().toLowerCase();
+const sourceExternalIdentity = (sourceId: string, externalId: string | null): string | null => (
+  externalId ? `${sourceId.trim().toLowerCase()}\u0000${externalId.trim().toLowerCase()}` : null
+);
 
 const sanitizeSeed = (seed: TrendSeedCandidate): Omit<SanitizedTrendSeed, 'normalizedQuery'> => ({
   fingerprint: fingerprintSeed(seed),
@@ -215,107 +240,122 @@ export class PrismaTrendRepository implements TrendRepository {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly runLeaseMs: number,
-    private readonly defaultIntervalHours = 4,
+    _legacyMaxSeeds?: number,
   ) {}
 
   async claimRun(
-    userId: string,
-    trigger: DiscoveryTrigger,
+    job: TrendExecutionJobData,
     startedAt: Date,
   ): Promise<TrendRunClaim> {
     return this.prisma.$transaction(async (transaction) => {
-      let monitor = await transaction.trendMonitor.findUnique({ where: { userId } });
-      if (!monitor) {
-        monitor = await transaction.trendMonitor.upsert({
-          where: { userId },
-          create: {
-            userId,
-            intervalHours: this.defaultIntervalHours,
-            nextRunAt: startedAt,
-            runStatus: 'queued',
-          },
-          update: {},
+      const { userId, trigger } = job;
+      const monitor = await transaction.trendMonitor.findUnique({ where: { userId } });
+      if (!monitor) return { state: 'missing' } as const;
+
+      const pendingFollowUpRunId = async (): Promise<string | null> => {
+        if (!monitor.manualRefreshPending || monitor.activeRunId === null || monitor.runStatus !== 'queued') {
+          return null;
+        }
+        const run = await transaction.trendRun.findUnique({
+          where: { id_userId: { id: monitor.activeRunId, userId } },
+          select: { trigger: true, status: true },
         });
-      }
-      const active = monitor.activeRunId !== null &&
-        monitor.runLeaseUntil !== null && monitor.runLeaseUntil > startedAt;
-      if (active) {
-        const activeRunId = monitor.activeRunId!;
-        if (monitor.runStatus === 'queued') {
-          const queuedRun = await transaction.trendRun.findUnique({
-            where: { id_userId: { id: activeRunId, userId } },
-            select: { trigger: true, status: true },
-          });
-          const resumesSameRun = queuedRun?.trigger === trigger &&
-            (queuedRun.status === 'queued' || queuedRun.status === 'running');
-          if (!resumesSameRun) {
-            if (trigger !== 'manual' || monitor.manualRefreshPending) {
-              return { state: 'active', followUpManualRegistered: false } as const;
-            }
-          } else {
-            const leaseUntil = new Date(startedAt.getTime() + this.runLeaseMs);
-            const claimed = await transaction.trendMonitor.updateMany({
-              where: {
-                id: monitor.id,
-                userId,
-                activeRunId,
-                runStatus: 'queued',
-                runLeaseUntil: monitor.runLeaseUntil,
-              },
-              data: { runStatus: 'running', runLeaseUntil: leaseUntil, lastError: Prisma.DbNull },
-            });
-            if (claimed.count === 1) {
-              await transaction.trendRun.updateMany({
-                where: { id: activeRunId, userId, status: { in: ['queued', 'running'] } },
-                data: { status: 'running', startedAt },
-              });
-              return {
-                state: 'claimed', runId: activeRunId, monitorId: monitor.id,
-                intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
-              } as const;
-            }
-          }
-        }
-        if (trigger !== 'manual' || monitor.manualRefreshPending) {
-          return { state: 'active', followUpManualRegistered: false } as const;
-        }
-        const pending = await transaction.trendMonitor.updateMany({
+        return run?.trigger === 'manual' && run.status === 'queued' ? monitor.activeRunId : null;
+      };
+
+      const manualRunId = job.trigger === 'manual' && 'runId' in job ? job.runId : null;
+      if (job.trigger === 'manual' && manualRunId === null) {
+        const active = monitor.activeRunId !== null && monitor.runLeaseUntil !== null &&
+          monitor.runLeaseUntil > startedAt &&
+          (monitor.runStatus === 'queued' || monitor.runStatus === 'running');
+        if (active) return { state: 'active', followUpManualRunId: await pendingFollowUpRunId() } as const;
+        const runId = randomUUID();
+        const leaseUntil = new Date(startedAt.getTime() + this.runLeaseMs);
+        const claimed = await transaction.trendMonitor.updateMany({
           where: {
-            id: monitor.id, userId, activeRunId,
-            runLeaseUntil: { gt: startedAt }, manualRefreshPending: false,
+            id: monitor.id, userId, activeRunId: null,
+            runStatus: { in: ['queued', 'succeeded', 'failed'] },
+            OR: [{ runLeaseUntil: null }, { runLeaseUntil: { lte: startedAt } }],
           },
-          data: { manualRefreshPending: true },
+          data: {
+            runStatus: 'running', activeRunId: runId, runLeaseUntil: leaseUntil,
+            manualRefreshPending: false, lastError: Prisma.DbNull,
+          },
         });
-        return { state: 'active', followUpManualRegistered: pending.count === 1 } as const;
+        if (claimed.count !== 1) return { state: 'active', followUpManualRunId: null } as const;
+        await transaction.trendRun.create({
+          data: { id: runId, userId, monitorId: monitor.id, trigger: 'manual', status: 'running', startedAt },
+        });
+        return {
+          state: 'claimed', runId, monitorId: monitor.id,
+          intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
+        } as const;
       }
 
-      if (monitor.activeRunId !== null) {
-        await transaction.trendRun.updateMany({
-          where: { id: monitor.activeRunId, userId, status: { in: ['queued', 'running'] } },
+      if (job.trigger === 'manual') {
+        if (
+          monitor.activeRunId !== manualRunId ||
+          monitor.runStatus !== 'queued' ||
+          monitor.runLeaseUntil === null ||
+          monitor.runLeaseUntil <= startedAt
+        ) {
+          return { state: 'active', followUpManualRunId: await pendingFollowUpRunId() } as const;
+        }
+        const queuedRun = await transaction.trendRun.findUnique({
+          where: { id_userId: { id: manualRunId!, userId } },
+          select: { trigger: true, status: true },
+        });
+        if (queuedRun?.trigger !== 'manual' || queuedRun.status !== 'queued') {
+          return { state: 'active', followUpManualRunId: await pendingFollowUpRunId() } as const;
+        }
+        const leaseUntil = new Date(startedAt.getTime() + this.runLeaseMs);
+        const claimed = await transaction.trendMonitor.updateMany({
+          where: {
+            id: monitor.id, userId, activeRunId: manualRunId!, runStatus: 'queued',
+            runLeaseUntil: monitor.runLeaseUntil,
+          },
           data: {
-            status: 'failed', finishedAt: startedAt,
-            error: { code: 'TREND_RUN_LEASE_EXPIRED', message: 'Trend run lease expired' },
+            runStatus: 'running', runLeaseUntil: leaseUntil,
+            manualRefreshPending: false, lastError: Prisma.DbNull,
           },
         });
+        if (claimed.count !== 1) {
+          return { state: 'active', followUpManualRunId: null } as const;
+        }
+        await transaction.trendRun.updateMany({
+          where: { id: manualRunId!, userId, trigger: 'manual', status: 'queued' },
+          data: { status: 'running', startedAt },
+        });
+        return {
+          state: 'claimed', runId: manualRunId!, monitorId: monitor.id,
+          intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
+        } as const;
+      }
+
+      const hasDueAt = 'dueAt' in job;
+      const legacyScheduled = !hasDueAt;
+      const dueAt = hasDueAt ? new Date(job.dueAt) : monitor.nextRunAt;
+      if (
+        (!legacyScheduled && dueAt > startedAt) ||
+        monitor.nextRunAt.getTime() !== dueAt.getTime() ||
+        monitor.activeRunId !== null ||
+        monitor.runStatus !== 'queued'
+      ) {
+        return { state: 'active', followUpManualRunId: await pendingFollowUpRunId() } as const;
       }
       const runId = randomUUID();
       const leaseUntil = new Date(startedAt.getTime() + this.runLeaseMs);
       const claimed = await transaction.trendMonitor.updateMany({
         where: {
-          id: monitor.id, userId,
-          OR: [
-            { activeRunId: null },
-            { runLeaseUntil: null },
-            { runLeaseUntil: { lte: startedAt } },
-          ],
+          id: monitor.id, userId, nextRunAt: dueAt, activeRunId: null,
+          runStatus: 'queued', runLeaseUntil: monitor.runLeaseUntil,
         },
         data: {
           activeRunId: runId, runStatus: 'running', runLeaseUntil: leaseUntil,
           lastError: Prisma.DbNull,
-          ...(trigger === 'manual' ? { manualRefreshPending: false } : {}),
         },
       });
-      if (claimed.count !== 1) return { state: 'active', followUpManualRegistered: false } as const;
+      if (claimed.count !== 1) return { state: 'active', followUpManualRunId: null } as const;
       await transaction.trendRun.create({
         data: { id: runId, userId, monitorId: monitor.id, trigger, status: 'running', startedAt },
       });
@@ -343,6 +383,37 @@ export class PrismaTrendRepository implements TrendRepository {
       select: { fingerprint: true },
     });
     return new Set(rows.map(({ fingerprint }) => fingerprint));
+  }
+
+  async listRecentSeedIdentities(input: {
+    userId: string;
+    seeds: Array<Pick<SanitizedTrendSeed, 'sourceId' | 'externalId' | 'sourceUrl' | 'title'>>;
+    discoveredSince: Date;
+    excludeRunId: string;
+  }): Promise<TrendSeedIdentities> {
+    const urls = input.seeds.map(({ sourceUrl }) => sourceUrl);
+    const base = {
+      userId: input.userId,
+      discoveredAt: { gte: input.discoveredSince },
+      runId: { not: input.excludeRunId },
+    } as const;
+    const [externalRows, urlRows, titleRows] = await Promise.all([
+      this.prisma.trendSeed.findMany({
+        where: { ...base, externalId: { not: null } },
+        select: { sourceId: true, externalId: true },
+      }),
+      urls.length === 0 ? Promise.resolve([] as Array<{ sourceUrl: string }>) : this.prisma.trendSeed.findMany({
+        where: { ...base, sourceUrl: { in: urls } }, select: { sourceUrl: true },
+      }),
+      this.prisma.trendSeed.findMany({ where: base, select: { title: true } }),
+    ]);
+    return {
+      sourceExternal: new Set((externalRows as Array<{ sourceId: string; externalId: string | null }>).map(
+        ({ sourceId, externalId }) => sourceExternalIdentity(sourceId, externalId),
+      ).filter((value): value is string => value !== null)),
+      urls: new Set((urlRows as Array<{ sourceUrl: string }>).map(({ sourceUrl }) => sourceUrl)),
+      titles: new Set((titleRows as Array<{ title: string }>).map(({ title }) => normalizedSeedTitle(title))),
+    };
   }
 
   async saveSeeds(input: { runId: string; userId: string; seeds: SanitizedTrendSeed[] }): Promise<void> {
@@ -384,7 +455,7 @@ export class PrismaTrendRepository implements TrendRepository {
 
   async completeSuccess(input: CompleteTrendRunInput): Promise<{
     newItemCount: number;
-    followUpManual: boolean;
+    followUpManualRunId: string | null;
   }> {
     return this.prisma.$transaction(async (transaction) => {
       const ownership = await transaction.trendMonitor.updateMany({
@@ -432,18 +503,30 @@ export class PrismaTrendRepository implements TrendRepository {
           newItemCount: inserted.count, error: Prisma.DbNull,
         },
       });
-      const followUpManual = monitor.manualRefreshPending;
+      const followUpManualRunId = monitor.manualRefreshPending ? randomUUID() : null;
+      if (followUpManualRunId) {
+        await transaction.trendRun.create({
+          data: {
+            id: followUpManualRunId, userId: input.userId, monitorId: input.monitorId,
+            trigger: 'manual', status: 'queued', startedAt: input.finishedAt,
+          },
+        });
+      }
       await transaction.trendMonitor.update({
         where: { id_userId: { id: input.monitorId, userId: input.userId } },
         data: {
-          runStatus: followUpManual ? 'queued' : 'succeeded', activeRunId: null,
-          runLeaseUntil: null, manualRefreshPending: followUpManual, lastError: Prisma.DbNull,
+          runStatus: followUpManualRunId ? 'queued' : 'succeeded',
+          activeRunId: followUpManualRunId,
+          runLeaseUntil: followUpManualRunId
+            ? new Date(input.finishedAt.getTime() + this.runLeaseMs)
+            : null,
+          manualRefreshPending: followUpManualRunId !== null, lastError: Prisma.DbNull,
           ...(input.trigger === 'manual'
             ? {}
             : { nextRunAt: nextAutomaticRun(input.finishedAt, monitor.intervalHours) }),
         },
       });
-      return { newItemCount: inserted.count, followUpManual };
+      return { newItemCount: inserted.count, followUpManualRunId };
     });
   }
 
@@ -455,7 +538,7 @@ export class PrismaTrendRepository implements TrendRepository {
     error: SafeError;
     finishedAt: Date;
     status: 'queued' | 'failed';
-  }): Promise<{ followUpManual: boolean }> {
+  }): Promise<{ followUpManualRunId: string | null }> {
     return this.prisma.$transaction(async (transaction) => {
       const ownership = await transaction.trendMonitor.updateMany({
         where: {
@@ -466,17 +549,27 @@ export class PrismaTrendRepository implements TrendRepository {
         },
         data: { activeRunId: input.runId },
       });
-      if (ownership.count !== 1) return { followUpManual: false };
+      if (ownership.count !== 1) return { followUpManualRunId: null };
       const monitor = await transaction.trendMonitor.findUnique({
         where: { userId: input.userId },
         select: { manualRefreshPending: true, intervalHours: true },
       });
-      if (!monitor) return { followUpManual: false };
+      if (!monitor) return { followUpManualRunId: null };
       await transaction.trendRun.update({
         where: { id_userId: { id: input.runId, userId: input.userId } },
         data: { status: input.status, finishedAt: input.finishedAt, error: input.error },
       });
-      const followUpManual = input.status === 'failed' && monitor.manualRefreshPending;
+      const followUpManualRunId = input.status === 'failed' && monitor.manualRefreshPending
+        ? randomUUID()
+        : null;
+      if (followUpManualRunId) {
+        await transaction.trendRun.create({
+          data: {
+            id: followUpManualRunId, userId: input.userId, monitorId: input.monitorId,
+            trigger: 'manual', status: 'queued', startedAt: input.finishedAt,
+          },
+        });
+      }
       await transaction.trendMonitor.update({
         where: { id_userId: { id: input.monitorId, userId: input.userId } },
         data: input.status === 'queued'
@@ -487,26 +580,28 @@ export class PrismaTrendRepository implements TrendRepository {
               lastError: input.error,
             }
           : {
-              runStatus: followUpManual ? 'queued' : 'failed',
-              activeRunId: null,
-              runLeaseUntil: null,
-              manualRefreshPending: followUpManual,
+              runStatus: followUpManualRunId ? 'queued' : 'failed',
+              activeRunId: followUpManualRunId,
+              runLeaseUntil: followUpManualRunId
+                ? new Date(input.finishedAt.getTime() + this.runLeaseMs)
+                : null,
+              manualRefreshPending: followUpManualRunId !== null,
               lastError: input.error,
               ...(input.trigger !== 'manual'
                 ? { nextRunAt: nextAutomaticRun(input.finishedAt, monitor.intervalHours) }
                 : {}),
             },
       });
-      return { followUpManual };
+      return { followUpManualRunId };
     });
   }
 
-  async acknowledgeManualFollowUp(userId: string): Promise<boolean> {
+  async acknowledgeManualFollowUp(userId: string, runId: string): Promise<boolean> {
     const updated = await this.prisma.trendMonitor.updateMany({
       where: {
         userId,
         runStatus: 'queued',
-        activeRunId: null,
+        activeRunId: runId,
         manualRefreshPending: true,
       },
       data: { manualRefreshPending: false },
@@ -567,13 +662,17 @@ export class TrendDiscoveryService {
   }
 
   async run(
-    userId: string,
-    trigger: DiscoveryTrigger,
+    job: TrendExecutionJobData,
     context: { finalAttempt: boolean } = { finalAttempt: true },
-  ): Promise<{ followUpManual: boolean }> {
+  ): Promise<{ followUpManualRunId: string | null }> {
+    const { userId, trigger } = job;
     const startedAt = this.now();
-    const claim = await this.options.repository.claimRun(userId, trigger, startedAt);
-    if (claim.state !== 'claimed') return { followUpManual: false };
+    const claim = await this.options.repository.claimRun(job, startedAt);
+    if (claim.state !== 'claimed') {
+      return {
+        followUpManualRunId: claim.state === 'active' ? claim.followUpManualRunId : null,
+      };
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -592,10 +691,37 @@ export class TrendDiscoveryService {
         );
       }
       const sanitized = collection.candidates.map(sanitizeSeed);
-      const recent = await this.options.repository.listRecentFingerprints(
-        userId, sanitized.map(({ fingerprint }) => fingerprint), windowStart, claim.runId,
-      );
-      const unseen = sanitized.filter(({ fingerprint }) => !recent.has(fingerprint));
+      const recent = this.options.repository.listRecentSeedIdentities
+        ? await this.options.repository.listRecentSeedIdentities({
+            userId, seeds: sanitized, discoveredSince: windowStart, excludeRunId: claim.runId,
+          })
+        : {
+            sourceExternal: new Set<string>(), urls: new Set<string>(), titles: new Set<string>(),
+          };
+      const recentFingerprints = this.options.repository.listRecentSeedIdentities
+        ? null
+        : await this.options.repository.listRecentFingerprints(
+            userId, sanitized.map(({ fingerprint }) => fingerprint), windowStart, claim.runId,
+          );
+      const seenSourceExternal = new Set(recent.sourceExternal);
+      const seenUrls = new Set(recent.urls);
+      const seenTitles = new Set(recent.titles);
+      const unseen = sanitized.filter((candidate) => {
+        if (recentFingerprints?.has(candidate.fingerprint)) return false;
+        const sourceExternal = sourceExternalIdentity(
+          candidate.sourceId, candidate.externalId,
+        );
+        const title = normalizedSeedTitle(candidate.title);
+        if (
+          (sourceExternal !== null && seenSourceExternal.has(sourceExternal))
+          || seenUrls.has(candidate.sourceUrl)
+          || seenTitles.has(title)
+        ) return false;
+        if (sourceExternal !== null) seenSourceExternal.add(sourceExternal);
+        seenUrls.add(candidate.sourceUrl);
+        seenTitles.add(title);
+        return true;
+      });
       const seeds: SanitizedTrendSeed[] = unseen.map((candidate) => ({
         ...candidate,
         normalizedQuery: null,
@@ -663,7 +789,7 @@ export class TrendDiscoveryService {
         candidateCount: unseen.length, acceptedCount: accepted.length,
         items, finishedAt: this.now(),
       });
-      return { followUpManual: result.followUpManual };
+      return { followUpManualRunId: result.followUpManualRunId };
     } catch (error) {
       const failure = controller.signal.aborted
         ? new TrendOrchestrationError('TREND_RUN_TIMEOUT', 'Trend run exceeded its time limit', true)
@@ -673,8 +799,8 @@ export class TrendDiscoveryService {
         error: safeError(failure), finishedAt: this.now(),
         status: context.finalAttempt ? 'failed' : 'queued',
       });
-      if (completed.followUpManual && context.finalAttempt) {
-        return { followUpManual: true };
+      if (completed.followUpManualRunId && context.finalAttempt) {
+        return { followUpManualRunId: completed.followUpManualRunId };
       }
       throw failure;
     } finally {
@@ -688,7 +814,7 @@ export class TrendDiscoveryService {
     }
   }
 
-  async acknowledgeManualFollowUp(userId: string): Promise<boolean> {
-    return this.options.repository.acknowledgeManualFollowUp(userId);
+  async acknowledgeManualFollowUp(userId: string, runId: string): Promise<boolean> {
+    return this.options.repository.acknowledgeManualFollowUp(userId, runId);
   }
 }

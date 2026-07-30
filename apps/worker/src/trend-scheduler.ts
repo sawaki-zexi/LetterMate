@@ -87,7 +87,7 @@ export class PrismaTrendScheduleRepository implements TrendScheduleRepository {
                 runLeaseUntil: monitor.runLeaseUntil,
               },
               data: {
-                nextRunAt: claimUntil,
+                nextRunAt: dueAt,
                 runStatus: 'queued',
                 activeRunId: null,
                 runLeaseUntil: claimUntil,
@@ -122,7 +122,7 @@ export class PrismaTrendScheduleRepository implements TrendScheduleRepository {
                 { runLeaseUntil: { lte: now } },
               ],
             },
-            data: { nextRunAt: claimUntil, runStatus: 'queued', runLeaseUntil: claimUntil },
+            data: { runStatus: 'queued', runLeaseUntil: claimUntil },
           })).count === 1;
       if (acquired) {
         claimed.push({
@@ -143,11 +143,10 @@ export class PrismaTrendScheduleRepository implements TrendScheduleRepository {
         userId: claim.userId,
         runStatus: 'queued',
         activeRunId: null,
-        nextRunAt: claim.claimUntil,
+        nextRunAt: claim.dueAt,
         runLeaseUntil: claim.claimUntil,
       },
       data: {
-        nextRunAt: claim.dueAt,
         runStatus: 'failed',
         runLeaseUntil: null,
         lastError: {
@@ -168,8 +167,8 @@ interface TrendScheduleQueue {
       jobId: string;
       attempts: number;
       backoff: { type: string };
-      removeOnComplete: boolean;
-      removeOnFail: boolean;
+      removeOnComplete: { age: number; count: number };
+      removeOnFail: { age: number; count: number };
     },
   ): Promise<unknown>;
 }
@@ -207,13 +206,17 @@ export class TrendScheduleService {
       try {
         await this.queue.add(
           'scheduled-refresh',
-          { userId: monitor.userId, trigger: 'scheduled' },
+          {
+            userId: monitor.userId,
+            trigger: 'scheduled',
+            dueAt: monitor.dueAt.toISOString(),
+          },
           {
             jobId: scheduledTrendJobId(monitor.monitorId, monitor.dueAt),
             attempts: 3,
             backoff: { type: 'custom' },
-            removeOnComplete: true,
-            removeOnFail: true,
+            removeOnComplete: { age: 3_600, count: 1_000 },
+            removeOnFail: { age: 7 * 24 * 3_600, count: 1_000 },
           },
         );
         return true;

@@ -107,6 +107,31 @@ describe('useTopicRefreshManager', () => {
     expect(refreshTopic).toHaveBeenCalledTimes(1);
   });
 
+  it('accepts a queued registration when that same Topic run becomes terminal', async () => {
+    const existing = topic('topic-1', 'AI Agent');
+    let snapshot = [existing];
+    const { result } = renderHook(() => useTopicRefreshManager({
+      topics: [existing],
+      refreshTopic: vi.fn(async () => (
+        topic('topic-1', 'AI Agent', run('topic-registered', 'queued'))
+      )),
+      refetchTopics: vi.fn(async () => snapshot),
+      invalidateFeed: vi.fn(async () => undefined),
+      pollIntervalMs: 1_500,
+    }));
+
+    let completion!: Promise<unknown>;
+    act(() => { completion = result.current.startTopicRefresh('topic-1'); });
+    await act(async () => Promise.resolve());
+    snapshot = [topic('topic-1', 'AI Agent', run('topic-registered', 'succeeded', 6))];
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    await expect(completion).resolves.toMatchObject({
+      topicId: 'topic-1',
+      kind: 'success',
+    });
+  });
+
   it('releases a completed Topic session when unmounted during cache synchronization', async () => {
     const existing = topic('topic-1', 'AI Agent');
     let snapshot = [existing];

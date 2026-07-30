@@ -209,7 +209,11 @@ class ApiController {
     );
     if (refresh.shouldEnqueue) {
       try {
-        await this.trendQueue.enqueue({ userId, trigger: 'manual' });
+        await this.trendQueue.enqueue({
+          userId,
+          trigger: 'manual',
+          runId: refresh.registration!.runId,
+        });
       } catch (error) {
         if (refresh.registration) {
           await this.store.compensateTrendRefresh(userId, refresh.registration)

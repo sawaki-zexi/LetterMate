@@ -23,9 +23,9 @@ class RecordingQueue implements TopicQueue {
 }
 
 class RecordingTrendQueue implements TrendQueue {
-  jobs: TrendJobData[] = [];
+  jobs: Array<Extract<TrendJobData, { trigger: 'manual' }>> = [];
 
-  async enqueue(data: TrendJobData) {
+  async enqueue(data: Extract<TrendJobData, { trigger: 'manual' }>) {
     this.jobs.push(data);
   }
 
@@ -35,7 +35,7 @@ class RecordingTrendQueue implements TrendQueue {
 class FailOnceTrendQueue extends RecordingTrendQueue {
   private failed = false;
 
-  override async enqueue(data: TrendJobData) {
+  override async enqueue(data: Extract<TrendJobData, { trigger: 'manual' }>) {
     if (!this.failed) {
       this.failed = true;
       throw new Error('Redis unavailable');
@@ -294,9 +294,14 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(202);
 
-    expect(first.body).toMatchObject({ runStatus: 'queued', lastRun: null });
-    expect(second.body.lastRun).toBeNull();
-    expect(trendQueue.jobs).toEqual([{ userId: 'user-a', trigger: 'manual' }]);
+    expect(first.body).toMatchObject({
+      runStatus: 'queued',
+      lastRun: { trigger: 'manual', status: 'queued', newItemCount: null },
+    });
+    expect(second.body.lastRun).toEqual(first.body.lastRun);
+    expect(trendQueue.jobs).toEqual([{
+      userId: 'user-a', trigger: 'manual', runId: first.body.lastRun.id,
+    }]);
     expect(JSON.stringify(first.body)).not.toMatch(/secret|token|connector|candidate/i);
   });
 
@@ -319,9 +324,13 @@ describe('AI discovery API', () => {
       .post('/api/v1/trends/refresh')
       .set('x-user-id', 'user-a')
       .expect(202)
-      .expect(({ body }) => expect(body.lastRun).toBeNull());
+      .expect(({ body }) => expect(body.lastRun).toMatchObject({
+        trigger: 'manual', status: 'queued',
+      }));
 
-    expect(localTrendQueue.jobs).toEqual([{ userId: 'user-a', trigger: 'manual' }]);
+    expect(localTrendQueue.jobs).toEqual([
+      expect.objectContaining({ userId: 'user-a', trigger: 'manual', runId: expect.any(String) }),
+    ]);
     await localApp.close();
   });
 

@@ -81,11 +81,16 @@ export interface QueueTrendRefreshResult {
 
 export interface TrendRefreshRegistration {
   monitorId: string;
-  activeRunId: string | null;
-  runLeaseUntil: Date | null;
+  runId: string;
+  registrationUntil: Date;
+  previousActiveRunId: string | null;
+  previousRunLeaseUntil: Date | null;
   previousRunStatus: RunStatus;
   previousLastError: SafeError | null;
+  previousLastRun: RunSummary | null;
 }
+
+const TREND_QUEUE_REGISTRATION_MS = 20 * 60_000;
 
 type TopicWithRuns = PrismaTopic & { runs?: PrismaDiscoveryRun[] };
 type TrendMonitorWithRuns = PrismaTrendMonitor & { runs?: PrismaTrendRun[] };
@@ -202,6 +207,7 @@ export class PrismaTopicStore implements TopicStore {
         data: {
           keyword,
           normalizedKeyword,
+          queuedTrigger: 'initial',
           user: {
             connectOrCreate: {
               where: { id: userId },
@@ -270,12 +276,23 @@ export class PrismaTopicStore implements TopicStore {
       }
 
       if (topic.runStatus === 'queued') {
+        if (topic.queuedTrigger === 'initial' || topic.queuedTrigger === 'scheduled') {
+          await transaction.topic.updateMany({
+            where: { id, userId, runStatus: 'queued', manualRefreshPending: false },
+            data: { manualRefreshPending: true, lastError: Prisma.DbNull },
+          });
+          topic = await transaction.topic.findFirst({
+            where: { id, userId }, include: latestRunInclude,
+          });
+          if (!topic) return null;
+          return { topic: mapTopic(topic), shouldEnqueue: false };
+        }
         return { topic: mapTopic(topic), shouldEnqueue: false };
       }
 
       const queued = await transaction.topic.updateMany({
         where: { id, userId, runStatus: { in: ['succeeded', 'failed'] } },
-        data: { runStatus: 'queued', lastError: Prisma.DbNull },
+        data: { runStatus: 'queued', queuedTrigger: 'manual', lastError: Prisma.DbNull },
       });
       topic = await transaction.topic.findFirst({
         where: { id, userId }, include: latestRunInclude,
@@ -384,52 +401,95 @@ export class PrismaTopicStore implements TopicStore {
         }
         const active = monitor.runLeaseUntil !== null && monitor.runLeaseUntil > now &&
           (monitor.runStatus === 'queued' || monitor.runStatus === 'running');
+        const activeRun = monitor.activeRunId === null
+          ? null
+          : await transaction.trendRun.findUnique({
+              where: { id_userId: { id: monitor.activeRunId, userId } },
+              select: { trigger: true, status: true },
+            });
+        if (active && activeRun?.trigger === 'manual' && activeRun.status === 'queued') {
+          return {
+            status: mapTrendStatus(monitor), shouldEnqueue: false, registration: null,
+          };
+        }
         const previousError = safeErrorSchema.safeParse(monitor.lastError);
-        const registration: TrendRefreshRegistration | null = active ? null : {
+        if (active) {
+          const updated = await transaction.trendMonitor.updateMany({
+            where: {
+              id: monitor.id, userId, manualRefreshPending: false,
+              activeRunId: monitor.activeRunId,
+              runLeaseUntil: { gt: now },
+              runStatus: { in: ['queued', 'running'] },
+            },
+            data: { manualRefreshPending: true, lastError: Prisma.DbNull },
+          });
+          monitor = await transaction.trendMonitor.findUniqueOrThrow({
+            where: { userId }, include: latestRunInclude,
+          });
+          if (updated.count === 1) {
+            return {
+              status: mapTrendStatus(monitor), shouldEnqueue: false, registration: null,
+            };
+          }
+          continue;
+        }
+
+        const runId = randomUUID();
+        const registrationUntil = new Date(now.getTime() + TREND_QUEUE_REGISTRATION_MS);
+        const registration: TrendRefreshRegistration = {
           monitorId: monitor.id,
-          activeRunId: monitor.activeRunId,
-          runLeaseUntil: monitor.runLeaseUntil,
+          runId,
+          registrationUntil,
+          previousActiveRunId: monitor.activeRunId,
+          previousRunLeaseUntil: monitor.runLeaseUntil,
           previousRunStatus: monitor.runStatus,
           previousLastError: previousError.success ? previousError.data : null,
+          previousLastRun: mapRunSummary(monitor.runs?.[0]),
         };
         const updated = await transaction.trendMonitor.updateMany({
-          where: active
-            ? {
-                id: monitor.id, userId, manualRefreshPending: false,
-                activeRunId: monitor.activeRunId,
-                runLeaseUntil: { gt: now },
-                runStatus: { in: ['queued', 'running'] },
-              }
-            : {
-                id: monitor.id, userId, manualRefreshPending: false,
-                OR: [
-                  { activeRunId: null },
-                  { runLeaseUntil: null },
-                  { runLeaseUntil: { lte: now } },
-                  { runStatus: { notIn: ['queued', 'running'] } },
-                ],
-              },
+          where: {
+            id: monitor.id, userId, manualRefreshPending: false,
+            activeRunId: monitor.activeRunId,
+            runLeaseUntil: monitor.runLeaseUntil,
+            runStatus: monitor.runStatus,
+          },
           data: {
-            manualRefreshPending: true,
+            activeRunId: runId,
+            runLeaseUntil: registrationUntil,
+            runStatus: 'queued',
+            manualRefreshPending: false,
             lastError: Prisma.DbNull,
-            ...(active ? {} : { runStatus: 'queued' as const }),
+          },
+        });
+        if (updated.count !== 1) {
+          monitor = await transaction.trendMonitor.findUniqueOrThrow({
+            where: { userId }, include: latestRunInclude,
+          });
+          continue;
+        }
+        if (monitor.activeRunId) {
+          await transaction.trendRun.updateMany({
+            where: {
+              id: monitor.activeRunId, userId, status: { in: ['queued', 'running'] },
+            },
+            data: {
+              status: 'failed', finishedAt: now,
+              error: { code: 'TREND_RUN_LEASE_EXPIRED', message: 'Trend run lease expired' },
+            },
+          });
+        }
+        await transaction.trendRun.create({
+          data: {
+            id: runId, userId, monitorId: monitor.id,
+            trigger: 'manual', status: 'queued', startedAt: now,
           },
         });
         monitor = await transaction.trendMonitor.findUniqueOrThrow({
           where: { userId }, include: latestRunInclude,
         });
-        if (updated.count === 1) {
-          if (active) {
-            return {
-              status: mapTrendStatus(monitor), shouldEnqueue: false, registration: null,
-            };
-          }
-          return {
-            status: mapTrendStatus(monitor),
-            shouldEnqueue: true,
-            registration,
-          };
-        }
+        return {
+          status: mapTrendStatus(monitor), shouldEnqueue: true, registration,
+        };
       }
     });
   }
@@ -438,22 +498,32 @@ export class PrismaTopicStore implements TopicStore {
     userId: string,
     registration: TrendRefreshRegistration,
   ): Promise<boolean> {
-    const compensated = await this.prisma.trendMonitor.updateMany({
-      where: {
-        id: registration.monitorId,
-        userId,
-        manualRefreshPending: true,
-        runStatus: 'queued',
-        activeRunId: registration.activeRunId,
-        runLeaseUntil: registration.runLeaseUntil,
-      },
-      data: {
-        manualRefreshPending: false,
-        runStatus: registration.previousRunStatus,
-        lastError: registration.previousLastError ?? Prisma.DbNull,
-      },
+    return this.prisma.$transaction(async (transaction) => {
+      const compensated = await transaction.trendMonitor.updateMany({
+        where: {
+          id: registration.monitorId,
+          userId,
+          manualRefreshPending: false,
+          runStatus: 'queued',
+          activeRunId: registration.runId,
+          runLeaseUntil: registration.registrationUntil,
+        },
+        data: {
+          activeRunId: registration.previousActiveRunId,
+          runLeaseUntil: registration.previousRunLeaseUntil,
+          runStatus: registration.previousRunStatus,
+          lastError: registration.previousLastError ?? Prisma.DbNull,
+        },
+      });
+      if (compensated.count !== 1) return false;
+      await transaction.trendRun.deleteMany({
+        where: {
+          id: registration.runId, userId, monitorId: registration.monitorId,
+          trigger: 'manual', status: 'queued',
+        },
+      });
+      return true;
     });
-    return compensated.count === 1;
   }
 
   async close(): Promise<void> {
@@ -466,7 +536,11 @@ export class MemoryTopicStore implements TopicStore {
   private readonly items: DiscoveryItem[] = [];
   private readonly radarItems: Array<TrendFeedItem & { userId: string }> = [];
   private readonly pendingManualRefreshes = new Set<string>();
-  private readonly trendMonitors = new Map<string, TrendStatus & { manualRefreshPending: boolean }>();
+  private readonly trendMonitors = new Map<string, TrendStatus & {
+    manualRefreshPending: boolean;
+    activeRunId: string | null;
+    runLeaseUntil: Date | null;
+  }>();
 
   constructor(private readonly now: () => Date = () => new Date()) {}
 
@@ -525,6 +599,13 @@ export class MemoryTopicStore implements TopicStore {
       return { topic: structuredClone(topic), shouldEnqueue };
     }
     if (topic.runStatus === 'queued') {
+      if (
+        topic.lastRun?.status === 'queued'
+        && (topic.lastRun.trigger === 'initial' || topic.lastRun.trigger === 'scheduled')
+      ) {
+        this.pendingManualRefreshes.add(id);
+        topic.lastError = null;
+      }
       return { topic: structuredClone(topic), shouldEnqueue: false };
     }
     topic.runStatus = 'queued';
@@ -582,19 +663,35 @@ export class MemoryTopicStore implements TopicStore {
   ): Promise<TrendStatus> {
     const existing = this.trendMonitors.get(userId);
     if (existing) {
-      const { manualRefreshPending: _pending, ...status } = existing;
+      const {
+        manualRefreshPending: _pending,
+        activeRunId: _activeRunId,
+        runLeaseUntil: _runLeaseUntil,
+        ...status
+      } = existing;
       return structuredClone(trendStatusSchema.parse(status));
     }
-    const monitor: TrendStatus & { manualRefreshPending: boolean } = {
+    const monitor: TrendStatus & {
+      manualRefreshPending: boolean;
+      activeRunId: string | null;
+      runLeaseUntil: Date | null;
+    } = {
       runStatus: 'queued',
       nextRunAt: now.toISOString(),
       intervalHours,
       lastError: null,
       lastRun: null,
       manualRefreshPending: false,
+      activeRunId: null,
+      runLeaseUntil: null,
     };
     this.trendMonitors.set(userId, monitor);
-    const { manualRefreshPending: _pending, ...status } = monitor;
+    const {
+      manualRefreshPending: _pending,
+      activeRunId: _activeRunId,
+      runLeaseUntil: _runLeaseUntil,
+      ...status
+    } = monitor;
     return structuredClone(trendStatusSchema.parse(status));
   }
 
@@ -606,33 +703,63 @@ export class MemoryTopicStore implements TopicStore {
     await this.getTrendStatus(userId, intervalHours, now);
     const monitor = this.trendMonitors.get(userId)!;
     if (monitor.manualRefreshPending) {
-      const { manualRefreshPending: _pending, ...status } = monitor;
+      const {
+        manualRefreshPending: _pending,
+        activeRunId: _activeRunId,
+        runLeaseUntil: _runLeaseUntil,
+        ...status
+      } = monitor;
       return {
         status: structuredClone(trendStatusSchema.parse(status)),
         shouldEnqueue: false,
         registration: null,
       };
     }
+    const active = monitor.activeRunId !== null && monitor.runLeaseUntil !== null &&
+      monitor.runLeaseUntil > now &&
+      (monitor.runStatus === 'queued' || monitor.runStatus === 'running');
+    if (active) {
+      if (monitor.lastRun?.trigger !== 'manual') monitor.manualRefreshPending = true;
+      monitor.lastError = null;
+      const {
+        manualRefreshPending: _pending,
+        activeRunId: _activeRunId,
+        runLeaseUntil: _runLeaseUntil,
+        ...status
+      } = monitor;
+      return {
+        status: structuredClone(trendStatusSchema.parse(status)),
+        shouldEnqueue: false,
+        registration: null,
+      };
+    }
+    const runId = randomUUID();
+    const registrationUntil = new Date(now.getTime() + TREND_QUEUE_REGISTRATION_MS);
     const registration: TrendRefreshRegistration = {
       monitorId: userId,
-      activeRunId: null,
-      runLeaseUntil: null,
+      runId,
+      registrationUntil,
+      previousActiveRunId: monitor.activeRunId,
+      previousRunLeaseUntil: monitor.runLeaseUntil,
       previousRunStatus: monitor.runStatus,
       previousLastError: monitor.lastError,
+      previousLastRun: monitor.lastRun,
     };
-    monitor.manualRefreshPending = true;
-    if (monitor.runStatus === 'running') {
-      monitor.lastError = null;
-      const { manualRefreshPending: _pending, ...status } = monitor;
-      return {
-        status: structuredClone(trendStatusSchema.parse(status)),
-        shouldEnqueue: false,
-        registration: null,
-      };
-    }
+    monitor.manualRefreshPending = false;
     monitor.runStatus = 'queued';
+    monitor.activeRunId = runId;
+    monitor.runLeaseUntil = registrationUntil;
     monitor.lastError = null;
-    const { manualRefreshPending: _pending, ...status } = monitor;
+    monitor.lastRun = {
+      id: runId, trigger: 'manual', status: 'queued', startedAt: now.toISOString(),
+      finishedAt: null, newItemCount: null,
+    };
+    const {
+      manualRefreshPending: _pending,
+      activeRunId: _activeRunId,
+      runLeaseUntil: _runLeaseUntil,
+      ...status
+    } = monitor;
     return {
       status: structuredClone(trendStatusSchema.parse(status)),
       shouldEnqueue: true,
@@ -647,13 +774,18 @@ export class MemoryTopicStore implements TopicStore {
     const monitor = this.trendMonitors.get(userId);
     if (
       !monitor || registration.monitorId !== userId ||
-      !monitor.manualRefreshPending || monitor.runStatus !== 'queued'
+      monitor.manualRefreshPending || monitor.runStatus !== 'queued' ||
+      monitor.activeRunId !== registration.runId ||
+      monitor.runLeaseUntil?.getTime() !== registration.registrationUntil.getTime() ||
+      monitor.lastRun?.id !== registration.runId || monitor.lastRun.status !== 'queued'
     ) {
       return false;
     }
-    monitor.manualRefreshPending = false;
+    monitor.activeRunId = registration.previousActiveRunId;
+    monitor.runLeaseUntil = registration.previousRunLeaseUntil;
     monitor.runStatus = registration.previousRunStatus;
     monitor.lastError = registration.previousLastError;
+    monitor.lastRun = registration.previousLastRun;
     return true;
   }
 

@@ -80,6 +80,7 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
         OR: [
           {
             nextRunAt: { lte: now },
+            NOT: { runStatus: 'queued', queuedTrigger: 'manual' },
             OR: [
               { runStatus: { not: 'running' } },
               { runLeaseUntil: null },
@@ -97,6 +98,7 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
         nextRunAt: true,
         runStatus: true,
         runLeaseUntil: true,
+        queuedTrigger: true,
       },
     });
     const claimed: ClaimedTopic[] = [];
@@ -125,6 +127,7 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
         data: {
           nextRunAt: claimUntil,
           runStatus: 'queued',
+          queuedTrigger: 'scheduled',
         },
       });
       if (result.count === 1) {

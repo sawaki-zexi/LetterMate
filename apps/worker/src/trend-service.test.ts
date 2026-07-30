@@ -9,6 +9,10 @@ import {
 } from './trend-service.js';
 
 const now = new Date('2026-07-28T12:00:00.000Z');
+const scheduledJob = {
+  userId: 'user-1', trigger: 'scheduled' as const,
+  dueAt: '2026-07-28T11:50:00.000Z',
+};
 const seed = (overrides = {}) => ({
   sourceId: 'hacker-news-trends', platform: 'Hacker News', externalId: '42',
   title: 'OpenAI releases gpt-5.7 for software engineering',
@@ -30,8 +34,8 @@ const repository = (overrides: Partial<TrendRepository> = {}): TrendRepository =
   saveSeeds: vi.fn().mockResolvedValue(undefined),
   updateSeedQueries: vi.fn().mockResolvedValue(undefined),
   listHistoryUrls: vi.fn().mockResolvedValue([]),
-  completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 1, followUpManual: false }),
-  completeFailure: vi.fn().mockResolvedValue({ followUpManual: false }),
+  completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 1, followUpManualRunId: null }),
+  completeFailure: vi.fn().mockResolvedValue({ followUpManualRunId: null }),
   acknowledgeManualFollowUp: vi.fn().mockResolvedValue(true),
   ...overrides,
 });
@@ -79,14 +83,14 @@ const makeService = (options: {
 describe('TrendDiscoveryService', () => {
   it('treats one successful trend source with no candidates as a successful zero-item run', async () => {
     const repo = repository({
-      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManual: false }),
+      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManualRunId: null }),
     });
     const { service, classify, search, quality } = makeService({
       repository: repo,
       collect: vi.fn().mockResolvedValue(sourceSummary({ candidates: [] })),
     });
 
-    await expect(service.run('user-1', 'scheduled')).resolves.toEqual({ followUpManual: false });
+    await expect(service.run(scheduledJob)).resolves.toEqual({ followUpManualRunId: null });
 
     expect(classify).not.toHaveBeenCalled();
     expect(search).not.toHaveBeenCalled();
@@ -106,7 +110,7 @@ describe('TrendDiscoveryService', () => {
       })),
     });
 
-    await expect(service.run('user-1', 'scheduled')).rejects.toMatchObject({
+    await expect(service.run(scheduledJob)).rejects.toMatchObject({
       code: 'ALL_TREND_SOURCES_FAILED', retryable: true,
     });
     expect(repo.completeSuccess).not.toHaveBeenCalled();
@@ -128,7 +132,7 @@ describe('TrendDiscoveryService', () => {
     const repo = repository({
       listRecentFingerprints: vi.fn().mockImplementation(async (_userId, fingerprints) =>
         new Set([fingerprints[0]])),
-      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManual: false }),
+      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManualRunId: null }),
     });
     const { service } = makeService({
       repository: repo, classify, maxSeeds: 40,
@@ -136,7 +140,7 @@ describe('TrendDiscoveryService', () => {
       quality: vi.fn().mockResolvedValue([]),
     });
 
-    await service.run('user-1', 'scheduled');
+    await service.run(scheduledJob);
 
     expect(classify).toHaveBeenCalledTimes(3);
     expect(classify.mock.calls.map(([input]) => input.seeds.length)).toEqual([3, 3, 1]);
@@ -156,16 +160,49 @@ describe('TrendDiscoveryService', () => {
     }));
   });
 
+  it('deduplicates trend seeds independently by source identity, canonical URL, and title', async () => {
+    const candidates = [
+      seed({ externalId: 'existing-id', title: 'Existing title', url: 'https://example.com/one' }),
+      seed({ externalId: 'new-id-1', title: 'Different title', url: 'https://example.com/existing-url' }),
+      seed({ externalId: 'new-id-2', title: 'Existing title', url: 'https://example.com/two' }),
+      seed({ externalId: 'new-id-3', title: 'Unique title', url: 'https://example.com/three' }),
+    ];
+    const repo = repository({
+      listRecentSeedIdentities: vi.fn().mockResolvedValue({
+        sourceExternal: new Set(['hacker-news-trends\u0000existing-id']),
+        urls: new Set(['https://example.com/existing-url']),
+        titles: new Set(['existing title']),
+      }),
+      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManualRunId: null }),
+    });
+    const classify = vi.fn().mockImplementation(async ({ seeds }: { seeds: Array<{ id: string }> }) => (
+      seeds.map(({ id }) => ({ id, accepted: false, query: null, requiredTerms: [] }))
+    ));
+    const { service } = makeService({
+      repository: repo,
+      classify,
+      collect: vi.fn().mockResolvedValue(sourceSummary({ candidates })),
+      quality: vi.fn().mockResolvedValue([]),
+    });
+
+    await service.run(scheduledJob);
+
+    expect(classify.mock.calls[0]![0].seeds).toHaveLength(1);
+    expect(repo.saveSeeds).toHaveBeenCalledWith(expect.objectContaining({
+      seeds: [expect.objectContaining({ externalId: 'new-id-3', title: 'Unique title' })],
+    }));
+  });
+
   it('persists rejected technical-filter decisions with a null query', async () => {
     const repo = repository({
-      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManual: false }),
+      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManualRunId: null }),
     });
     const classify = vi.fn().mockImplementation(async ({ seeds }) => seeds.map(({ id }: { id: string }) => ({
       id, accepted: false, query: null, requiredTerms: [],
     })));
     const { service, search } = makeService({ repository: repo, classify });
 
-    await service.run('user-1', 'scheduled');
+    await service.run(scheduledJob);
 
     expect(search).not.toHaveBeenCalled();
     expect(repo.saveSeeds).toHaveBeenCalledWith(expect.objectContaining({
@@ -182,7 +219,7 @@ describe('TrendDiscoveryService', () => {
       }]),
     });
 
-    await expect(service.run('user-1', 'scheduled')).rejects.toBeInstanceOf(TrendOrchestrationError);
+    await expect(service.run(scheduledJob)).rejects.toBeInstanceOf(TrendOrchestrationError);
     expect(repo.saveSeeds).toHaveBeenCalledWith({
       runId: 'run-1',
       userId: 'user-1',
@@ -203,7 +240,7 @@ describe('TrendDiscoveryService', () => {
   it('builds version-preserving connector plans and passes their required match policy to quality', async () => {
     const { service, search, quality } = makeService();
 
-    await service.run('user-1', 'scheduled');
+    await service.run(scheduledJob);
 
     const plan = search.mock.calls[0]![0];
     expect(plan.keyword).toContain('gpt-5.7');
@@ -217,7 +254,7 @@ describe('TrendDiscoveryService', () => {
   it('honors trend budgets and forwards one AbortSignal through sources, connectors, and quality', async () => {
     const { service, collect, search, quality } = makeService({ maxSeeds: 7, requestBudget: 9 });
 
-    await service.run('user-1', 'scheduled');
+    await service.run(scheduledJob);
 
     expect(collect).toHaveBeenCalledWith(expect.objectContaining({ maxCandidates: 7, requestBudget: 9 }), expect.any(AbortSignal));
     const signal = collect.mock.calls[0]![1];
@@ -225,78 +262,63 @@ describe('TrendDiscoveryService', () => {
     expect(quality.mock.calls[0]![0].signal).toBe(signal);
   });
 
-  it('returns exactly one registered manual follow-up signal after atomic completion', async () => {
+  it('returns the exact registered manual follow-up identity after atomic completion', async () => {
     const repo = repository({
-      completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 1, followUpManual: true }),
+      completeSuccess: vi.fn().mockResolvedValue({
+        newItemCount: 1, followUpManualRunId: 'manual-follow-up-1',
+      }),
     });
     const { service } = makeService({ repository: repo });
 
-    await expect(service.run('user-1', 'scheduled')).resolves.toEqual({ followUpManual: true });
+    await expect(service.run(scheduledJob)).resolves.toEqual({
+      followUpManualRunId: 'manual-follow-up-1',
+    });
     expect(repo.completeSuccess).toHaveBeenCalledOnce();
   });
 });
 
 describe('PrismaTrendRepository', () => {
-  it('provisions a missing monitor with the configured default interval for manual discovery', async () => {
-    const provisioned = {
-      id: 'monitor-new', userId: 'user-1', runStatus: 'queued', activeRunId: null,
-      runLeaseUntil: null, intervalHours: 8,
-      nextRunAt: now, manualRefreshPending: false,
-    };
+  it('rejects an unregistered manual job instead of creating a run', async () => {
     const transaction = {
       trendMonitor: {
         findUnique: vi.fn().mockResolvedValue(null),
-        upsert: vi.fn().mockResolvedValue(provisioned),
-        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        updateMany: vi.fn(),
       },
-      trendRun: { create: vi.fn().mockResolvedValue({}) },
+      trendRun: { create: vi.fn() },
     };
     const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
     const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000, 8);
 
-    await expect(repo.claimRun('user-1', 'manual', now)).resolves.toMatchObject({
-      state: 'claimed', monitorId: 'monitor-new', intervalHours: 8,
-    });
-
-    expect(transaction.trendMonitor.upsert).toHaveBeenCalledWith({
-      where: { userId: 'user-1' },
-      create: {
-        userId: 'user-1', intervalHours: 8, nextRunAt: now, runStatus: 'queued',
-      },
-      update: {},
-    });
+    await expect(repo.claimRun({
+      userId: 'user-1', trigger: 'manual', runId: 'missing-run',
+    }, now)).resolves.toEqual({ state: 'missing' });
+    expect(transaction.trendRun.create).not.toHaveBeenCalled();
   });
 
-  it('registers exactly one pending manual refresh while an active lease exists', async () => {
+  it('rejects a stale manual job after a newer registration became active', async () => {
     const transaction = {
       trendMonitor: {
-        findUnique: vi.fn()
-          .mockResolvedValueOnce({
-            id: 'monitor-1', userId: 'user-1', runStatus: 'running', activeRunId: 'run-1',
-            runLeaseUntil: new Date('2026-07-28T12:05:00.000Z'), intervalHours: 4,
-            nextRunAt: new Date('2026-07-28T16:00:00.000Z'), manualRefreshPending: false,
-          })
-          .mockResolvedValueOnce({
-            id: 'monitor-1', userId: 'user-1', runStatus: 'running', activeRunId: 'run-1',
-            runLeaseUntil: new Date('2026-07-28T12:05:00.000Z'), intervalHours: 4,
-            nextRunAt: new Date('2026-07-28T16:00:00.000Z'), manualRefreshPending: true,
-          }),
-        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        findUnique: vi.fn().mockResolvedValue({
+          id: 'monitor-1', userId: 'user-1', runStatus: 'queued', activeRunId: 'run-new',
+          runLeaseUntil: new Date('2026-07-28T12:05:00.000Z'), intervalHours: 4,
+          nextRunAt: new Date('2026-07-28T16:00:00.000Z'), manualRefreshPending: false,
+        }),
+        updateMany: vi.fn(),
       },
+      trendRun: { findUnique: vi.fn(), updateMany: vi.fn() },
     };
     const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
     const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
 
-    await expect(repo.claimRun('user-1', 'manual', now)).resolves.toEqual({
-      state: 'active', followUpManualRegistered: true,
+    await expect(repo.claimRun({
+      userId: 'user-1', trigger: 'manual', runId: 'run-old',
+    }, now)).resolves.toEqual({
+      state: 'active', followUpManualRunId: null,
     });
-    await expect(repo.claimRun('user-1', 'manual', now)).resolves.toEqual({
-      state: 'active', followUpManualRegistered: false,
-    });
-    expect(transaction.trendMonitor.updateMany).toHaveBeenCalledTimes(1);
+    expect(transaction.trendMonitor.updateMany).not.toHaveBeenCalled();
   });
 
-  it('resumes the same queued manual run without clearing a pending follow-up', async () => {
+  it('resumes only the same queued manual run and consumes its pending marker', async () => {
     const transaction = {
       trendMonitor: {
         findUnique: vi.fn().mockResolvedValue({
@@ -314,12 +336,58 @@ describe('PrismaTrendRepository', () => {
     const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
     const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
 
-    await expect(repo.claimRun('user-1', 'manual', now)).resolves.toMatchObject({
+    await expect(repo.claimRun({
+      userId: 'user-1', trigger: 'manual', runId: 'run-1',
+    }, now)).resolves.toMatchObject({
       state: 'claimed', runId: 'run-1', monitorId: 'monitor-1',
     });
 
     expect(transaction.trendMonitor.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.not.objectContaining({ manualRefreshPending: false }),
+      data: expect.objectContaining({ manualRefreshPending: false }),
+    }));
+  });
+
+  it('rejects a delayed scheduled job after the authoritative due time advanced', async () => {
+    const transaction = {
+      trendMonitor: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: 'monitor-1', userId: 'user-1', runStatus: 'succeeded', activeRunId: null,
+          runLeaseUntil: null, intervalHours: 4,
+          nextRunAt: new Date('2026-07-28T16:00:00.000Z'), manualRefreshPending: false,
+        }),
+        updateMany: vi.fn(),
+      },
+      trendRun: { create: vi.fn() },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+    const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
+
+    await expect(repo.claimRun(scheduledJob, now)).resolves.toEqual({
+      state: 'active', followUpManualRunId: null,
+    });
+    expect(transaction.trendMonitor.updateMany).not.toHaveBeenCalled();
+    expect(transaction.trendRun.create).not.toHaveBeenCalled();
+  });
+
+  it('claims a legacy scheduled job reserved with a future queue lease', async () => {
+    const transaction = {
+      trendMonitor: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: 'monitor-1', userId: 'user-1', runStatus: 'queued', activeRunId: null,
+          runLeaseUntil: new Date('2026-07-28T12:05:00.000Z'), intervalHours: 4,
+          nextRunAt: new Date('2026-07-28T12:05:00.000Z'), manualRefreshPending: false,
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+      trendRun: { create: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+    const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
+
+    await expect(repo.claimRun({ userId: 'user-1', trigger: 'scheduled' }, now))
+      .resolves.toMatchObject({ state: 'claimed', runId: expect.any(String) });
+    expect(transaction.trendRun.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ trigger: 'scheduled', status: 'running' }),
     }));
   });
 
@@ -338,7 +406,7 @@ describe('PrismaTrendRepository', () => {
     await expect(repo.completeFailure({
       runId: 'run-1', monitorId: 'monitor-1', userId: 'user-1', trigger: 'scheduled',
       error: { code: 'FAILED', message: 'Safe failure' }, finishedAt: now, status: 'failed',
-    })).resolves.toEqual({ followUpManual: false });
+    })).resolves.toEqual({ followUpManualRunId: null });
 
     expect(transaction.trendMonitor.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ runLeaseUntil: { gt: now } }),
@@ -355,7 +423,10 @@ describe('PrismaTrendRepository', () => {
         update: vi.fn().mockResolvedValue({}),
       },
       radarItem: { createMany: vi.fn().mockResolvedValue({ count: 1 }) },
-      trendRun: { update: vi.fn().mockResolvedValue({}) },
+      trendRun: {
+        update: vi.fn().mockResolvedValue({}),
+        create: vi.fn().mockResolvedValue({}),
+      },
     };
     const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
     const repo = new PrismaTrendRepository(prisma as never, 10 * 60_000);
@@ -378,7 +449,27 @@ describe('PrismaTrendRepository', () => {
     expect(transaction.trendRun.update).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ newItemCount: 1, status: 'succeeded', finishedAt: now }),
     }));
-    expect(result).toEqual({ newItemCount: 1, followUpManual: true });
+    expect(result).toEqual({
+      newItemCount: 1,
+      followUpManualRunId: expect.any(String),
+    });
+    expect(transaction.trendRun.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        id: result.followUpManualRunId,
+        userId: 'user-1',
+        monitorId: 'monitor-1',
+        trigger: 'manual',
+        status: 'queued',
+      }),
+    });
+    expect(transaction.trendMonitor.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        activeRunId: result.followUpManualRunId,
+        manualRefreshPending: true,
+        runStatus: 'queued',
+        runLeaseUntil: new Date('2026-07-28T12:10:00.000Z'),
+      }),
+    }));
   });
 
   it('retries a final scheduled failure at the monitor configured interval', async () => {
@@ -421,7 +512,7 @@ describe('PrismaTrendRepository', () => {
     await expect(repo.completeFailure({
       runId: 'run-1', monitorId: 'monitor-1', userId: 'user-1', trigger: 'scheduled',
       error: { code: 'FAILED', message: 'Safe failure' }, finishedAt: now, status: 'queued',
-    })).resolves.toEqual({ followUpManual: false });
+    })).resolves.toEqual({ followUpManualRunId: null });
 
     expect(transaction.trendMonitor.update).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
@@ -444,7 +535,7 @@ describe('PrismaTrendRepository', () => {
       runId: 'run-1', userId: 'user-1',
       decisions: [{ fingerprint: 'fingerprint-1', normalizedQuery: 'OpenAI gpt-5.7' }],
     });
-    await expect(repo.acknowledgeManualFollowUp('user-1')).resolves.toBe(true);
+    await expect(repo.acknowledgeManualFollowUp('user-1', 'manual-run-1')).resolves.toBe(true);
 
     expect(prisma.trendSeed.updateMany).toHaveBeenCalledWith({
       where: { runId: 'run-1', userId: 'user-1', fingerprint: 'fingerprint-1' },
@@ -452,7 +543,7 @@ describe('PrismaTrendRepository', () => {
     });
     expect(prisma.trendMonitor.updateMany).toHaveBeenCalledWith({
       where: {
-        userId: 'user-1', runStatus: 'queued', activeRunId: null,
+        userId: 'user-1', runStatus: 'queued', activeRunId: 'manual-run-1',
         manualRefreshPending: true,
       },
       data: { manualRefreshPending: false },

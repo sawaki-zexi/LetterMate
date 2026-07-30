@@ -111,6 +111,7 @@ describe('PrismaTopicScheduleRepository', () => {
       data: {
         nextRunAt: claimUntil,
         runStatus: 'queued',
+        queuedTrigger: 'scheduled',
       },
     });
   });
@@ -143,7 +144,7 @@ describe('PrismaTopicScheduleRepository', () => {
         runStatus: 'running',
         runLeaseUntil: leaseExpiredAt,
       },
-      data: { nextRunAt: claimUntil, runStatus: 'queued' },
+      data: { nextRunAt: claimUntil, runStatus: 'queued', queuedTrigger: 'scheduled' },
     });
   });
 });

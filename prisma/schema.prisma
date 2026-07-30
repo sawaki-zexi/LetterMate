@@ -76,6 +76,7 @@ model Topic {
   createdAt             DateTime        @default(now())
   lastRunAt             DateTime?
   runStatus             RunStatus       @default(queued)
+  queuedTrigger         DiscoveryTrigger?
   lastError             Json?
   nextRunAt             DateTime?
   scheduleIntervalHours Int             @default(12)

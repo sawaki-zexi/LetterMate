@@ -3,8 +3,6 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   runSummarySchema,
   trendStatusSchema,
-  type RunStatus,
-  type SafeError,
 } from '@lettermate/contracts';
 import { MemoryTopicStore, PrismaTopicStore } from './topic-store.js';
 
@@ -320,6 +318,9 @@ describe('topic store multi-source mappings', () => {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         findUniqueOrThrow: vi.fn().mockResolvedValue(pending),
       },
+      trendRun: {
+        findUnique: vi.fn().mockResolvedValue({ trigger: 'scheduled', status: 'running' }),
+      },
       $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
     } as unknown as PrismaClient;
 
@@ -378,7 +379,18 @@ describe('topic store multi-source mappings', () => {
       ...running, runStatus: 'succeeded' as const, activeRunId: null,
       runLeaseUntil: null, manualRefreshPending: false,
     };
-    const queued = { ...succeeded, runStatus: 'queued' as const, manualRefreshPending: true };
+    let newRunId = '';
+    const queued = () => ({
+      ...succeeded,
+      runStatus: 'queued' as const,
+      activeRunId: newRunId,
+      runLeaseUntil: new Date('2026-07-28T12:20:00.000Z'),
+      runs: [{
+        id: newRunId, userId: 'user-1', monitorId: 'monitor-1',
+        trigger: 'manual' as const, status: 'queued' as const, startedAt: now,
+        finishedAt: null, newItemCount: 0,
+      }],
+    });
     const prisma = {
       user: { upsert: vi.fn().mockResolvedValue({}) },
       trendMonitor: {
@@ -388,7 +400,15 @@ describe('topic store multi-source mappings', () => {
           .mockResolvedValueOnce({ count: 1 }),
         findUniqueOrThrow: vi.fn()
           .mockResolvedValueOnce(succeeded)
-          .mockResolvedValueOnce(queued),
+          .mockImplementationOnce(async () => queued()),
+      },
+      trendRun: {
+        findUnique: vi.fn().mockResolvedValue({ trigger: 'scheduled', status: 'running' }),
+        create: vi.fn(async ({ data }: { data: { id: string } }) => {
+          newRunId = data.id;
+          return data;
+        }),
+        updateMany: vi.fn(),
       },
       $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
     } as unknown as PrismaClient;
@@ -399,98 +419,137 @@ describe('topic store multi-source mappings', () => {
     expect(prisma.trendMonitor.updateMany).toHaveBeenCalledTimes(2);
   });
 
-  it('compensates only its unchanged idle trend refresh registration', async () => {
+  it('creates a distinct manual registration after DB completion while the old job still exists', async () => {
     const now = new Date('2026-07-28T12:00:00.000Z');
+    const oldRun = {
+      id: 'manual-old', userId: 'user-1', monitorId: 'monitor-1',
+      trigger: 'manual', status: 'succeeded', startedAt: new Date('2026-07-28T11:00:00.000Z'),
+      finishedAt: new Date('2026-07-28T11:05:00.000Z'), newItemCount: 0,
+    } as const;
     const idle = {
       id: 'monitor-1', userId: 'user-1', runStatus: 'succeeded', nextRunAt: now,
       intervalHours: 4, activeRunId: null, runLeaseUntil: null,
-      manualRefreshPending: false,
-      lastError: { code: 'PREVIOUS_FAILURE', message: 'Previous safe failure' },
-      runs: [],
+      manualRefreshPending: false, lastError: null, runs: [oldRun],
     } as const;
-    let monitor: Omit<typeof idle, 'runStatus' | 'manualRefreshPending' | 'lastError'> & {
-      runStatus: RunStatus;
-      manualRefreshPending: boolean;
-      lastError: SafeError | null;
-    } = { ...idle };
-    const updateMany = vi.fn(async ({ where, data }: {
-      where: Record<string, unknown>;
-      data: Record<string, unknown>;
-    }) => {
-      if (data.manualRefreshPending === true && monitor.manualRefreshPending === false) {
-        monitor = {
-          ...monitor,
-          runStatus: 'queued',
-          manualRefreshPending: true,
-          lastError: null,
-        };
-        return { count: 1 };
-      }
-      const unchangedRegistration = where.manualRefreshPending === true &&
-        where.runStatus === 'queued' && where.activeRunId === null &&
-        where.runLeaseUntil === null && monitor.manualRefreshPending === true &&
-        monitor.runStatus === 'queued' && monitor.activeRunId === null &&
-        monitor.runLeaseUntil === null;
-      if (!unchangedRegistration) return { count: 0 };
-      monitor = {
-        ...monitor,
-        runStatus: data.runStatus as typeof monitor.runStatus,
-        manualRefreshPending: false,
-        lastError: data.lastError as typeof monitor.lastError,
-      };
-      return { count: 1 };
-    });
+    let newRunId = '';
     const prisma = {
       user: { upsert: vi.fn().mockResolvedValue({}) },
       trendMonitor: {
-        upsert: vi.fn(async () => monitor), updateMany,
-        findUniqueOrThrow: vi.fn(async () => monitor),
+        upsert: vi.fn().mockResolvedValue(idle),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: vi.fn(async () => ({
+          ...idle,
+          runStatus: 'queued' as const,
+          activeRunId: newRunId,
+          runLeaseUntil: new Date('2026-07-28T12:20:00.000Z'),
+          runs: [{
+            ...oldRun,
+            id: newRunId,
+            trigger: 'manual' as const,
+            status: 'queued' as const,
+            startedAt: now,
+            finishedAt: null,
+          }],
+        })),
       },
+      trendRun: {
+        create: vi.fn(async ({ data }: { data: { id: string } }) => {
+          newRunId = data.id;
+          return data;
+        }),
+        updateMany: vi.fn(),
+      },
+      $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
+    } as unknown as PrismaClient;
+
+    const result = await new PrismaTopicStore(prisma).queueTrendRefresh('user-1', 4, now);
+
+    expect(result.shouldEnqueue).toBe(true);
+    expect(result.registration?.runId).toBe(newRunId);
+    expect(newRunId).not.toBe('manual-old');
+    expect(result.status.lastRun).toMatchObject({
+      id: newRunId, trigger: 'manual', status: 'queued',
+    });
+    expect(prisma.trendRun.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        id: newRunId, userId: 'user-1', monitorId: 'monitor-1',
+        trigger: 'manual', status: 'queued', startedAt: now,
+      }),
+    });
+  });
+
+  it('compensates only its unchanged queued trend registration', async () => {
+    const registrationUntil = new Date('2026-07-28T12:20:00.000Z');
+    const updateMany = vi.fn().mockResolvedValue({ count: 1 });
+    const deleteMany = vi.fn().mockResolvedValue({ count: 1 });
+    const prisma = {
+      trendMonitor: { updateMany },
+      trendRun: { deleteMany },
+      $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
+    } as unknown as PrismaClient;
+    const store = new PrismaTopicStore(prisma);
+    const registration = {
+      monitorId: 'monitor-1', runId: 'manual-new', registrationUntil,
+      previousActiveRunId: null, previousRunLeaseUntil: null,
+      previousRunStatus: 'succeeded' as const,
+      previousLastError: { code: 'PREVIOUS_FAILURE', message: 'Previous safe failure' },
+      previousLastRun: null,
+    };
+
+    const compensated = await store.compensateTrendRefresh('user-1', registration);
+
+    expect(compensated).toBe(true);
+    expect(updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'monitor-1', userId: 'user-1', manualRefreshPending: false,
+        runStatus: 'queued', activeRunId: 'manual-new', runLeaseUntil: registrationUntil,
+      },
+      data: {
+        activeRunId: null, runLeaseUntil: null, runStatus: 'succeeded',
+        lastError: registration.previousLastError,
+      },
+    });
+    expect(deleteMany).toHaveBeenCalledWith({
+      where: {
+        id: 'manual-new', userId: 'user-1', monitorId: 'monitor-1',
+        trigger: 'manual', status: 'queued',
+      },
+    });
+  });
+
+  it('does not compensate after a worker has claimed the registered trend refresh', async () => {
+    const updateMany = vi.fn().mockResolvedValue({ count: 0 });
+    const deleteMany = vi.fn();
+    const prisma = {
+      trendMonitor: { updateMany }, trendRun: { deleteMany },
       $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
     } as unknown as PrismaClient;
     const store = new PrismaTopicStore(prisma);
 
-    const first = await store.queueTrendRefresh('user-1', 4, now);
-    const repeated = await store.queueTrendRefresh('user-1', 4, now);
-    const compensated = await store.compensateTrendRefresh('user-1', first.registration!);
-    const retry = await store.queueTrendRefresh('user-1', 4, now);
-
-    expect(first).toMatchObject({ shouldEnqueue: true, registration: { monitorId: 'monitor-1' } });
-    expect(repeated).toMatchObject({ shouldEnqueue: false, registration: null });
-    expect(compensated).toBe(true);
-    expect(retry).toMatchObject({ shouldEnqueue: true });
-    expect(updateMany).toHaveBeenCalledTimes(3);
-  });
-
-  it('does not compensate after a worker has claimed the registered trend refresh', async () => {
-    const now = new Date('2026-07-28T12:00:00.000Z');
-    const queued = {
-      id: 'monitor-1', userId: 'user-1', runStatus: 'queued', nextRunAt: now,
-      intervalHours: 4, activeRunId: null, runLeaseUntil: null,
-      manualRefreshPending: true, lastError: null, runs: [],
-    } as const;
-    const updateMany = vi.fn().mockResolvedValue({ count: 0 });
-    const prisma = { trendMonitor: { updateMany } } as unknown as PrismaClient;
-    const store = new PrismaTopicStore(prisma);
-
     const compensated = await store.compensateTrendRefresh('user-1', {
       monitorId: 'monitor-1',
-      activeRunId: null,
-      runLeaseUntil: null,
+      runId: 'manual-new',
+      registrationUntil: new Date('2026-07-28T12:20:00.000Z'),
+      previousActiveRunId: null,
+      previousRunLeaseUntil: null,
       previousRunStatus: 'succeeded',
       previousLastError: null,
+      previousLastRun: null,
     });
 
     expect(compensated).toBe(false);
     expect(updateMany).toHaveBeenCalledWith({
       where: {
-        id: queued.id, userId: 'user-1', manualRefreshPending: true,
-        runStatus: 'queued', activeRunId: null, runLeaseUntil: null,
+        id: 'monitor-1', userId: 'user-1', manualRefreshPending: false,
+        runStatus: 'queued', activeRunId: 'manual-new',
+        runLeaseUntil: new Date('2026-07-28T12:20:00.000Z'),
       },
       data: {
-        manualRefreshPending: false, runStatus: 'succeeded', lastError: expect.anything(),
+        activeRunId: null, runLeaseUntil: null,
+        runStatus: 'succeeded', lastError: expect.anything(),
       },
     });
+    expect(deleteMany).not.toHaveBeenCalled();
   });
 
   it('queues only one pending manual refresh without changing a running topic state', async () => {
@@ -527,6 +586,33 @@ describe('topic store multi-source mappings', () => {
       where: {
         id: 'topic-1', userId: 'user-1', runStatus: 'running', manualRefreshPending: false,
       },
+      data: { manualRefreshPending: true, lastError: expect.anything() },
+    });
+  });
+
+  it('records one pending manual refresh while an initial or scheduled Topic job is queued', async () => {
+    const queued = {
+      id: 'topic-queued', userId: 'user-1', keyword: 'Agents', normalizedKeyword: 'agents',
+      expandedTerms: [], createdAt: new Date('2026-07-27T08:00:00.000Z'), lastRunAt: null,
+      nextRunAt: new Date('2026-07-27T20:00:00.000Z'), scheduleIntervalHours: 12,
+      productiveRunStreak: 0, emptyRunStreak: 0, runStatus: 'queued' as const,
+      queuedTrigger: 'scheduled' as const, lastError: null, activeRunId: null,
+      runLeaseUntil: new Date('2026-07-27T08:15:00.000Z'), manualRefreshPending: false,
+    };
+    const pending = { ...queued, manualRefreshPending: true };
+    const prisma = {
+      topic: {
+        findFirst: vi.fn().mockResolvedValueOnce(queued).mockResolvedValueOnce(pending),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+      $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
+    } as unknown as PrismaClient;
+
+    const result = await new PrismaTopicStore(prisma).queueRefresh('user-1', 'topic-queued');
+
+    expect(result).toMatchObject({ shouldEnqueue: false, topic: { runStatus: 'queued' } });
+    expect(prisma.topic.updateMany).toHaveBeenCalledWith({
+      where: { id: 'topic-queued', userId: 'user-1', runStatus: 'queued', manualRefreshPending: false },
       data: { manualRefreshPending: true, lastError: expect.anything() },
     });
   });

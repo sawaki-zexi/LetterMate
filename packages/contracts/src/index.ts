@@ -145,10 +145,18 @@ export const discoveryJobDataSchema = z.object({
   trigger: discoveryTriggerSchema,
 });
 
-export const trendJobDataSchema = z.strictObject({
-  userId: z.string().min(1),
-  trigger: discoveryTriggerSchema,
-});
+export const trendJobDataSchema = z.discriminatedUnion('trigger', [
+  z.strictObject({
+    userId: z.string().min(1),
+    trigger: z.literal('manual'),
+    runId: z.string().min(1),
+  }),
+  z.strictObject({
+    userId: z.string().min(1),
+    trigger: z.literal('scheduled'),
+    dueAt: z.iso.datetime(),
+  }),
+]);
 
 export const apiErrorSchema = z.object({
   code: z.string().min(1),

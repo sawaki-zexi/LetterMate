@@ -221,6 +221,39 @@ describe('useRefreshCoordinator', () => {
     await expect(completion).resolves.toMatchObject({ message: '刷新完成，新增 2 条内容' });
   });
 
+  it('accepts a queued Topic registration when that same run becomes terminal', async () => {
+    const queuedRun = run('topic-registered', 'queued');
+    const harness = setup({
+      topics: [topic('topic-1')],
+      selectedTopicId: 'topic-1',
+      refreshTopic: vi.fn(async () => topic('topic-1', queuedRun)),
+    });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    harness.setSnapshots([
+      topic('topic-1', run('topic-registered', 'succeeded', undefined, 4)),
+    ], trend());
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    await expect(completion).resolves.toMatchObject({ kind: 'success' });
+  });
+
+  it('accepts a queued Trend registration when that same run becomes terminal', async () => {
+    const queuedRun = run('trend-registered', 'queued');
+    const harness = setup({
+      origin: 'trend',
+      refreshTrends: vi.fn(async () => trend(queuedRun)),
+    });
+    const completion = begin(harness.result);
+    await act(async () => Promise.resolve());
+
+    harness.setSnapshots([], trend(run('trend-registered', 'succeeded', undefined, 5)));
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    await expect(completion).resolves.toMatchObject({ kind: 'success' });
+  });
+
   it('does not wait for unrelated trend polling for a selected Topic', async () => {
     const never = new Promise<never>(() => undefined);
     const refetchTrendStatus = vi.fn(() => never);

@@ -48,6 +48,7 @@ export interface SaveFailureInput {
   error: SafeError;
   finishedAt: Date;
   status: 'queued' | 'failed';
+  trigger?: DiscoveryTrigger;
   schedule?: TopicScheduleUpdate;
 }
 
@@ -145,6 +146,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         },
         data: {
           runStatus: 'running',
+          queuedTrigger: null,
           activeRunId: runId,
           runLeaseUntil: new Date(startedAt.getTime() + this.runLeaseMs),
           lastError: Prisma.DbNull,
@@ -296,6 +298,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         data: {
           expandedTerms: unique(input.expandedTerms),
           runStatus: topicState?.manualRefreshPending ? 'queued' : 'succeeded',
+          queuedTrigger: topicState?.manualRefreshPending ? 'manual' : null,
           lastRunAt: input.finishedAt,
           lastError: Prisma.DbNull,
           activeRunId: null,
@@ -337,6 +340,9 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         where: { id: input.topicId },
         data: {
           runStatus: topicState?.manualRefreshPending ? 'queued' : input.status,
+          queuedTrigger: topicState?.manualRefreshPending
+            ? 'manual'
+            : input.status === 'queued' ? (input.trigger ?? 'scheduled') : null,
           lastRunAt: input.finishedAt,
           lastError: input.error,
           activeRunId: null,
@@ -531,6 +537,7 @@ export class TopicDiscoveryService {
         error: toSafeAiError(failure),
         finishedAt,
         status: context.finalAttempt ? 'failed' : 'queued',
+        trigger,
         ...(context.finalAttempt && trigger === 'scheduled'
           ? { schedule: calculateFailureSchedule(finishedAt) }
           : {}),

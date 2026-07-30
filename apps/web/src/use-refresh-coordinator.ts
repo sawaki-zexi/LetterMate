@@ -406,7 +406,11 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
         try {
           const response = await currentOptions.refreshTopic(topicId);
           if (sessionRef.current !== session || session.finishing) return;
-          if (response.lastRun) {
+          if (
+            response.lastRun
+            && !(response.lastRun.trigger === 'manual'
+              && response.lastRun.status === 'queued')
+          ) {
             session.topicIgnoredRunIds.get(topicId)?.add(response.lastRun.id);
           }
           session.readyTopicIds.add(topicId);
@@ -429,7 +433,13 @@ export function useRefreshCoordinator(options: RefreshCoordinatorOptions): Refre
         try {
           const response = await currentOptions.refreshTrends();
           if (sessionRef.current !== session || session.finishing) return;
-          if (response.lastRun) session.trendIgnoredRunIds.add(response.lastRun.id);
+          if (
+            response.lastRun
+            && !(response.lastRun.trigger === 'manual'
+              && response.lastRun.status === 'queued')
+          ) {
+            session.trendIgnoredRunIds.add(response.lastRun.id);
+          }
           session.trendReady = true;
         } catch {
           if (sessionRef.current !== session || session.finishing) return;

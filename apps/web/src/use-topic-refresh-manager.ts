@@ -259,7 +259,13 @@ export function useTopicRefreshManager(options: TopicRefreshManagerOptions): Top
 
     void Promise.resolve().then(() => optionsRef.current.refreshTopic(topicId)).then((response) => {
       if (sessionsRef.current.get(topicId) !== session) return;
-      if (response.lastRun) session.ignoredRunIds.add(response.lastRun.id);
+      if (
+        response.lastRun
+        && !(response.lastRun.trigger === 'manual'
+          && response.lastRun.status === 'queued')
+      ) {
+        session.ignoredRunIds.add(response.lastRun.id);
+      }
       session.ready = true;
     }).catch(() => {
       if (!sessionsRef.current.delete(topicId)) return;

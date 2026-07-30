@@ -225,12 +225,27 @@ describe('AI discovery contracts', () => {
     ).toMatchObject({ trigger: 'scheduled' });
   });
 
-  it('shares a stable trend queue and accepts trigger-aware trend jobs', () => {
+  it('requires durable registration identities for trend jobs', () => {
     expect(trendQueueName).toBe('trend-discovery');
-    expect(trendJobDataSchema.parse({ userId: 'user-a', trigger: 'manual' })).toEqual({
+    expect(trendJobDataSchema.parse({
+      userId: 'user-a', trigger: 'manual', runId: 'manual-run-1',
+    })).toEqual({
       userId: 'user-a',
       trigger: 'manual',
+      runId: 'manual-run-1',
     });
+    expect(trendJobDataSchema.parse({
+      userId: 'user-a', trigger: 'scheduled', dueAt: '2026-07-29T08:00:00.000Z',
+    })).toEqual({
+      userId: 'user-a',
+      trigger: 'scheduled',
+      dueAt: '2026-07-29T08:00:00.000Z',
+    });
+    expect(() => trendJobDataSchema.parse({ userId: 'user-a', trigger: 'manual' })).toThrow();
+    expect(() => trendJobDataSchema.parse({ userId: 'user-a', trigger: 'scheduled' })).toThrow();
+    expect(() => trendJobDataSchema.parse({
+      userId: 'user-a', trigger: 'scheduled', dueAt: 'not-a-date',
+    })).toThrow();
   });
 
   it('discriminates topic and trend feed items by origin', () => {

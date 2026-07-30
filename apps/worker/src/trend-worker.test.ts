@@ -13,10 +13,12 @@ import {
 
 const job = (
   attemptsMade: number,
-  trigger: TrendJobData['trigger'] = 'scheduled',
+  data: TrendJobData = {
+    userId: 'user-1', trigger: 'scheduled', dueAt: '2026-07-28T11:50:00.000Z',
+  },
 ): Job<TrendJobData> => ({
   id: 'job-42',
-  data: { userId: 'user-1', trigger },
+  data,
   attemptsMade,
   opts: { attempts: 3 },
 }) as Job<TrendJobData>;
@@ -28,12 +30,15 @@ describe('trend job handler', () => {
     let manualPending = false;
     const claimedRunIds: string[] = [];
     const repository: TrendRepository = {
-      claimRun: vi.fn(async (_userId, trigger) => {
+      claimRun: vi.fn(async ({ trigger }) => {
         if (active) {
           if (trigger === 'manual' && runStatus === 'running') {
             const registered = !manualPending;
             manualPending = true;
-            return { state: 'active', followUpManualRegistered: registered } as const;
+            return {
+              state: 'active',
+              followUpManualRunId: registered ? 'manual-follow-up-1' : null,
+            } as const;
           }
           if (trigger === 'scheduled' && runStatus === 'queued') {
             runStatus = 'running';
@@ -43,7 +48,7 @@ describe('trend job handler', () => {
               nextRunAt: new Date('2026-07-28T16:00:00.000Z'),
             } as const;
           }
-          return { state: 'active', followUpManualRegistered: false } as const;
+          return { state: 'active', followUpManualRunId: null } as const;
         }
         active = true;
         runStatus = 'running';
@@ -60,7 +65,10 @@ describe('trend job handler', () => {
       completeSuccess: vi.fn(async () => {
         active = false;
         runStatus = manualPending ? 'queued' : 'idle';
-        return { newItemCount: 0, followUpManual: manualPending };
+        return {
+          newItemCount: 0,
+          followUpManualRunId: manualPending ? 'manual-follow-up-1' : null,
+        };
       }),
       completeFailure: vi.fn(async ({ status }) => {
         if (status === 'queued') {
@@ -69,7 +77,11 @@ describe('trend job handler', () => {
           active = false;
           runStatus = manualPending ? 'queued' : 'idle';
         }
-        return { followUpManual: status === 'failed' && manualPending };
+        return {
+          followUpManualRunId: status === 'failed' && manualPending
+            ? 'manual-follow-up-1'
+            : null,
+        };
       }),
       acknowledgeManualFollowUp: vi.fn(async () => {
         manualPending = false;
@@ -84,7 +96,7 @@ describe('trend job handler', () => {
         collect: vi.fn(async () => {
           sourceAttempt += 1;
           if (sourceAttempt === 1) {
-            await repository.claimRun('user-1', 'manual', new Date());
+            manualPending = true;
             throw retryable;
           }
           return {
@@ -110,6 +122,13 @@ describe('trend job handler', () => {
 
     expect(claimedRunIds).toEqual(['run-1', 'run-1']);
     expect(queue.add).toHaveBeenCalledTimes(1);
+    expect(queue.add).toHaveBeenCalledWith(
+      'manual-refresh',
+      { userId: 'user-1', trigger: 'manual', runId: 'manual-follow-up-1' },
+      expect.objectContaining({
+        jobId: manualTrendFollowUpJobId('manual-follow-up-1'),
+      }),
+    );
     expect(repository.acknowledgeManualFollowUp).toHaveBeenCalledTimes(1);
     expect(manualPending).toBe(false);
   });
@@ -124,30 +143,34 @@ describe('trend job handler', () => {
 
     await expect(createTrendJobHandler(service, queue)(job(0))).rejects.toBe(error);
 
-    expect(service.run).toHaveBeenCalledWith('user-1', 'scheduled', { finalAttempt: false });
+    expect(service.run).toHaveBeenCalledWith(job(0).data, { finalAttempt: false });
     expect(queue.add).not.toHaveBeenCalled();
   });
 
   it('marks the final retry and enqueues one deterministic manual follow-up', async () => {
     const service = {
-      run: vi.fn().mockResolvedValue({ followUpManual: true }),
+      run: vi.fn().mockResolvedValue({ followUpManualRunId: 'manual-follow-up-1' }),
       acknowledgeManualFollowUp: vi.fn().mockResolvedValue(true),
     } as unknown as Pick<TrendDiscoveryService, 'run' | 'acknowledgeManualFollowUp'>;
     const queue = { add: vi.fn().mockResolvedValue(undefined) };
 
     await createTrendJobHandler(service, queue)(job(2));
 
-    expect(service.run).toHaveBeenCalledWith('user-1', 'scheduled', { finalAttempt: true });
+    expect(service.run).toHaveBeenCalledWith(job(2).data, { finalAttempt: true });
     expect(queue.add).toHaveBeenCalledWith(
       'manual-refresh',
-      { userId: 'user-1', trigger: 'manual' },
+      { userId: 'user-1', trigger: 'manual', runId: 'manual-follow-up-1' },
       expect.objectContaining({
-        jobId: manualTrendFollowUpJobId('user-1', 'job-42'),
+        jobId: manualTrendFollowUpJobId('manual-follow-up-1'),
         attempts: 3,
         backoff: { type: 'custom' },
+        removeOnComplete: { age: 3_600, count: 1_000 },
+        removeOnFail: { age: 604_800, count: 1_000 },
       }),
     );
-    expect(service.acknowledgeManualFollowUp).toHaveBeenCalledWith('user-1');
+    expect(service.acknowledgeManualFollowUp).toHaveBeenCalledWith(
+      'user-1', 'manual-follow-up-1',
+    );
     expect(queue.add.mock.invocationCallOrder[0])
       .toBeLessThan(vi.mocked(service.acknowledgeManualFollowUp).mock.invocationCallOrder[0]!);
   });
@@ -155,7 +178,7 @@ describe('trend job handler', () => {
   it('does not clear pending manual state when follow-up enqueue fails', async () => {
     const enqueueError = new Error('Redis unavailable');
     const service = {
-      run: vi.fn().mockResolvedValue({ followUpManual: true }),
+      run: vi.fn().mockResolvedValue({ followUpManualRunId: 'manual-follow-up-1' }),
       acknowledgeManualFollowUp: vi.fn(),
     } as unknown as Pick<TrendDiscoveryService, 'run' | 'acknowledgeManualFollowUp'>;
     const queue = { add: vi.fn().mockRejectedValue(enqueueError) };
@@ -163,6 +186,25 @@ describe('trend job handler', () => {
     await expect(createTrendJobHandler(service, queue)(job(2))).rejects.toBe(enqueueError);
 
     expect(service.acknowledgeManualFollowUp).not.toHaveBeenCalled();
+  });
+
+  it('recovers legacy trend jobs without durable payload identities', async () => {
+    const service = {
+      run: vi.fn().mockResolvedValue({ followUpManualRunId: null }),
+      acknowledgeManualFollowUp: vi.fn(),
+    } as unknown as Pick<TrendDiscoveryService, 'run' | 'acknowledgeManualFollowUp'>;
+    const queue = { add: vi.fn() };
+    const legacy = {
+      ...job(0),
+      data: { userId: 'user-1', trigger: 'manual' },
+    } as unknown as Job<TrendJobData>;
+
+    await createTrendJobHandler(service, queue)(legacy);
+
+    expect(service.run).toHaveBeenCalledWith(
+      { userId: 'user-1', trigger: 'manual' },
+      { finalAttempt: false },
+    );
   });
 
   it('rejects invalid job data before running discovery', async () => {
