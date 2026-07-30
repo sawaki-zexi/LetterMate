@@ -2,9 +2,10 @@
 
 ## Project
 
-LetterMate is a personal discovery workspace. Users create a topic keyword;
-the system finds recent material through OpenRouter and shows citation-backed
-Chinese summaries as `hot` or `quality` items.
+LetterMate is a personal discovery workspace. It combines exact-keyword Topic
+tracking with automatic technology-trend discovery. Both paths search multiple
+sources, validate supporting content, deduplicate candidates, and produce
+Chinese `hot` or `quality` Feed items with original links.
 
 This is an npm workspaces monorepo: React/Vite web client, NestJS API, BullMQ
 worker, PostgreSQL/Prisma, and Redis.
@@ -20,14 +21,14 @@ worker, PostgreSQL/Prisma, and Redis.
 | Path | Purpose |
 | --- | --- |
 | `apps/web` | React/Vite client |
-| `apps/api` | NestJS API, authentication, validation, and job enqueueing |
-| `apps/worker` | BullMQ consumers and discovery orchestration |
+| `apps/api` | NestJS API, request identity, ownership boundaries, validation, and job enqueueing |
+| `apps/worker` | Connectors, trend inputs, discovery pipelines, BullMQ consumers, and schedulers |
 | `packages/config` | Shared environment configuration |
 | `packages/contracts` | Shared API and cross-application contracts |
 | `packages/domain` | Domain rules and AI gateway abstractions |
 | `prisma/schema.prisma` | Database schema |
 | `infra/compose.yaml` | Local PostgreSQL and Redis |
-| `tests` | Integration and end-to-end support |
+| `tests/e2e` | Playwright end-to-end flows; unit and integration tests are colocated with source files |
 
 ## Constraints
 
@@ -35,8 +36,14 @@ worker, PostgreSQL/Prisma, and Redis.
   authorization headers on the server side.
 - Put shared API shapes in `packages/contracts` and business rules in
   `packages/domain`; keep provider-specific code behind the AI gateway.
-- Keep user ownership checks and citation-backed HTTP(S) URLs for discovery
-  items.
+- Preserve complete keyword and version boundaries; do not broaden precise
+  Topics into generic related concepts.
+- Trend lists create search seeds only. They never create Feed items without
+  supporting content from the main discovery pipeline.
+- Keep user ownership checks and verified HTTP(S) source proof for all final
+  Feed items.
+- Treat the fixed `x-user-id` identity as development-only; it is not
+  production authentication.
 - Never commit `.env`, real keys, tokens, or authorization headers.
 - When changing `prisma/schema.prisma`, generate Prisma and add a migration.
 - Do not reintroduce retired trust states, evidence counts, or source rankings

@@ -4,6 +4,8 @@
 
 LetterMate is a personal discovery workspace. Users can monitor one complete keyword precisely, while the system also collects search seeds from external technology trend lists. Both paths use multi-source search, content enrichment, fact-support gating, deduplication, and AI review before Chinese summaries with original links appear in one Feed.
 
+> The core discovery pipelines, scheduling, unified Feed, and refresh feedback are implemented. Identity is still development-only: the Web client sends a fixed `x-user-id: user-a`, and the API uses that header for data isolation. Production login, sessions, and CSRF are not implemented. Each real external source still requires credentialed local integration testing.
+
 ## Features
 
 - Precise keywords preserve product names, project names, and version segments. `gpt-5.7` is not broadened to generic GPT/AI material and does not match `gpt-5.7.1`.
@@ -104,5 +106,3 @@ Project documentation:
 
 - [Product requirements](./docs/requirements.md)
 - [Technical design](./docs/design.md)
-- [Detailed multi-source design](./docs/superpowers/specs/2026-07-27-lettermate-multi-source-discovery-design.md)
-- [Detailed refresh and trend design](./docs/superpowers/specs/2026-07-28-refresh-trend-monitoring-time-filters-design.md)

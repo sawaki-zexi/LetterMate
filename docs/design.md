@@ -1,8 +1,16 @@
 # LetterMate 精准追踪与趋势发现技术方案
 
 **状态：** 当前有效
-**更新日期：** 2026-07-29
-**详细规格：** [多源高精度发现设计](./superpowers/specs/2026-07-27-lettermate-multi-source-discovery-design.md)、[刷新、趋势监控与时间筛选设计](./superpowers/specs/2026-07-28-refresh-trend-monitoring-time-filters-design.md)
+**更新日期：** 2026-07-30
+
+## 当前开发进度
+
+已实现 Topic 精准追踪、11 个主发现连接器、6 个趋势输入、正文和事实支持门控、Topic/Trend 调度、运行租约、统一 Feed、时间与来源筛选、点击/下拉刷新、持久化新增计数，以及对应 Prisma 迁移和默认离线自动化测试。
+
+当前仍有两个生产交付缺口：
+
+- Web 固定发送 `x-user-id: user-a`，API 直接信任该请求头。真实登录、服务端会话和 CSRF 尚未实现，`SESSION_SECRET` 与 `CSRF_SECRET` 目前只是预留配置。
+- 外部连接器的默认测试使用 Fake 或固定响应；OpenRouter、TwitterAPI.io 及其他凭据型来源仍需在目标环境完成 live smoke test、配额和故障行为验收。
 
 ## 1. 架构决策
 
@@ -132,11 +140,11 @@ AI 只能引用已验证候选池中的 URL。外部抓取在每次请求和重�
 
 ## 7. 数据与一致性
 
-- `Topic`：完整关键词、扩展词、运行状态、`nextRunAt`、6/12/24 小时周期和最新安全运行摘要。
+- `Topic`：完整关键词、扩展词、运行状态、`queuedTrigger`、`nextRunAt`、6/12/24 小时周期和最新安全运行摘要。
 - `DiscoveryRun`：Topic 触发方式、状态、开始/结束时间和实际新增数。
 - `DiscoveryItem`：Topic 所有的最终中文内容、原始 URL 和来源元数据。
 - `TrendMonitor`：用户唯一的趋势状态、持久化 `intervalHours`、`nextRunAt`、租约和待处理手动刷新；缺失记录的间隔默认按 4 小时创建。
-- `TrendRun`：趋势触发方式、状态、候选/录取/新增数和安全错误。
+- `TrendRun`：趋势触发方式、状态、候选/录取/新增数和安全错误；手动刷新在入队前先创建持久化的 `queued` 运行。
 - `TrendSeed`：最小化来源、外部 ID、标题、URL、指纹和精准查询词。
 - `RadarItem`：用户所有的最终趋势内容，按 `(userId, canonicalPrimaryUrl)` 唯一。
 
@@ -145,11 +153,13 @@ Topic 和趋势完成事务都从实际插入数写入 `newItemCount`。运行�
 ## 8. 调度和队列
 
 - 新 Topic 使用 `initial` 任务；手动刷新使用 `manual`；调度使用 `scheduled`。
+- `Topic.queuedTrigger` 区分排队中的 `initial | manual | scheduled`。初始或定时任务排队时收到手动刷新，只登记一个 pending 请求；当前任务终止后再创建后续手动任务。
 - Topic 首次成功后默认为 12 小时；连续两个高产定时运行缩短为 6 小时，连续两个空定时运行延长为 24 小时。
 - `TREND_INTERVAL_HOURS` 默认为 4，只在缺少 TrendMonitor 时提供创建值；已有记录的持久化 `intervalHours` 是后续调度的权威值，环境变量变化不回写已有记录。
 - 两类 scheduler 每 10 分钟扫描，PostgreSQL `nextRunAt` 是真实状态，BullMQ job ID 确保幂等。
 - Topic 使用稳定 ±10% 抖动；手动运行不改变 Topic streak、Topic 自动周期或趋势自动周期。
 - Topic 和 TrendMonitor 都使用运行租约恢复 Worker 中断；同一目标最多一个运行，重复手动请求只保留一个 pending 刷新。
+- 趋势手动刷新在数据库事务中创建带短租约的 `TrendRun`，BullMQ job 携带其 `runId`。入队失败时只补偿尚未被 Worker 认领的登记，旧版无 `runId` 的遗留任务不会重复执行。
 
 ## 9. API
 

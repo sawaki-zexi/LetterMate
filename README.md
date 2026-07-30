@@ -4,6 +4,8 @@
 
 LetterMate 是个人信息发现工作台。用户可以用一个完整关键词精准追踪新内容；系统也会从外部技术趋势榜单收集搜索种子。两类候选都经过多来源搜索、正文补全、事实支持过滤、去重和 AI 评审，最终在统一 Feed 中显示带原始链接的中文摘要。
 
+> 当前核心发现流程、调度、统一 Feed 和刷新反馈已经实现。身份层仍是开发版：Web 固定发送 `x-user-id: user-a`，API 仅按该请求头隔离数据，尚未实现可用于生产的登录、会话和 CSRF 流程。真实外部来源还需使用本地凭据分别完成联调。
+
 ## 当前能力
 
 - 精准关键词：保留产品名、项目名和版本段。`gpt-5.7` 不会宽化为一般 GPT/AI 内容，也不会匹配 `gpt-5.7.1`。
@@ -104,5 +106,3 @@ npm test -- apps/worker/src/twitterapi-io.live.test.ts
 
 - [产品需求](./docs/requirements.md)
 - [技术方案](./docs/design.md)
-- [多源发现详细设计](./docs/superpowers/specs/2026-07-27-lettermate-multi-source-discovery-design.md)
-- [刷新与趋势详细设计](./docs/superpowers/specs/2026-07-28-refresh-trend-monitoring-time-filters-design.md)
