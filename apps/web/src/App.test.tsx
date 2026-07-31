@@ -603,6 +603,9 @@ describe('discovery workspace', () => {
     const css = readFileSync('apps/web/src/styles.css', 'utf8');
     expect(css).toMatch(/\.refresh-button\s*\{[^}]*width:\s*38px;[^}]*height:\s*38px;/s);
     expect(css).toMatch(/\.pull-indicator\s*\{[^}]*height:\s*32px;/s);
+    expect(css).toMatch(/\.origin-label\s*\{[^}]*max-width:\s*220px;[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
+    expect(css).not.toContain('.segmented--origin');
+    expect(css).not.toContain('.origin-label--trend');
     expect(css).toContain('@keyframes refresh-spin');
     expect(css).toMatch(/prefers-reduced-motion:\s*reduce[\s\S]*\.spin\s*\{[^}]*animation:\s*none/s);
   });

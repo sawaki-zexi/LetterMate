@@ -119,29 +119,23 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   const persistedNewItemCount = topicManualRun.newItemCount + trendManualRun.newItemCount;
   await expect(completion).toHaveText(`刷新完成，新增 ${persistedNewItemCount} 条内容`);
 
-  await expect(page.locator('.origin-label', { hasText: '趋势发现' }).first()).toBeVisible();
-  await expect(page.locator('.origin-label', { hasText: '关键词追踪' }).first()).toBeVisible();
+  await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` }).first()).toBeVisible();
+  await expect(page.locator('.origin-label', { hasText: '来自全网趋势' }).first()).toBeVisible();
+  await expect(page.getByText('精选').first()).toBeVisible();
+  await expect(page.getByText(/关键词追踪|趋势发现|优质/)).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '今天', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: '昨天', exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: '近 3 天', exact: true })).toBeVisible();
 
-  const topicOriginResponse = page.waitForResponse((response) => {
-    const url = new URL(response.url());
-    return url.pathname === '/api/v1/feed'
-      && url.searchParams.get('origin') === 'topic'
-      && !url.searchParams.has('topicId');
-  });
-  await page.getByRole('button', { name: '关键词追踪' }).click();
-  await topicOriginResponse;
-  await expect(page.locator('.origin-label', { hasText: '关键词追踪' }).first()).toBeVisible();
-  await expect(page.locator('.origin-label', { hasText: '趋势发现' })).toHaveCount(0);
+  const sourceSelect = page.getByLabel('来源');
+  await expect(sourceSelect).toHaveValue('all');
   const selectedTopicResponse = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return url.pathname === '/api/v1/feed'
       && url.searchParams.get('origin') === 'topic'
       && url.searchParams.get('topicId') === topicId;
   });
-  await page.getByLabel('主题').selectOption(topicId);
+  await sourceSelect.selectOption(`topic:${topicId}`);
   const selectedTopicFeed = await selectedTopicResponse;
   expect(selectedTopicFeed.ok()).toBe(true);
   const selectedTopicUrl = new URL(selectedTopicFeed.url());
@@ -150,6 +144,8 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   const topicCards = page.locator('.discovery-card');
   await expect(topicCards).toHaveCount(2);
   expect((await topicCards.allTextContents()).every((content) => content.includes(keyword))).toBe(true);
+  await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` })).toHaveCount(2);
+  await expect(page.locator('.origin-label', { hasText: '来自全网趋势' })).toHaveCount(0);
 
   const trendOnlyResponse = page.waitForResponse((response) => {
     const url = new URL(response.url());
@@ -157,20 +153,15 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
       && url.searchParams.get('origin') === 'trend'
       && !url.searchParams.has('topicId');
   });
-  await page.getByRole('button', { name: '趋势发现' }).click();
+  await sourceSelect.selectOption('trend');
   await trendOnlyResponse;
-  await expect(page.getByLabel('主题')).toHaveCount(0);
-  await expect(page.locator('.origin-label', { hasText: '趋势发现' }).first()).toBeVisible();
-  await expect(page.locator('.origin-label', { hasText: '关键词追踪' })).toHaveCount(0);
+  await expect(page.locator('.origin-label', { hasText: '来自全网趋势' }).first()).toBeVisible();
+  await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` })).toHaveCount(0);
 
-  await page.getByRole('group', { name: '发现来源' })
-    .getByRole('button', { name: '全部', exact: true })
-    .click();
-  await expect(page.locator('.origin-label', { hasText: '趋势发现' }).first()).toBeVisible();
-  await expect(page.locator('.origin-label', { hasText: '关键词追踪' }).first()).toBeVisible();
-  await expect.poll(() => feedRequests.some((url) =>
-    url.searchParams.get('origin') === 'all' && !url.searchParams.has('topicId'),
-  )).toBe(true);
+  await sourceSelect.selectOption('all');
+  await expect(sourceSelect).toHaveValue('all');
+  await expect(page.locator('.origin-label', { hasText: '来自全网趋势' }).first()).toBeVisible();
+  await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` }).first()).toBeVisible();
 
   if (testInfo.project.name === 'mobile' || testInfo.project.name === 'compact-mobile') {
     await page.evaluate(() => window.scrollTo(0, 0));

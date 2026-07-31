@@ -6,7 +6,7 @@ export default defineConfig({
   fullyParallel: false,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
-    baseURL: 'http://127.0.0.1:5184',
+    baseURL: 'http://127.0.0.1:5410',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
@@ -19,8 +19,8 @@ export default defineConfig({
       timeout: 120_000,
     },
     {
-      command: 'npm run dev -w @lettermate/web -- --host 127.0.0.1 --port 5184',
-      url: 'http://127.0.0.1:5184',
+      command: 'npm run dev -w @lettermate/web -- --host 127.0.0.1 --port 5410',
+      url: 'http://127.0.0.1:5410',
       env: { VITE_API_PROXY: 'http://127.0.0.1:3011' },
       reuseExistingServer: false,
       timeout: 120_000,
