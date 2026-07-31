@@ -14,6 +14,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { discoveryKindLabels } from '../discovery-display.js';
 
 const sourceTypeMeta: Record<SourceType, { label: string; icon: LucideIcon }> = {
   web: { label: '网页', icon: Globe2 },
@@ -29,14 +30,21 @@ export function DiscoveryCard({
   item,
   detailHref,
   headingLevel = 2,
+  topicKeyword,
 }: {
   item: FeedItem;
   detailHref?: string;
   headingLevel?: 2 | 3;
+  topicKeyword?: string;
 }) {
   const Heading = `h${headingLevel}` as const;
   const ClassificationIcon = item.kind === 'hot' ? Flame : Sparkles;
-  const classification = item.kind === 'hot' ? '热点' : '优质';
+  const classification = discoveryKindLabels[item.kind];
+  const discoveryContext = item.origin === 'trend'
+    ? '来自全网趋势'
+    : topicKeyword
+      ? `来自「${topicKeyword}」`
+      : '来自关注主题';
   const source = sourceTypeMeta[item.sourceType];
   const SourceIcon = source.icon;
   const author = [item.authorName, item.authorHandle ? `@${item.authorHandle}` : null]
@@ -49,8 +57,12 @@ export function DiscoveryCard({
           <ClassificationIcon size={15} />{classification}
         </span>
         <div className="discovery-card__meta">
-          <span className={`origin-label origin-label--${item.origin}`}>
-            {item.origin === 'trend' ? '趋势发现' : '关键词追踪'}
+          <span
+            className="origin-label"
+            title={item.origin === 'topic' ? topicKeyword : undefined}
+            aria-label={discoveryContext}
+          >
+            {discoveryContext}
           </span>
           <span><SourceIcon size={14} />{item.platform}</span>
           <span>{source.label}</span>

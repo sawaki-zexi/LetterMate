@@ -27,10 +27,13 @@ const topicItem: FeedItem = {
 describe('DiscoveryCard', () => {
   afterEach(cleanup);
 
-  it('renders Topic origin, details, and safe source links without retired trust labels', () => {
-    render(<DiscoveryCard item={topicItem} />);
-    expect(screen.getByText('关键词追踪')).toBeVisible();
-    expect(screen.getByText('优质')).toBeVisible();
+  it('renders Topic context, details, and safe source links without retired trust labels', () => {
+    render(<DiscoveryCard item={topicItem} topicKeyword="gpt-5.7" />);
+    expect(screen.getByText('来自「gpt-5.7」')).toBeVisible();
+    expect(screen.getByTitle('gpt-5.7')).toHaveAttribute('aria-label', '来自「gpt-5.7」');
+    expect(screen.getByText('精选')).toBeVisible();
+    expect(screen.queryByText('关键词追踪')).not.toBeInTheDocument();
+    expect(screen.queryByText('优质')).not.toBeInTheDocument();
     expect(screen.getByText('完整介绍了实现方式。')).toBeVisible();
     expect(screen.getByText(/可复现代码/)).toBeVisible();
     expect(screen.getByText('X')).toBeVisible();
@@ -42,12 +45,19 @@ describe('DiscoveryCard', () => {
     expect(screen.queryByText(/可信|已核实|评分|证据|排名/)).not.toBeInTheDocument();
   });
 
-  it('labels Radar items as trend discoveries', () => {
+  it('labels Radar items as global trend discoveries', () => {
     const trendItem: FeedItem = { ...topicItem, id: 'radar-1', origin: 'trend', topicId: null };
     render(<DiscoveryCard item={trendItem} />);
 
-    expect(screen.getByText('趋势发现')).toBeVisible();
+    expect(screen.getByText('来自全网趋势')).toBeVisible();
     expect(screen.queryByText('关键词追踪')).not.toBeInTheDocument();
+    expect(screen.queryByText('趋势发现')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the generic Topic context without a keyword', () => {
+    render(<DiscoveryCard item={topicItem} />);
+
+    expect(screen.getByText('来自关注主题')).toBeVisible();
   });
 
   it('uses an h2 by default and supports an h3 inside grouped feeds', () => {
