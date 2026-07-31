@@ -55,6 +55,7 @@ function feedItem(
   id: string,
   origin: FeedItem['origin'],
   ageInDays = 0,
+  topicId = 'topic-1',
 ): FeedItem {
   const common = {
     id,
@@ -73,7 +74,7 @@ function feedItem(
     provenanceKind: 'api_record' as const,
   };
   return origin === 'topic'
-    ? { ...common, origin, topicId: 'topic-1' }
+    ? { ...common, origin, topicId }
     : { ...common, origin, topicId: null };
 }
 
@@ -91,6 +92,7 @@ interface FetchMockOptions {
   topics?: Topic[];
   topicsResponse?: Promise<Topic[]>;
   feed?: FeedItem[];
+  item?: FeedItem;
   created?: Topic;
   sources?: DiscoverySourceStatus[];
   topicCompletionCount?: number;
@@ -104,6 +106,7 @@ function installFetchMock({
   topics: initialTopics = [],
   topicsResponse,
   feed = [],
+  item,
   created,
   sources = [],
   topicCompletionCount = 0,
@@ -162,6 +165,7 @@ function installFetchMock({
         : initialTrendStatus);
     }
     if (url.endsWith('/discovery-sources')) return Response.json(sources);
+    if (/\/items\/[^/?]+$/.test(url)) return Response.json(item!);
     if (url.includes('/feed')) {
       feedRequestCount += 1;
       if (feedRequestCount > 1 && feedRefetchFailures > 0) {
@@ -216,23 +220,32 @@ describe('discovery workspace', () => {
     await waitFor(() => expect(requests.some(({ url }) => url.includes('range=3d'))).toBe(true));
   });
 
-  it('keeps origin and topic filters valid and omits topic selection from trend-only view', async () => {
+  it('maps one source selector to valid Feed filters without stale topic IDs', async () => {
     installFetchMock({ topics: [topic('topic-1', 'AI Agent')], feed: [feedItem('today', 'topic')] });
     renderApp('/');
 
-    expect(await screen.findByRole('group', { name: '发现来源' })).toBeVisible();
-    const topicSelect = await screen.findByRole('combobox', { name: '主题' });
-    await screen.findByRole('option', { name: 'AI Agent' });
-    fireEvent.change(topicSelect, { target: { value: 'topic-1' } });
+    const source = await screen.findByRole('combobox', { name: '来源' });
+    await within(source).findByRole('option', { name: 'AI Agent' });
+    expect(within(source).getAllByRole('option').map((option) => option.textContent)).toEqual([
+      '全部来源', '全网趋势', 'AI Agent',
+    ]);
+
+    fireEvent.change(source, { target: { value: 'topic:topic-1' } });
     await waitFor(() => expect(requests.some(({ url }) => (
       url.includes('/feed?') && url.includes('topicId=topic-1') && url.includes('origin=topic')
     ))).toBe(true));
 
-    fireEvent.click(screen.getByRole('button', { name: '趋势发现' }));
-    expect(screen.queryByRole('combobox', { name: '主题' })).not.toBeInTheDocument();
+    fireEvent.change(source, { target: { value: 'trend' } });
     await waitFor(() => expect(requests.some(({ url }) => (
       url.includes('/feed?') && url.includes('origin=trend') && !url.includes('topicId=')
     ))).toBe(true));
+
+    fireEvent.change(source, { target: { value: 'all' } });
+    await waitFor(() => {
+      const latestFeedRequest = requests.filter(({ url }) => url.includes('/feed?')).at(-1)?.url;
+      expect(latestFeedRequest).toContain('origin=all');
+      expect(latestFeedRequest).not.toContain('topicId=');
+    });
     expect(requests.every(({ url }) => !(url.includes('origin=trend') && url.includes('topicId=')))).toBe(true);
   });
 
@@ -247,6 +260,25 @@ describe('discovery workspace', () => {
     expect(screen.getAllByRole('article')).toHaveLength(2);
     expect(screen.queryByRole('heading', { name: '近 3 天' })).not.toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '今天' }).closest('section')).toHaveClass('feed-time-group');
+  });
+
+  it('passes the exact Topic keyword into Topic cards', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent'), topic('topic-2', 'gpt-5.7')],
+      feed: [feedItem('today', 'topic', 0, 'topic-2')],
+    });
+    renderApp('/');
+
+    expect(await screen.findByText('来自「gpt-5.7」')).toBeVisible();
+    expect(screen.queryByText('来自「AI Agent」')).not.toBeInTheDocument();
+  });
+
+  it('renders quality items as selected on the detail page', async () => {
+    installFetchMock({ item: feedItem('detail', 'topic') });
+    renderApp('/items/detail');
+
+    expect(await screen.findByText('精选')).toBeVisible();
+    expect(screen.queryByText('优质')).not.toBeInTheDocument();
   });
 
   it('shows active target count and the coordinator completion message for top refresh', async () => {
@@ -277,6 +309,45 @@ describe('discovery workspace', () => {
     expect(refresh).toHaveAttribute('aria-busy', 'false');
   });
 
+  it('refreshes only the Topic selected as the current source', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent'), topic('topic-2', 'gpt-5.7')],
+      feed: [feedItem('today', 'topic', 0, 'topic-2')],
+    });
+    renderApp('/');
+
+    const source = await screen.findByRole('combobox', { name: '来源' });
+    await within(source).findByRole('option', { name: 'gpt-5.7' });
+    fireEvent.change(source, { target: { value: 'topic:topic-2' } });
+    fireEvent.click(screen.getByRole('button', { name: '刷新发现' }));
+
+    await waitFor(() => expect(requests.some(({ url, method }) => (
+      url.endsWith('/topics/topic-2/refresh') && method === 'POST'
+    ))).toBe(true));
+    expect(requests.some(({ url, method }) => (
+      url.endsWith('/topics/topic-1/refresh') && method === 'POST'
+    ))).toBe(false);
+    expect(requests.some(({ url, method }) => (
+      url.endsWith('/trends/refresh') && method === 'POST'
+    ))).toBe(false);
+  });
+
+  it('refreshes only trends when broad trends are the current source', async () => {
+    installFetchMock({ topics: [topic('topic-1', 'AI Agent')], feed: [feedItem('today', 'trend')] });
+    renderApp('/');
+
+    const source = await screen.findByRole('combobox', { name: '来源' });
+    fireEvent.change(source, { target: { value: 'trend' } });
+    fireEvent.click(screen.getByRole('button', { name: '刷新发现' }));
+
+    await waitFor(() => expect(requests.some(({ url, method }) => (
+      url.endsWith('/trends/refresh') && method === 'POST'
+    ))).toBe(true));
+    expect(requests.some(({ url, method }) => (
+      /\/topics\/[^/]+\/refresh$/.test(url) && method === 'POST'
+    ))).toBe(false);
+  });
+
   it('does not refresh an incomplete all-target scope while Topics are loading', async () => {
     let resolveTopics!: (topics: Topic[]) => void;
     const topicsResponse = new Promise<Topic[]>((resolve) => { resolveTopics = resolve; });
@@ -292,17 +363,15 @@ describe('discovery workspace', () => {
     await waitFor(() => expect(refresh).toBeEnabled());
   });
 
-  it('disables topic-only refresh when there are no Topic targets', async () => {
+  it('does not offer Topic source options when there are no Topics', async () => {
     installFetchMock({ topics: [], feed: [] });
     renderApp('/');
 
     await screen.findByText('暂无发现内容');
-    fireEvent.click(screen.getByRole('button', { name: '关键词追踪' }));
-
-    const refresh = screen.getByRole('button', { name: '刷新发现' });
-    expect(refresh).toBeDisabled();
-    fireEvent.click(refresh);
-    expect(requests.some(({ url, method }) => url.includes('/topics/') && method === 'POST')).toBe(false);
+    const source = screen.getByRole('combobox', { name: '来源' });
+    expect(within(source).getAllByRole('option').map((option) => option.textContent)).toEqual([
+      '全部来源', '全网趋势',
+    ]);
   });
 
   it('clears a selected Topic when a refreshed Topic snapshot removes it', async () => {
@@ -313,15 +382,15 @@ describe('discovery workspace', () => {
     });
     const { client } = renderApp('/');
 
-    const topicSelect = await screen.findByRole('combobox', { name: '主题' });
-    await screen.findByRole('option', { name: 'AI Agent' });
-    fireEvent.change(topicSelect, { target: { value: 'topic-1' } });
+    const source = await screen.findByRole('combobox', { name: '来源' });
+    await within(source).findByRole('option', { name: 'AI Agent' });
+    fireEvent.change(source, { target: { value: 'topic:topic-1' } });
     await waitFor(() => expect(requests.some(({ url }) => url.includes('topicId=topic-1'))).toBe(true));
 
     mock.setTopics([]);
     await act(async () => { await client.invalidateQueries({ queryKey: ['topics'] }); });
 
-    await waitFor(() => expect(topicSelect).toHaveValue(''));
+    await waitFor(() => expect(source).toHaveValue('all'));
     await waitFor(() => {
       const latestFeedRequest = requests.filter(({ url }) => url.includes('/feed?')).at(-1)?.url;
       expect(latestFeedRequest).not.toContain('topicId=topic-1');

@@ -2,7 +2,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
   DiscoveryKind,
   DiscoverySourceStatus,
-  FeedOrigin,
   FeedRange,
   SourceType,
   Topic,
@@ -25,7 +24,13 @@ import { useEffect, useState, type CSSProperties } from 'react';
 import { NavLink, Route, Routes, useParams } from 'react-router-dom';
 import { api } from './api.js';
 import { DiscoveryCard } from './components/DiscoveryCard.js';
+import { discoveryKindLabels } from './discovery-display.js';
 import { groupFeedItems } from './feed-time.js';
+import {
+  feedFilterForSource,
+  topicSourceSelection,
+  type FeedSourceSelection,
+} from './feed-source-selection.js';
 import { usePullRefresh } from './use-pull-refresh.js';
 import {
   useRefreshCoordinator,
@@ -207,8 +212,8 @@ function FeedPage() {
   const trendStatus = useTrendStatus();
   const [kind, setKind] = useState<DiscoveryKind | 'all'>('all');
   const [range, setRange] = useState<FeedRange>('30d');
-  const [origin, setOrigin] = useState<FeedOrigin>('all');
-  const [topicId, setTopicId] = useState('');
+  const [sourceSelection, setSourceSelection] = useState<FeedSourceSelection>('all');
+  const { origin, topicId } = feedFilterForSource(sourceSelection);
   const filter = {
     range,
     origin,
@@ -250,13 +255,12 @@ function FeedPage() {
     onRefresh: async () => { await refresh.startRefresh(); },
   });
   const groups = groupFeedItems(feed.data ?? []);
-  const changeOrigin = (nextOrigin: FeedOrigin) => {
-    setOrigin(nextOrigin);
-    if (nextOrigin !== 'topic') setTopicId('');
-  };
+  const topicKeywordById = new Map(
+    (topics.data ?? []).map((topic) => [topic.id, topic.keyword]),
+  );
 
   useEffect(() => {
-    if (topicId && topics.data && !hasSelectedTopic) setTopicId('');
+    if (topicId && topics.data && !hasSelectedTopic) setSourceSelection('all');
   }, [hasSelectedTopic, topicId, topics.data]);
 
   return (
@@ -292,37 +296,34 @@ function FeedPage() {
       )}
       <div className="feed-tools">
         <div className="feed-segments">
-          <div className="segmented segmented--origin" role="group" aria-label="发现来源">
-            {([['all', '全部'], ['topic', '关键词追踪'], ['trend', '趋势发现']] as const).map(([value, label]) => (
-              <button key={value} aria-pressed={origin === value} onClick={() => changeOrigin(value)}>{label}</button>
-            ))}
-          </div>
-          <div className="segmented" role="group" aria-label="发现分类">
-            {([['all', '全部'], ['hot', '热点'], ['quality', '优质']] as const).map(([value, label]) => (
-              <button key={value} aria-pressed={kind === value} onClick={() => setKind(value)}>{label}</button>
+          <div className="segmented" role="group" aria-label="内容类型">
+            {(['all', 'hot', 'quality'] as const).map((value) => (
+              <button key={value} aria-pressed={kind === value} onClick={() => setKind(value)}>
+                {value === 'all' ? '全部' : discoveryKindLabels[value]}
+              </button>
             ))}
           </div>
         </div>
         <div className="feed-selects">
+          <label className="filter-control source-filter">
+            <span>来源</span>
+            <select
+              value={sourceSelection}
+              onChange={(event) => setSourceSelection(event.target.value as FeedSourceSelection)}
+            >
+              <option value="all">全部来源</option>
+              <option value="trend">全网趋势</option>
+              {(topics.data ?? []).map((topic) => (
+                <option key={topic.id} value={topicSourceSelection(topic.id)}>{topic.keyword}</option>
+              ))}
+            </select>
+          </label>
           <label className="filter-control time-filter">
             <span>时间范围</span>
             <select value={range} onChange={(event) => setRange(event.target.value as FeedRange)}>
               {timeRangeOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
             </select>
           </label>
-          {origin !== 'trend' && (
-            <label className="filter-control topic-filter">
-              <span>主题</span>
-              <select value={topicId} onChange={(event) => {
-                const nextTopicId = event.target.value;
-                setTopicId(nextTopicId);
-                if (nextTopicId) setOrigin('topic');
-              }}>
-                <option value="">全部主题</option>
-                {(topics.data ?? []).map((topic) => <option key={topic.id} value={topic.id}>{topic.keyword}</option>)}
-              </select>
-            </label>
-          )}
         </div>
       </div>
       <TopicErrors topics={topics.data ?? []} />
@@ -334,7 +335,20 @@ function FeedPage() {
           <section className="feed-time-group" key={group.label}>
             <h2>{group.label}</h2>
             <div className="discovery-list">
-              {group.items.map((item) => <DiscoveryCard key={item.id} item={item} detailHref={`/items/${item.id}`} headingLevel={3} />)}
+              {group.items.map((item) => {
+                const topicKeyword = item.origin === 'topic'
+                  ? topicKeywordById.get(item.topicId)
+                  : undefined;
+                return (
+                  <DiscoveryCard
+                    key={item.id}
+                    item={item}
+                    {...(topicKeyword ? { topicKeyword } : {})}
+                    detailHref={`/items/${item.id}`}
+                    headingLevel={3}
+                  />
+                );
+              })}
             </div>
           </section>
         ))}
@@ -451,7 +465,7 @@ function ItemPage() {
     <Page title="发现详情" description="AI 中文摘要、推荐理由与引用原文">
       <QueryState isLoading={item.isLoading} error={item.error} retry={() => void item.refetch()} />
       {item.data && <article className="item-detail">
-        <span className={`classification classification--${item.data.kind}`}>{item.data.kind === 'hot' ? '热点' : '优质'}</span>
+        <span className={`classification classification--${item.data.kind}`}>{discoveryKindLabels[item.data.kind]}</span>
         <h2>{item.data.title}</h2>
         <section><h3>中文摘要</h3><p>{item.data.summary}</p></section>
         <section><h3>推荐理由</h3><p>{item.data.reason}</p></section>
