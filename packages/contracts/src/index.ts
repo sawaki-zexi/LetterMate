@@ -38,6 +38,26 @@ export const topicInputSchema = z.object({
   keyword: z.string().trim().min(1).max(100),
 });
 
+const feedSearchTextSchema = z.string().trim().max(100)
+  .transform((value) => value || undefined)
+  .optional();
+
+export const feedQuerySchema = z.strictObject({
+  topicId: z.string().trim().min(1).optional(),
+  kind: discoveryKindSchema.optional(),
+  range: feedRangeSchema.default('30d'),
+  origin: feedOriginSchema.default('all'),
+  q: feedSearchTextSchema,
+}).superRefine((filter, context) => {
+  if (filter.topicId && filter.origin === 'trend') {
+    context.addIssue({
+      code: 'custom',
+      path: ['origin'],
+      message: 'topicId cannot be combined with trend origin',
+    });
+  }
+});
+
 export const safeErrorSchema = z.object({
   code: z.string().min(1),
   message: z.string().min(1),
@@ -176,6 +196,8 @@ export type DiscoverySourceStatus = z.infer<typeof discoverySourceStatusSchema>;
 export type DiscoveryTrigger = z.infer<typeof discoveryTriggerSchema>;
 export type FeedItem = z.infer<typeof feedItemSchema>;
 export type FeedOrigin = z.infer<typeof feedOriginSchema>;
+export type FeedQuery = z.infer<typeof feedQuerySchema>;
+export type FeedQueryInput = z.input<typeof feedQuerySchema>;
 export type FeedRange = z.infer<typeof feedRangeSchema>;
 export type ProvenanceKind = z.infer<typeof provenanceKindSchema>;
 export type RunSummary = z.infer<typeof runSummarySchema>;

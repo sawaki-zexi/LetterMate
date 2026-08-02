@@ -7,6 +7,7 @@ import {
   discoverySourceStatusSchema,
   feedItemSchema,
   feedOriginSchema,
+  feedQuerySchema,
   feedRangeSchema,
   runSummarySchema,
   sourceTypeSchema,
@@ -109,6 +110,21 @@ describe('AI discovery contracts', () => {
     expect(feedOriginSchema.options).toEqual(['all', 'topic', 'trend']);
     expect(() => feedRangeSchema.parse('archive')).toThrow();
     expect(() => feedOriginSchema.parse('keyword')).toThrow();
+  });
+
+  it('normalizes persisted Feed search queries with existing filters', () => {
+    expect(feedQuerySchema.parse({
+      q: '  智能体工程  ', range: '30d', origin: 'topic', kind: 'quality',
+    })).toEqual({
+      q: '智能体工程', range: '30d', origin: 'topic', kind: 'quality',
+    });
+    expect(feedQuerySchema.parse({ q: '   ' })).toEqual({
+      q: undefined, range: '30d', origin: 'all',
+    });
+    expect(() => feedQuerySchema.parse({ q: 'x'.repeat(101) })).toThrow();
+    expect(() => feedQuerySchema.parse({
+      topicId: 'topic-1', origin: 'trend',
+    })).toThrow();
   });
 
   it('accepts authoritative run summaries for every status', () => {
