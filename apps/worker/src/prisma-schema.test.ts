@@ -1,25 +1,42 @@
-import { Prisma } from '@prisma/client';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const model = (modelName: string) => Prisma.dmmf.datamodel.models.find((candidate) => candidate.name === modelName);
+const schema = readFileSync(join(process.cwd(), 'prisma', 'schema.prisma'), 'utf8');
+
+const modelSource = (modelName: string) => (
+  schema.match(new RegExp(`model ${modelName} \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
+);
+
+const fieldLine = (modelName: string, fieldName: string) => (
+  modelSource(modelName).match(new RegExp(`^  ${fieldName}\\s+([^\\n]+)$`, 'm'))?.[1] ?? ''
+);
 
 const fieldNames = (modelName: string) => (
-  model(modelName)?.fields.map((field) => field.name) ?? []
+  [...modelSource(modelName).matchAll(/^  (\w+)\s+/gm)].map((match) => match[1])
 );
 
-const relation = (modelName: string, fieldName: string) => (
-  model(modelName)?.fields.find((field) => field.name === fieldName)
-);
+const modelNames = () => [...schema.matchAll(/^model (\w+) \{/gm)].map((match) => match[1]);
+
+const relation = (modelName: string, fieldName: string) => {
+  const line = fieldLine(modelName, fieldName);
+  const relationFields = line.match(/fields: \[([^\]]*)\]/)?.[1];
+  const relationReferences = line.match(/references: \[([^\]]*)\]/)?.[1];
+
+  return {
+    isRequired: !line.split(/\s+/)[0]?.endsWith('?'),
+    ...(relationFields ? { relationFromFields: relationFields.split(', ').map((field) => field.trim()) } : {}),
+    ...(relationReferences ? { relationToFields: relationReferences.split(', ').map((field) => field.trim()) } : {}),
+    ...(line.includes('onDelete: Cascade') ? { relationOnDelete: 'Cascade' } : {}),
+  };
+};
 
 const uniqueConstraints = (modelName: string) => {
-  const candidate = model(modelName);
-  if (!candidate) return [];
-
   return [
-    ...candidate.uniqueIndexes.map((index) => index.fields),
-    ...candidate.fields.filter((field) => field.isUnique).map((field) => [field.name]),
+    ...[...modelSource(modelName).matchAll(/@@unique\(\[([^\]]+)\]\)/g)]
+      .map((match) => match[1].split(', ').map((field) => field.trim())),
+    ...fieldNames(modelName).filter((fieldName) => fieldLine(modelName, fieldName).includes('@unique'))
+      .map((fieldName) => [fieldName]),
   ];
 };
 
@@ -29,22 +46,25 @@ describe('multi-source Prisma schema', () => {
   it('stores topic scheduling state and source-aware discovery items', () => {
     expect(fieldNames('Topic')).toEqual(expect.arrayContaining([
       'nextRunAt', 'scheduleIntervalHours', 'productiveRunStreak', 'emptyRunStreak', 'runs',
+      'deletedAt', 'variantsInitialized',
     ]));
     expect(fieldNames('DiscoveryItem')).toEqual(expect.arrayContaining([
       'sourceType', 'platform', 'authorName', 'authorHandle', 'externalId', 'provenanceKind',
+      'topicKeyword',
     ]));
   });
 
   it('defines durable discovery run lifecycle fields', () => {
-    expect(Prisma.dmmf.datamodel.models.map((model) => model.name)).toContain('DiscoveryRun');
+    expect(modelNames()).toContain('DiscoveryRun');
     expect(fieldNames('DiscoveryRun')).toEqual(expect.arrayContaining([
       'topicId', 'trigger', 'status', 'startedAt', 'finishedAt', 'connectorSummary',
-      'candidateCount', 'acceptedCount', 'newItemCount', 'error',
+      'candidateCount', 'acceptedCount', 'newItemCount', 'error', 'keywordSnapshot',
+      'expandedTermsSnapshot',
     ]));
   });
 
   it('defines one user-owned trend monitor with recoverable scheduling state', () => {
-    expect(Prisma.dmmf.datamodel.models.map((candidate) => candidate.name)).toEqual(
+    expect(modelNames()).toEqual(
       expect.arrayContaining(['TrendMonitor', 'TrendRun', 'TrendSeed', 'RadarItem']),
     );
     expect(fieldNames('TrendMonitor')).toEqual(expect.arrayContaining([
@@ -210,5 +230,36 @@ describe('multi-source Prisma schema', () => {
     expect(normalizedMigration).toContain(
       'CREATE UNIQUE INDEX "TrendSeed_runId_fingerprint_key" ON "TrendSeed"("runId", "fingerprint");',
     );
+  });
+
+  it('preserves topic keyword history and permits re-creating deleted keywords', () => {
+    expect(fieldLine('Topic', 'deletedAt')).toMatch(/^DateTime\?/);
+    expect(fieldLine('Topic', 'variantsInitialized')).toContain('Boolean');
+    expect(fieldLine('Topic', 'variantsInitialized')).toContain('@default(false)');
+    expect(fieldLine('DiscoveryRun', 'keywordSnapshot')).toMatch(/^String/);
+    expect(fieldLine('DiscoveryRun', 'expandedTermsSnapshot')).toContain('String[]');
+    expect(fieldLine('DiscoveryRun', 'expandedTermsSnapshot')).toContain('@default([])');
+    expect(fieldLine('DiscoveryItem', 'topicKeyword')).toMatch(/^String/);
+    expect(uniqueConstraints('Topic')).not.toContainEqual(['userId', 'normalizedKeyword']);
+    expect(modelSource('Topic')).toContain('@@index([userId, deletedAt, createdAt])');
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260802_topic_keyword_management', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    const normalizedMigration = migration.replace(/\s+/g, ' ').trim();
+
+    expect(normalizedMigration).toContain('ALTER TABLE "Topic" ADD COLUMN "deletedAt" TIMESTAMP(3), ADD COLUMN "variantsInitialized" BOOLEAN NOT NULL DEFAULT false;');
+    expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryRun" ADD COLUMN "keywordSnapshot" TEXT, ADD COLUMN "expandedTermsSnapshot" TEXT[];');
+    expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryItem" ADD COLUMN "topicKeyword" TEXT;');
+    expect(normalizedMigration).toContain('UPDATE "DiscoveryRun" AS "run" SET "keywordSnapshot" = "topic"."keyword", "expandedTermsSnapshot" = "topic"."expandedTerms" FROM "Topic" AS "topic" WHERE "run"."topicId" = "topic"."id";');
+    expect(normalizedMigration).toContain('UPDATE "DiscoveryItem" AS "item" SET "topicKeyword" = "topic"."keyword" FROM "Topic" AS "topic" WHERE "item"."topicId" = "topic"."id";');
+    expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryRun" ALTER COLUMN "keywordSnapshot" SET NOT NULL;');
+    expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryRun" ALTER COLUMN "expandedTermsSnapshot" SET DEFAULT ARRAY[]::TEXT[];');
+    expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryRun" ALTER COLUMN "expandedTermsSnapshot" SET NOT NULL;');
+    expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryItem" ALTER COLUMN "topicKeyword" SET NOT NULL;');
+    expect(normalizedMigration).toContain('DROP INDEX "Topic_userId_normalizedKeyword_key";');
+    expect(normalizedMigration).toContain('CREATE UNIQUE INDEX "Topic_userId_normalizedKeyword_active_key" ON "Topic"("userId", "normalizedKeyword") WHERE "deletedAt" IS NULL;');
+    expect(normalizedMigration).toContain('CREATE INDEX "Topic_userId_deletedAt_createdAt_idx" ON "Topic"("userId", "deletedAt", "createdAt");');
   });
 });
