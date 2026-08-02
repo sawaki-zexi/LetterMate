@@ -13,6 +13,7 @@ import {
   topicFeedItemSchema,
   topicSchema,
   topicInputSchema,
+  topicUpdateInputSchema,
   trendFeedItemSchema,
   trendJobDataSchema,
   trendQueueName,
@@ -45,6 +46,46 @@ describe('AI discovery contracts', () => {
     expect(topicInputSchema.parse({ keyword: '  AI Agent  ' })).toEqual({ keyword: 'AI Agent' });
     expect(() => topicInputSchema.parse({ keyword: '' })).toThrow();
     expect(() => topicInputSchema.parse({ keyword: 'x'.repeat(101) })).toThrow();
+  });
+
+  it('accepts a complete topic keyword update and trims its values', () => {
+    expect(topicUpdateInputSchema.parse({
+      keyword: '  gpt-5.7  ',
+      expandedTerms: ['  gpt 5.7  ', '  gpt5.7  '],
+    })).toEqual({
+      keyword: 'gpt-5.7',
+      expandedTerms: ['gpt 5.7', 'gpt5.7'],
+    });
+  });
+
+  it('limits topic keyword updates to twenty nonempty terms of at most one hundred characters', () => {
+    expect(() => topicUpdateInputSchema.parse({
+      keyword: 'gpt-5.7',
+      expandedTerms: Array.from({ length: 21 }, (_, index) => `term-${index}`),
+    })).toThrow();
+    expect(() => topicUpdateInputSchema.parse({
+      keyword: 'gpt-5.7',
+      expandedTerms: ['   '],
+    })).toThrow();
+    expect(() => topicUpdateInputSchema.parse({
+      keyword: 'gpt-5.7',
+      expandedTerms: ['x'.repeat(101)],
+    })).toThrow();
+  });
+
+  it('rejects expanded terms duplicated after Unicode normalization', () => {
+    const result = topicUpdateInputSchema.safeParse({
+      keyword: 'gpt-5.7',
+      expandedTerms: ['GPT 5.7', '  gpt   5.7  ', 'ＧＰＴ ５.７'],
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: ['expandedTerms', 1], message: '扩展词不能重复' }),
+        expect.objectContaining({ path: ['expandedTerms', 2], message: '扩展词不能重复' }),
+      ]));
+    }
   });
 
   it('requires hot or quality items with summary, reason and source URLs', () => {
@@ -249,7 +290,13 @@ describe('AI discovery contracts', () => {
   });
 
   it('discriminates topic and trend feed items by origin', () => {
-    const topicItem = { ...feedItemFixture, origin: 'topic' as const, topicId: 'topic-1' };
+    const topicItem = {
+      ...feedItemFixture,
+      origin: 'topic' as const,
+      topicId: 'topic-1',
+      topicKeyword: 'AI agents',
+      topicKeywordActive: true,
+    };
     const trendItem = { ...feedItemFixture, origin: 'trend' as const, topicId: null };
 
     expect(topicFeedItemSchema.parse(topicItem).origin).toBe('topic');
@@ -258,6 +305,8 @@ describe('AI discovery contracts', () => {
     expect(feedItemSchema.parse(trendItem).topicId).toBeNull();
     expect(() => feedItemSchema.parse({ ...topicItem, topicId: null })).toThrow();
     expect(() => feedItemSchema.parse({ ...trendItem, topicId: 'topic-1' })).toThrow();
+    expect(() => topicFeedItemSchema.parse({ ...topicItem, topicKeyword: '' })).toThrow();
+    expect(() => topicFeedItemSchema.parse({ ...topicItem, topicKeywordActive: 'true' })).toThrow();
   });
 
   it('accepts only HTTP(S) citations and feed source URLs', () => {
@@ -272,6 +321,8 @@ describe('AI discovery contracts', () => {
         sourceUrls: [sourceUrl],
         origin: 'topic' as const,
         topicId: 'topic-1',
+        topicKeyword: 'AI agents',
+        topicKeywordActive: true,
       };
       const trendItem = {
         ...feedItemFixture,
@@ -298,6 +349,8 @@ describe('AI discovery contracts', () => {
       sourceUrls: [sourceUrl],
       origin: 'topic' as const,
       topicId: 'topic-1',
+      topicKeyword: 'AI agents',
+      topicKeywordActive: true,
     };
     const trendItem = {
       ...feedItemFixture,
@@ -314,7 +367,13 @@ describe('AI discovery contracts', () => {
   });
 
   it('rejects unknown keys at public Task 1 DTO boundaries', () => {
-    const topicItem = { ...feedItemFixture, origin: 'topic' as const, topicId: 'topic-1' };
+    const topicItem = {
+      ...feedItemFixture,
+      origin: 'topic' as const,
+      topicId: 'topic-1',
+      topicKeyword: 'AI agents',
+      topicKeywordActive: true,
+    };
     const trendItem = { ...feedItemFixture, origin: 'trend' as const, topicId: null };
 
     expect(() => trendJobDataSchema.parse({
