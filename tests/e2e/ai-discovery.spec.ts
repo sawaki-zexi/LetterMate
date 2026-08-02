@@ -163,6 +163,32 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   await expect(page.locator('.origin-label', { hasText: '来自全网趋势' }).first()).toBeVisible();
   await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` }).first()).toBeVisible();
 
+  const searchInput = page.getByLabel('搜索已获取文章');
+  const searchRequestCount = feedRequests.filter((url) => url.searchParams.has('q')).length;
+  await searchInput.fill('Agent 工程');
+  await page.waitForTimeout(300);
+  expect(feedRequests.filter((url) => url.searchParams.has('q'))).toHaveLength(searchRequestCount);
+
+  const searchResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === '/api/v1/feed'
+      && url.searchParams.get('q') === 'Agent 工程'
+      && url.searchParams.get('range') === '3d'
+      && url.searchParams.get('origin') === 'all';
+  });
+  await searchInput.press('Enter');
+  expect((await searchResponse).ok()).toBe(true);
+  await expect(page.locator('.discovery-card')).toHaveCount(1);
+  await expect(page.getByRole('heading', { name: 'gpt-5.7 Agent 工程实践指南' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'gpt-5.7 官方更新说明' })).toHaveCount(0);
+
+  await page.getByRole('button', { name: '清除搜索' }).click();
+  await expect(searchInput).toHaveValue('');
+  await expect(page.getByLabel('时间范围')).toHaveValue('3d');
+  await expect(page.getByLabel('来源')).toHaveValue('all');
+  await expect(page.getByRole('heading', { name: 'gpt-5.7 官方更新说明' })).toBeVisible();
+  await expect(page.locator('.origin-label', { hasText: '来自全网趋势' }).first()).toBeVisible();
+
   if (testInfo.project.name === 'mobile' || testInfo.project.name === 'compact-mobile') {
     await page.evaluate(() => window.scrollTo(0, 0));
     const pageContainer = page.locator('main.page');

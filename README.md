@@ -55,7 +55,7 @@ LetterMate 将完整关键词追踪与自动技术趋势发现合并到一个 Fe
 - 核心事实支持门控、历史增量判断和多层去重。
 - `hot | quality` 分类、中文摘要、推荐理由和可回溯原始链接。
 - Topic 的 6/12/24 小时自适应调度与趋势监控持久化周期。
-- 统一 Feed、来源/分类/时间筛选和自然日期分组。
+- 统一 Feed、已入库文章搜索、来源/分类/时间筛选和自然日期分组。
 - 点击刷新与移动端下拉刷新，完成数量来自持久化运行摘要。
 - 桌面、平板、手机和 320px 紧凑视口支持。
 
@@ -197,7 +197,7 @@ npm run dev -w @lettermate/worker
 | `GET` | `/items/:id` | 获取 Topic 或趋势条目详情 |
 | `GET` | `/discovery-sources` | 获取脱敏后的连接器启用状态 |
 
-Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend`、`kind=hot|quality` 和可选 `topicId`。`topicId` 不能与 `origin=trend` 同时使用。
+Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend`、`kind=hot|quality`、可选 `topicId` 和最长 100 字符的 `q`。`q` 只搜索当前用户已入库文章的标题、摘要和推荐理由，不触发外部发现；有关键词时按标题、摘要、推荐理由的加权相关性排序，再按文章时间和 ID 稳定排序。`topicId` 不能与 `origin=trend` 同时使用。
 
 ## 开发与验证
 
@@ -230,7 +230,7 @@ npm test -- apps/worker/src/twitterapi-io.live.test.ts
 - Topic 与趋势两条持久化发现管线。
 - 11 个主发现连接器和 6 个趋势输入。
 - 调度、租约恢复、幂等刷新和运行摘要。
-- 统一 Feed、时间/来源筛选、日期分组和响应式界面。
+- 统一 Feed、已入库文章搜索、时间/来源筛选、日期分组和响应式界面。
 - 默认离线自动化测试与凭据型 live smoke test 入口。
 
 生产使用前仍需完成：
