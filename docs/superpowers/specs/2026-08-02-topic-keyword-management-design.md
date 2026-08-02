@@ -40,6 +40,7 @@ Allow users to edit and delete tracked Topic keywords while preserving historica
 Use a keyword snapshot on each Topic discovery item and soft deletion on Topic.
 
 - Add nullable `deletedAt` to `Topic`.
+- Add `variantsInitialized` to `Topic`. It becomes true after the first successful AI expansion or any user update, including an explicitly saved empty variant list.
 - Add immutable `topicKeyword` to `DiscoveryItem`.
 - Capture the primary keyword and deterministic variants used by each discovery run so an in-flight run cannot be relabeled by a concurrent edit.
 - Persist each accepted item with the run's primary-keyword snapshot.
