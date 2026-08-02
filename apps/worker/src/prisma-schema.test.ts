@@ -250,6 +250,7 @@ describe('multi-source Prisma schema', () => {
     const normalizedMigration = migration.replace(/\s+/g, ' ').trim();
 
     expect(normalizedMigration).toContain('ALTER TABLE "Topic" ADD COLUMN "deletedAt" TIMESTAMP(3), ADD COLUMN "variantsInitialized" BOOLEAN NOT NULL DEFAULT false;');
+    expect(normalizedMigration).toContain('UPDATE "Topic" SET "variantsInitialized" = true;');
     expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryRun" ADD COLUMN "keywordSnapshot" TEXT, ADD COLUMN "expandedTermsSnapshot" TEXT[];');
     expect(normalizedMigration).toContain('ALTER TABLE "DiscoveryItem" ADD COLUMN "topicKeyword" TEXT;');
     expect(normalizedMigration).toContain('UPDATE "DiscoveryRun" AS "run" SET "keywordSnapshot" = "topic"."keyword", "expandedTermsSnapshot" = "topic"."expandedTerms" FROM "Topic" AS "topic" WHERE "run"."topicId" = "topic"."id";');

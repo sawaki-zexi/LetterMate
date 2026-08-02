@@ -2,6 +2,9 @@ ALTER TABLE "Topic"
   ADD COLUMN "deletedAt" TIMESTAMP(3),
   ADD COLUMN "variantsInitialized" BOOLEAN NOT NULL DEFAULT false;
 
+UPDATE "Topic"
+SET "variantsInitialized" = true;
+
 ALTER TABLE "DiscoveryRun"
   ADD COLUMN "keywordSnapshot" TEXT,
   ADD COLUMN "expandedTermsSnapshot" TEXT[];
