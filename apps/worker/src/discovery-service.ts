@@ -118,7 +118,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
   ) {}
 
   async findOwnedTopic(topicId: string, userId: string): Promise<Topic | null> {
-    const topic = await this.prisma.topic.findFirst({ where: { id: topicId, userId } });
+    const topic = await this.prisma.topic.findFirst({ where: { id: topicId, userId, deletedAt: null } });
     return topic ? mapTopic(topic) : null;
   }
 
@@ -129,14 +129,15 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
   ): Promise<string | null> {
     return this.prisma.$transaction(async (transaction) => {
       const previous = await transaction.topic.findFirst({
-        where: { id: topicId },
-        select: { activeRunId: true, runStatus: true, runLeaseUntil: true },
+        where: { id: topicId, deletedAt: null },
+        select: { activeRunId: true, runStatus: true, runLeaseUntil: true, keyword: true, expandedTerms: true },
       });
       if (!previous) return null;
       const runId = randomUUID();
       const claimed = await transaction.topic.updateMany({
         where: {
           id: topicId,
+          deletedAt: null,
           activeRunId: previous.activeRunId,
           OR: [
             { runStatus: { not: 'running' } },
@@ -172,7 +173,10 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         });
       }
       const run = await transaction.discoveryRun.create({
-        data: { id: runId, topicId, trigger, status: 'running', startedAt },
+        data: {
+          id: runId, topicId, trigger, status: 'running', startedAt,
+          keywordSnapshot: previous.keyword, expandedTermsSnapshot: previous.expandedTerms,
+        },
         select: { id: true },
       });
       return run.id;
@@ -189,7 +193,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
 
   async getScheduleState(topicId: string): Promise<TopicScheduleState> {
     const topic = await this.prisma.topic.findFirst({
-      where: { id: topicId },
+      where: { id: topicId, deletedAt: null },
       select: {
         scheduleIntervalHours: true,
         productiveRunStreak: true,
@@ -239,6 +243,11 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         where: { id: input.topicId },
         select: { manualRefreshPending: true },
       });
+      const run = await transaction.discoveryRun.findUnique({
+        where: { id: input.runId },
+        select: { keywordSnapshot: true },
+      });
+      if (!run) throw new Error('Discovery run was not found');
       const normalizedItems = input.items.flatMap((item) => {
         const sourceUrls = unique(item.sourceUrls.map(canonicalizeUrl));
         const canonicalPrimaryUrl = sourceUrls[0];
@@ -272,6 +281,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
           authorHandle: item.authorHandle,
           externalId: item.externalId,
           provenanceKind: item.provenanceKind,
+          topicKeyword: run.keywordSnapshot,
         } as const;
         await transaction.discoveryItem.upsert({
           where: {

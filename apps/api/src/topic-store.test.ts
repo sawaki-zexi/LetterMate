@@ -7,6 +7,37 @@ import {
 import { MemoryTopicStore, PrismaTopicStore } from './topic-store.js';
 
 describe('topic store multi-source mappings', () => {
+  it('updates only an owned topic, invalidates prior variants, and permits a deleted keyword to be reused', async () => {
+    const store = new MemoryTopicStore();
+    const original = await store.createTopic('user-1', 'GPT-5.7', 'gpt-5.7');
+    const historicItem = store.seedItem(original.id, 'quality');
+
+    expect(await store.updateTopic('user-2', original.id, {
+      keyword: 'GPT-5.8', normalizedKeyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'],
+    })).toBeNull();
+
+    const updated = await store.updateTopic('user-1', original.id, {
+      keyword: 'GPT-5.8', normalizedKeyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'],
+    });
+    expect(updated).toMatchObject({
+      shouldEnqueue: true,
+      topic: { id: original.id, keyword: 'GPT-5.8', expandedTerms: ['gpt 5.8'] },
+    });
+
+    expect(await store.deleteTopic('user-2', original.id)).toBe(false);
+    expect(await store.deleteTopic('user-1', original.id)).toBe(true);
+    expect(await store.listTopics('user-1')).toEqual([]);
+    expect(await store.listFeed('user-1', { origin: 'topic', since: null })).toEqual([
+      expect.objectContaining({
+        id: historicItem.id,
+        topicKeyword: 'GPT-5.7',
+        topicKeywordActive: false,
+      }),
+    ]);
+    expect(await store.createTopic('user-1', 'GPT-5.8', 'gpt-5.8')).toMatchObject({
+      keyword: 'GPT-5.8',
+    });
+  });
   it('maps the latest Prisma discovery run as a strict public summary', async () => {
     const prisma = {
       topic: {
@@ -51,7 +82,7 @@ describe('topic store multi-source mappings', () => {
     });
     expect(runSummarySchema.parse(topic?.lastRun)).not.toHaveProperty('connectorSummary');
     expect(prisma.topic.findFirst).toHaveBeenCalledWith({
-      where: { id: 'topic-1', userId: 'user-1' },
+      where: { id: 'topic-1', userId: 'user-1', deletedAt: null },
       include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
     });
   });
@@ -105,6 +136,7 @@ describe('topic store multi-source mappings', () => {
           authorHandle: 'project',
           externalId: '100',
           provenanceKind: 'api_record',
+          topicKeyword: 'Project',
         }]),
       },
       radarItem: { findMany: vi.fn().mockResolvedValue([]) },
@@ -584,7 +616,7 @@ describe('topic store multi-source mappings', () => {
     expect(second).toMatchObject({ shouldEnqueue: false, topic: { runStatus: 'running' } });
     expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenNthCalledWith(1, {
       where: {
-        id: 'topic-1', userId: 'user-1', runStatus: 'running', manualRefreshPending: false,
+        id: 'topic-1', userId: 'user-1', deletedAt: null, runStatus: 'running', manualRefreshPending: false,
       },
       data: { manualRefreshPending: true, lastError: expect.anything() },
     });
@@ -612,7 +644,7 @@ describe('topic store multi-source mappings', () => {
 
     expect(result).toMatchObject({ shouldEnqueue: false, topic: { runStatus: 'queued' } });
     expect(prisma.topic.updateMany).toHaveBeenCalledWith({
-      where: { id: 'topic-queued', userId: 'user-1', runStatus: 'queued', manualRefreshPending: false },
+      where: { id: 'topic-queued', userId: 'user-1', deletedAt: null, runStatus: 'queued', manualRefreshPending: false },
       data: { manualRefreshPending: true, lastError: expect.anything() },
     });
   });

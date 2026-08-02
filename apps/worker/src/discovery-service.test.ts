@@ -61,6 +61,7 @@ function createPrisma(existingUrls: string[] = []) {
     },
     discoveryRun: {
       create: vi.fn().mockResolvedValue({ id: 'run-1' }),
+      findUnique: vi.fn().mockResolvedValue({ keywordSnapshot: 'AI Agent' }),
       update: vi.fn().mockResolvedValue({ id: 'run-1' }),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
@@ -113,6 +114,8 @@ describe('PrismaDiscoveryRepository', () => {
         id: expect.any(String),
         topicId: 'topic-1',
         trigger: 'scheduled',
+        keywordSnapshot: 'AI Agent',
+        expandedTermsSnapshot: ['agent'],
         status: 'running',
         startedAt,
       },
@@ -120,7 +123,7 @@ describe('PrismaDiscoveryRepository', () => {
     });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1',
+        id: 'topic-1', deletedAt: null,
         activeRunId: null,
         OR: [
           { runStatus: { not: 'running' } },
@@ -172,7 +175,7 @@ describe('PrismaDiscoveryRepository', () => {
     expect(runId).toBe('run-1');
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1',
+        id: 'topic-1', deletedAt: null,
         activeRunId: 'stale-run',
         OR: [
           { runStatus: { not: 'running' } },

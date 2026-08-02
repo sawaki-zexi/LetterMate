@@ -77,6 +77,7 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
   async claimDueTopics(now: Date, claimUntil: Date, limit: number): Promise<ClaimedTopic[]> {
     const dueTopics = await this.prisma.topic.findMany({
       where: {
+        deletedAt: null,
         OR: [
           {
             nextRunAt: { lte: now },
@@ -112,11 +113,13 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
         where: staleRun
           ? {
               id: topic.id,
+              deletedAt: null,
               runStatus: 'running',
               runLeaseUntil: topic.runLeaseUntil,
             }
           : {
               id: topic.id,
+              deletedAt: null,
               nextRunAt: topic.nextRunAt,
               OR: [
                 { runStatus: { not: 'running' } },
