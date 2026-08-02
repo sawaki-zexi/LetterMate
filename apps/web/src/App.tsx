@@ -19,8 +19,9 @@ import {
   Plus,
   RefreshCw,
   Search,
+  X,
 } from 'lucide-react';
-import { useEffect, useState, type CSSProperties } from 'react';
+import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
 import { NavLink, Route, Routes, useParams } from 'react-router-dom';
 import { api } from './api.js';
 import { DiscoveryCard } from './components/DiscoveryCard.js';
@@ -231,12 +232,15 @@ function FeedPage() {
   const [kind, setKind] = useState<DiscoveryKind | 'all'>('all');
   const [range, setRange] = useState<FeedRange>('30d');
   const [sourceSelection, setSourceSelection] = useState<FeedSourceSelection>('all');
+  const [searchDraft, setSearchDraft] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
   const { origin, topicId } = feedFilterForSource(sourceSelection);
   const filter = {
     range,
     origin,
     ...(topicId ? { topicId } : {}),
     ...(kind === 'all' ? {} : { kind }),
+    ...(searchQuery ? { q: searchQuery } : {}),
   };
   const feed = useQuery({
     queryKey: ['feed', filter],
@@ -294,6 +298,16 @@ function FeedPage() {
     if (topicId && topics.data && !hasSelectedTopic) setSourceSelection('all');
   }, [hasSelectedTopic, topicId, topics.data]);
 
+  const submitSearch = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSearchQuery(searchDraft.trim());
+  };
+
+  const clearSearch = () => {
+    setSearchDraft('');
+    setSearchQuery('');
+  };
+
   return (
     <Page title="发现" description="从搜索、社交、视频与技术社区汇集高价值新内容" action={
       <button
@@ -325,6 +339,27 @@ function FeedPage() {
           ><RefreshCw size={16} /></button>
         </div>
       )}
+      <form
+        className={`feed-search ${searchQuery ? 'feed-search--active' : ''}`}
+        role="search"
+        onSubmit={submitSearch}
+      >
+        <input
+          aria-label="搜索已获取文章"
+          maxLength={100}
+          placeholder="搜索已获取文章"
+          value={searchDraft}
+          onChange={(event) => setSearchDraft(event.target.value)}
+        />
+        <button className="icon-button" type="submit" title="搜索文章" aria-label="搜索文章">
+          {feed.isFetching && searchQuery ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
+        </button>
+        {searchQuery && (
+          <button className="icon-button" type="button" title="清除搜索" aria-label="清除搜索" onClick={clearSearch}>
+            <X size={17} />
+          </button>
+        )}
+      </form>
       <div className="feed-tools">
         <div className="feed-segments">
           <div className="segmented" role="group" aria-label="内容类型">
@@ -360,7 +395,9 @@ function FeedPage() {
       <TopicErrors topics={topics.data ?? []} />
       {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
       {!feed.data && <QueryState isLoading={feed.isLoading} error={feed.error} retry={() => void feed.refetch()} />}
-      {feed.data?.length === 0 && <div className="state"><Inbox />暂无发现内容</div>}
+      {feed.data?.length === 0 && (
+        <div className="state"><Inbox />{searchQuery ? '未找到匹配文章' : '暂无发现内容'}</div>
+      )}
       <div className="feed-groups">
         {groups.map((group) => (
           <section className="feed-time-group" key={group.label}>
