@@ -5,6 +5,7 @@ import type {
   FeedRange,
   SourceType,
   Topic,
+  TrendStatus,
 } from '@lettermate/contracts';
 import {
   AlertCircle,
@@ -56,6 +57,12 @@ const isRunActive = (status: Topic['runStatus']): boolean => (
   status === 'queued' || status === 'running'
 );
 
+const isTrendRunActive = (status: TrendStatus): boolean => (
+  isRunActive(status.runStatus)
+  && status.lastRun !== null
+  && isRunActive(status.lastRun.status)
+);
+
 const sourceTypeLabel: Record<SourceType, string> = {
   web: '网页',
   feed: '订阅',
@@ -83,7 +90,7 @@ function useTrendStatus() {
   return useQuery({
     queryKey: ['trend-status'],
     queryFn: api.trendStatus,
-    refetchInterval: (query) => query.state.data && isRunActive(query.state.data.runStatus)
+    refetchInterval: (query) => query.state.data && isTrendRunActive(query.state.data)
       ? 1_500
       : false,
   });
@@ -279,7 +286,7 @@ function FeedPage() {
       )).length;
   const activeTrendCount = origin !== 'topic'
     && trendStatus.data
-    && isRunActive(trendStatus.data.runStatus)
+    && isTrendRunActive(trendStatus.data)
     ? 1
     : 0;
   const serverTargetCount = activeTopicCount + activeTrendCount;

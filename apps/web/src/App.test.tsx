@@ -636,6 +636,22 @@ describe('discovery workspace', () => {
       .toBe(initialRequests + 1);
   });
 
+  it('does not show refresh progress for a newly provisioned trend monitor without a run', async () => {
+    installFetchMock({
+      trendStatus: {
+        ...initialTrendStatus,
+        runStatus: 'queued',
+        lastRun: null,
+      },
+    });
+    renderApp('/');
+
+    const refresh = await screen.findByRole('button', { name: '刷新发现' });
+    await waitFor(() => expect(refresh).toBeEnabled());
+    expect(refresh).toHaveAttribute('aria-busy', 'false');
+    expect(screen.queryByText('正在更新 1 个目标')).not.toBeInTheDocument();
+  });
+
   it('keeps a Topic row locked on stale synchronization and retries it explicitly', async () => {
     installFetchMock({ topics: [topic('topic-1', 'AI Agent')], topicCompletionCount: 2 });
     const { client } = renderApp('/topics');
