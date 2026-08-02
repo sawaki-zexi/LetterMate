@@ -56,6 +56,24 @@ describe('web API client', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('trims and serializes a submitted persisted Feed search query', async () => {
+    const fetchMock = vi.fn(async () => Response.json([feedItem]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.feed({
+      q: '  智能体工程  ',
+      origin: 'topic',
+      topicId: 'topic/a',
+      kind: 'quality',
+      range: 'all',
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/feed?topicId=topic%2Fa&kind=quality&range=all&origin=topic&q=%E6%99%BA%E8%83%BD%E4%BD%93%E5%B7%A5%E7%A8%8B',
+      expect.any(Object),
+    );
+  });
+
   it('rejects legacy item shapes without an origin', async () => {
     const { origin: _origin, ...legacyItem } = feedItem;
     vi.stubGlobal('fetch', vi.fn(async () => Response.json([legacyItem])));

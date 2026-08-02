@@ -92,6 +92,8 @@ interface FetchMockOptions {
   topics?: Topic[];
   topicsResponse?: Promise<Topic[]>;
   feed?: FeedItem[];
+  feedByQuery?: Record<string, FeedItem[]>;
+  feedSearchFailures?: number;
   item?: FeedItem;
   created?: Topic;
   createdResponse?: Promise<Topic>;
@@ -109,6 +111,8 @@ function installFetchMock({
   topics: initialTopics = [],
   topicsResponse,
   feed = [],
+  feedByQuery = {},
+  feedSearchFailures: initialFeedSearchFailures = 0,
   item,
   created,
   createdResponse,
@@ -128,6 +132,7 @@ function installFetchMock({
   let trendStatusFailures = initialTrendStatusFailures;
   let feedRequestCount = 0;
   let feedRefetchFailures = initialFeedRefetchFailures;
+  let feedSearchFailures = initialFeedSearchFailures;
   let manualTopicPollCount = 0;
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -179,11 +184,18 @@ function installFetchMock({
     if (/\/items\/[^/?]+$/.test(url)) return Response.json(item!);
     if (url.includes('/feed')) {
       feedRequestCount += 1;
+      const query = new URL(url, 'http://test').searchParams.get('q');
+      if (query && feedSearchFailures > 0) {
+        feedSearchFailures -= 1;
+        return Response.json({
+          code: 'FEED_UNAVAILABLE', message: '搜索暂时不可用', traceId: 'test',
+        }, { status: 503 });
+      }
       if (feedRequestCount > 1 && feedRefetchFailures > 0) {
         feedRefetchFailures -= 1;
         return Response.json({ code: 'FEED_UNAVAILABLE', message: '发现内容暂时不可用', traceId: 'test' }, { status: 503 });
       }
-      return Response.json(feed);
+      return Response.json(query ? feedByQuery[query] ?? [] : feed);
     }
     return Response.json({ code: 'NOT_FOUND', message: 'not found', traceId: 'test' }, { status: 404 });
   }));
@@ -229,6 +241,78 @@ describe('discovery workspace', () => {
 
     fireEvent.change(range, { target: { value: '3d' } });
     await waitFor(() => expect(requests.some(({ url }) => url.includes('range=3d'))).toBe(true));
+  });
+
+  it('submits search only from the form and keeps it active across Feed filters', async () => {
+    installFetchMock({
+      feed: [feedItem('normal', 'topic')],
+      feedByQuery: { 智能体工程: [feedItem('matched', 'topic')] },
+    });
+    renderApp('/');
+    await screen.findByRole('heading', { name: /normal/ });
+    const input = screen.getByLabelText('搜索已获取文章');
+    const requestsBeforeTyping = requests.filter(({ url }) => url.includes('/feed')).length;
+
+    fireEvent.change(input, { target: { value: '  智能体工程  ' } });
+    expect(requests.filter(({ url }) => url.includes('/feed'))).toHaveLength(requestsBeforeTyping);
+
+    fireEvent.submit(screen.getByRole('search'));
+    await screen.findByRole('heading', { name: /matched/ });
+    expect(requests.some(({ url }) => {
+      const query = new URL(url, 'http://test').searchParams;
+      return query.get('q') === '智能体工程'
+        && query.get('range') === '30d'
+        && query.get('origin') === 'all';
+    })).toBe(true);
+
+    fireEvent.change(screen.getByRole('combobox', { name: '时间范围' }), {
+      target: { value: '3d' },
+    });
+    await waitFor(() => expect(requests.some(({ url }) => {
+      const query = new URL(url, 'http://test').searchParams;
+      return query.get('q') === '智能体工程' && query.get('range') === '3d';
+    })).toBe(true));
+  });
+
+  it('searches from the icon button and clears back to the normal Feed', async () => {
+    installFetchMock({
+      feed: [feedItem('normal', 'topic')],
+      feedByQuery: { 智能体: [feedItem('matched', 'topic')] },
+    });
+    renderApp('/');
+    await screen.findByRole('heading', { name: /normal/ });
+
+    fireEvent.change(screen.getByLabelText('搜索已获取文章'), {
+      target: { value: '智能体' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '搜索文章' }));
+    await screen.findByRole('heading', { name: /matched/ });
+
+    fireEvent.click(screen.getByRole('button', { name: '清除搜索' }));
+    await screen.findByRole('heading', { name: /normal/ });
+    expect(requests.at(-1)?.url).not.toContain('q=');
+  });
+
+  it('shows search empty state and retains failed context for retry', async () => {
+    installFetchMock({
+      feed: [feedItem('normal', 'topic')],
+      feedByQuery: { 无结果: [], 智能体: [feedItem('matched', 'topic')] },
+      feedSearchFailures: 1,
+    });
+    renderApp('/');
+    await screen.findByRole('heading', { name: /normal/ });
+    const input = screen.getByLabelText('搜索已获取文章');
+
+    fireEvent.change(input, { target: { value: '无结果' } });
+    fireEvent.submit(screen.getByRole('search'));
+    expect(await screen.findByText('搜索暂时不可用')).toBeVisible();
+    expect(input).toHaveValue('无结果');
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    expect(await screen.findByText('未找到匹配文章')).toBeVisible();
+
+    fireEvent.change(input, { target: { value: '智能体' } });
+    fireEvent.submit(screen.getByRole('search'));
+    await screen.findByRole('heading', { name: /matched/ });
   });
 
   it('maps one source selector to valid Feed filters without stale topic IDs', async () => {
@@ -550,6 +634,22 @@ describe('discovery workspace', () => {
 
     expect(requests.filter(({ url }) => url.endsWith('/trends/status')).length)
       .toBe(initialRequests + 1);
+  });
+
+  it('does not show refresh progress for a newly provisioned trend monitor without a run', async () => {
+    installFetchMock({
+      trendStatus: {
+        ...initialTrendStatus,
+        runStatus: 'queued',
+        lastRun: null,
+      },
+    });
+    renderApp('/');
+
+    const refresh = await screen.findByRole('button', { name: '刷新发现' });
+    await waitFor(() => expect(refresh).toBeEnabled());
+    expect(refresh).toHaveAttribute('aria-busy', 'false');
+    expect(screen.queryByText('正在更新 1 个目标')).not.toBeInTheDocument();
   });
 
   it('keeps a Topic row locked on stale synchronization and retries it explicitly', async () => {

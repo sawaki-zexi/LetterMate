@@ -1,11 +1,11 @@
 # LetterMate 精准追踪与趋势发现技术方案
 
 **状态：** 当前有效
-**更新日期：** 2026-07-30
+**更新日期：** 2026-08-02
 
 ## 当前开发进度
 
-已实现 Topic 精准追踪、11 个主发现连接器、6 个趋势输入、正文和事实支持门控、Topic/Trend 调度、运行租约、统一 Feed、时间与来源筛选、点击/下拉刷新、持久化新增计数，以及对应 Prisma 迁移和默认离线自动化测试。
+已实现 Topic 精准追踪、11 个主发现连接器、6 个趋势输入、正文和事实支持门控、Topic/Trend 调度、运行租约、统一 Feed、已入库文章搜索、时间与来源筛选、点击/下拉刷新、持久化新增计数，以及对应 Prisma 迁移和默认离线自动化测试。
 
 当前仍有两个生产交付缺口：
 
@@ -35,7 +35,8 @@ External trend inputs
 
 DiscoveryItem + RadarItem
   -> NestJS unified Feed API
-  -> React range/origin filters and calendar groups
+  -> persisted article search and range/origin filters
+  -> React calendar groups
 ```
 
 React Web 只调用 NestJS API。API 负责认证、用户边界、输入验证和 BullMQ 入队；Worker 负责外部网络访问和发现编排；PostgreSQL/Prisma 保存调度与运行真实状态；Redis/BullMQ 传递任务。所有外部密钥和鉴权头只在 API/Worker 服务端存在。
@@ -180,14 +181,14 @@ Feed 参数：
 
 - `range=1d|3d|7d|30d|90d|all`，默认 `30d`；
 - `origin=all|topic|trend`，默认 `all`；
-- 可选 `kind=hot|quality` 和 `topicId`；
+- 可选 `kind=hot|quality`、`topicId` 和最长 100 字符的 `q`；
 - `topicId` 与 `origin=trend` 非法，API 返回 `VALIDATION_ERROR`。
 
-服务端按 `publishedAt ?? discoveredAt` 过滤和稳定倒序排列；`all` 不设置起始时间。
+服务端始终执行用户边界和已有筛选。没有 `q` 时按 `publishedAt ?? discoveredAt`、ID 稳定倒序排列，`all` 不设置起始时间；有 `q` 时只查询已持久化的 `DiscoveryItem` 与 `RadarItem`，不会入队或访问外部来源。搜索使用 `pg_trgm` GIN 索引匹配标题、摘要和推荐理由，按标题 > 摘要 > 推荐理由的权重计算相关性，再按文章时间和 ID 稳定排序。Topic 与趋势结果各自取出相关性排名后，在 API 中执行同一稳定合并顺序；所有 SQL 值参数化，通配符按字面量转义。
 
 ## 10. Web 交互
 
-Feed 顶部提供来源 segmented control、分类 control、原生时间 `<select>` 和适用时的 Topic select。六个时间范围共用一个服务端查询，默认近 30 天。返回条目按“今天、昨天、近 3 天、近 7 天、本月更早、更早”互斥分组，空组不渲染。
+Feed 顶部提供已入库文章搜索框、来源 segmented control、分类 control、原生时间 `<select>` 和适用时的 Topic select。输入草稿与已提交搜索词分离，只有回车或点击搜索按钮才发送查询；清除按钮移除 `q` 并保留其他筛选。搜索失败保留输入上下文供重试，空结果显示专用状态。六个时间范围共用一个服务端查询，默认近 30 天。返回条目按“今天、昨天、近 3 天、近 7 天、本月更早、更早”互斥分组，空组不渲染。
 
 刷新协调范围：
 
@@ -250,4 +251,4 @@ npm run build
 npm run test:e2e
 ```
 
-默认测试不访问外网。OpenRouter live smoke test 要求同时设置 `RUN_LIVE_AI_TESTS=1` 和 `AI_API_KEY`；TwitterAPI.io live smoke test 要求同时设置 `RUN_LIVE_TWITTERAPI_IO_TESTS=1` 和 `TWITTERAPI_IO_API_KEY`。Playwright 使用确定性 API 覆盖四个配置视口、六范围中的默认 `30d`/交互 `3d`、来源过滤、点击/下拉刷新、持久化计数、时间分组、禁用措辞和水平溢出。
+默认测试不访问外网。OpenRouter live smoke test 要求同时设置 `RUN_LIVE_AI_TESTS=1` 和 `AI_API_KEY`；TwitterAPI.io live smoke test 要求同时设置 `RUN_LIVE_TWITTERAPI_IO_TESTS=1` 和 `TWITTERAPI_IO_API_KEY`。数据库搜索集成测试还要求 `RUN_DATABASE_TESTS=1` 和可用的 `DATABASE_URL`。Playwright 使用确定性 API 覆盖四个配置视口、六范围中的默认 `30d`/交互 `3d`、来源过滤、提交式文章搜索、点击/下拉刷新、持久化计数、时间分组、禁用措辞和水平溢出。
