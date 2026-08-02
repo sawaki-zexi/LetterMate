@@ -1,9 +1,7 @@
 import { parseConfig } from '@lettermate/config';
 import {
-  discoveryKindSchema,
   discoverySourceStatusSchema,
-  feedOriginSchema,
-  feedRangeSchema,
+  feedQuerySchema,
   topicInputSchema,
   type DiscoverySourceStatus,
 } from '@lettermate/contracts';
@@ -75,20 +73,6 @@ function parseOrThrow<T>(schema: z.ZodType<T>, value: unknown, message: string):
   }
   return result.data;
 }
-
-const feedFilterSchema = z.object({
-  topicId: z.string().min(1).optional(),
-  kind: discoveryKindSchema.optional(),
-  range: feedRangeSchema.default('30d'),
-  origin: feedOriginSchema.default('all'),
-}).strict().superRefine((filter, context) => {
-  if (filter.topicId && filter.origin === 'trend') {
-    context.addIssue({
-      code: 'custom', path: ['origin'],
-      message: 'topicId cannot be combined with trend origin',
-    });
-  }
-});
 
 const feedRangeMilliseconds = {
   '1d': 24 * 60 * 60 * 1_000,
@@ -176,7 +160,7 @@ class ApiController {
     @Query() query: Record<string, unknown>,
   ) {
     const userId = authenticatedUser(header);
-    const filter = parseOrThrow(feedFilterSchema, query, '发现筛选条件无效');
+    const filter = parseOrThrow(feedQuerySchema, query, '发现筛选条件无效');
     if (filter.topicId && !(await this.store.findTopic(userId, filter.topicId))) {
       throw new NotFoundException(errorBody('NOT_FOUND', '主题不存在'));
     }
@@ -189,6 +173,7 @@ class ApiController {
       since,
       ...(filter.topicId ? { topicId: filter.topicId } : {}),
       ...(filter.kind ? { kind: filter.kind } : {}),
+      ...(filter.q ? { query: filter.q } : {}),
     });
   }
 

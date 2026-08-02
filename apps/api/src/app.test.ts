@@ -207,6 +207,56 @@ describe('AI discovery API', () => {
     expect(response.body[0].kind).toBe('hot');
   });
 
+  it('searches persisted owner articles with existing Feed filters', async () => {
+    const topic = store.seedTopic('user-a', 'Agents');
+    const otherTopic = store.seedTopic('user-b', 'Private');
+    await store.completeFakeDiscovery('user-a', topic.id, {
+      expandedTerms: [],
+      items: [{
+        kind: 'quality', title: '智能体工程实践', summary: '可复现方法', reason: '内容深入',
+        sourceUrls: ['https://example.com/agent-engineering'], publishedAt: null,
+        sourceType: 'web', platform: 'Example', authorName: null, authorHandle: null,
+        externalId: null, provenanceKind: 'fetched_page',
+      }, {
+        kind: 'hot', title: '智能体工程热点', summary: '近期讨论', reason: '热度上升',
+        sourceUrls: ['https://example.com/agent-hot'], publishedAt: null,
+        sourceType: 'web', platform: 'Example', authorName: null, authorHandle: null,
+        externalId: null, provenanceKind: 'fetched_page',
+      }, {
+        kind: 'quality', title: '无关文章', summary: '普通内容', reason: '普通理由',
+        sourceUrls: ['https://example.com/unmatched'], publishedAt: null,
+        sourceType: 'web', platform: 'Example', authorName: null, authorHandle: null,
+        externalId: null, provenanceKind: 'fetched_page',
+      }],
+    });
+    await store.completeFakeDiscovery('user-b', otherTopic.id, {
+      expandedTerms: [],
+      items: [{
+        kind: 'quality', title: '智能体工程私有文章', summary: '私有', reason: '私有',
+        sourceUrls: ['https://example.com/private'], publishedAt: null,
+        sourceType: 'web', platform: 'Example', authorName: null, authorHandle: null,
+        externalId: null, provenanceKind: 'fetched_page',
+      }],
+    });
+
+    const response = await request(app.getHttpServer())
+      .get(`/api/v1/feed?q=${encodeURIComponent(' 工程 ')}&origin=topic&kind=quality&range=all&topicId=${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(200);
+
+    expect(response.body.map((item: { title: string }) => item.title))
+      .toEqual(['智能体工程实践']);
+  });
+
+  it('rejects persisted Feed search queries over 100 characters', async () => {
+    const response = await request(app.getHttpServer())
+      .get(`/api/v1/feed?q=${'x'.repeat(101)}`)
+      .set('x-user-id', 'user-a')
+      .expect(400);
+
+    expect(response.body.code).toBe('VALIDATION_ERROR');
+  });
+
   it('defaults the feed to 30 days and supports all retained history', async () => {
     const topic = store.seedTopic('user-a', 'History');
     store.seedItem(topic.id, 'quality', {
