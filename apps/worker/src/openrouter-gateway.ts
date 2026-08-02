@@ -1,6 +1,7 @@
 import {
   discoveryCandidateSchema,
 } from '@lettermate/contracts';
+import { canonicalizeUrl } from '@lettermate/domain';
 import { z } from 'zod';
 import {
   AiGatewayError,
@@ -18,6 +19,7 @@ import {
   type TrendSeedClassificationInput,
   type TrendSeedDecision,
 } from './ai-gateway.js';
+import { isChineseContent } from './chinese-content.js';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
@@ -29,6 +31,8 @@ const expansionSchema = z.object({
 const discoveryContentSchema = z.object({
   items: z.array(discoveryCandidateSchema).max(30),
 });
+
+type DiscoveryContent = z.infer<typeof discoveryContentSchema>;
 
 const assessmentSchema = z.object({
   decisions: z.array(z.object({
@@ -449,7 +453,7 @@ export class OpenRouterAiGateway implements AiGateway {
         {
           role: 'system',
           content:
-            'Create concise Chinese discovery items only from the supplied accepted candidates. Preserve source URLs and source metadata exactly. Explain why each item is worth reading. Never add a URL, date, author, platform, external ID, or provenance value that is not in the input.',
+            'Create concise discovery items only from the supplied accepted candidates. The title, summary, and reason of every item must be written in Simplified Chinese. Translate English source titles instead of copying them. Keep necessary product names, model names, versions, code, and protocol names such as GPT-5.7 and React 19 unchanged when needed, but do not let any user-facing field remain an all-English sentence. The summary must only state facts supported by the supplied candidate. The reason must explain in Chinese why the item is worth reading. Preserve source URLs and source metadata exactly. Never add a URL, date, author, platform, external ID, or provenance value that is not in the input.',
         },
         { role: 'user', content: JSON.stringify({ topic: input.keyword, candidates: input.candidates }) },
       ],
@@ -458,7 +462,59 @@ export class OpenRouterAiGateway implements AiGateway {
       { name: 'discovery_composition', schema: discoveryJsonSchema, maxTokens: 8_192 },
       input.signal,
     );
-    return data.items;
+    const invalidItems = data.items.filter((item) => !isLocalizedItem(item));
+    if (invalidItems.length === 0) return data.items;
+
+    const repaired = await this.repairLocalizedItems(input, invalidItems);
+    const repairedBySource = new Map<string, z.infer<typeof discoveryCandidateSchema>>();
+    for (const item of repaired) {
+      const key = primarySourceKey(item);
+      if (key !== null && !repairedBySource.has(key)) repairedBySource.set(key, item);
+    }
+
+    return data.items.flatMap((item) => {
+      if (isLocalizedItem(item)) return [item];
+      const replacement = repairedBySource.get(primarySourceKey(item) ?? '');
+      return replacement && isLocalizedItem(replacement)
+        ? [{ ...item, title: replacement.title, summary: replacement.summary, reason: replacement.reason }]
+        : [];
+    });
+  }
+
+  private async repairLocalizedItems(
+    input: {
+      keyword: string;
+      candidates: CompositionCandidate[];
+      signal?: AbortSignal;
+    },
+    drafts: z.infer<typeof discoveryCandidateSchema>[],
+  ): Promise<DiscoveryContent['items']> {
+    const draftSources = new Set(drafts.map(primarySourceKey).filter((value): value is string => value !== null));
+    const candidates = input.candidates.filter(({ candidate }) => draftSources.has(candidate.canonicalUrl));
+    if (candidates.length === 0) return [];
+
+    try {
+      const { data } = await this.completeStructured(
+        [
+          {
+            role: 'system',
+            content:
+              'Repair only the title, summary, and reason of the supplied draft discovery items. Return every supplied item in the same JSON shape. All three user-facing fields must use Simplified Chinese. Preserve facts, source URLs, and every source metadata field exactly from the original candidate; do not invent or translate URLs, authors, platforms, dates, IDs, or provenance values.',
+          },
+          {
+            role: 'user',
+            content: JSON.stringify({ topic: input.keyword, drafts, candidates }),
+          },
+        ],
+        discoveryContentSchema,
+        false,
+        { name: 'discovery_chinese_repair', schema: discoveryJsonSchema, maxTokens: 4_096 },
+        input.signal,
+      );
+      return data.items;
+    } catch {
+      return [];
+    }
   }
 
   private async completeStructured<T>(
@@ -468,12 +524,19 @@ export class OpenRouterAiGateway implements AiGateway {
     output: StructuredOutput,
     signal?: AbortSignal,
   ): Promise<{ data: T; message: OpenRouterMessage }> {
-    const first = await this.complete(messages, useWeb, output, signal);
+    const schemaInstruction: ChatMessage = {
+      role: 'system',
+      content: `Return JSON only. The response must match schema ${output.name}: ${JSON.stringify(output.schema)}`,
+    };
+    const constrainedMessages = messages[0]?.role === 'system'
+      ? [messages[0], schemaInstruction, ...messages.slice(1)]
+      : [schemaInstruction, ...messages];
+    const first = await this.complete(constrainedMessages, useWeb, output, signal);
     const firstData = parseStructured(first.content, schema);
     if (firstData !== null) return { data: firstData, message: first };
 
     const correction: ChatMessage[] = [
-      ...messages,
+      ...constrainedMessages,
       { role: 'assistant', content: first.content },
       {
         role: 'user',
@@ -516,15 +579,12 @@ export class OpenRouterAiGateway implements AiGateway {
           messages,
           temperature: 0.1,
           max_tokens: output.maxTokens,
-          provider: { require_parameters: true },
-          response_format: {
-            type: 'json_schema',
-            json_schema: {
-              name: output.name,
-              strict: true,
-              schema: output.schema,
-            },
+          provider: {
+            order: ['DeepSeek'],
+            allow_fallbacks: false,
+            require_parameters: true,
           },
+          response_format: { type: 'json_object' },
           ...(useWeb && this.config.webSearch ? { plugins: [{ id: 'web' }] } : {}),
         }),
       });
@@ -559,4 +619,14 @@ export class OpenRouterAiGateway implements AiGateway {
       parentSignal?.removeEventListener('abort', abort);
     }
   }
+}
+
+function primarySourceKey(item: { sourceUrls: string[] }): string | null {
+  const sourceUrl = item.sourceUrls[0];
+  if (!sourceUrl) return null;
+  try { return canonicalizeUrl(sourceUrl); } catch { return null; }
+}
+
+function isLocalizedItem(item: z.infer<typeof discoveryCandidateSchema>): boolean {
+  return isChineseContent(item.title) && isChineseContent(item.summary) && isChineseContent(item.reason);
 }

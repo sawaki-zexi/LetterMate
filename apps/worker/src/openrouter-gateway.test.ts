@@ -62,12 +62,13 @@ describe('OpenRouterAiGateway', () => {
     ]);
     const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
     expect(body.plugins).toBeUndefined();
-    expect(body.response_format.json_schema).toMatchObject({ name: 'trend_seed_classification', strict: true });
-    expect(body.response_format.json_schema.schema.additionalProperties).toBe(false);
-    expect(body.response_format.json_schema.schema.properties.decisions.maxItems)
-      .toBe(TREND_CLASSIFICATION_MAX_SEEDS);
-    expect(body.response_format.json_schema.schema.properties.decisions.items.properties.requiredTerms.maxItems)
-      .toBe(TREND_CLASSIFICATION_MAX_REQUIRED_TERMS);
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    const schemaMessage = body.messages.find((message: { content: string }) => (
+      message.content.includes('trend_seed_classification')
+    ));
+    expect(schemaMessage.content).toContain(`"maxItems":${TREND_CLASSIFICATION_MAX_SEEDS}`);
+    expect(schemaMessage.content).toContain(`"maxItems":${TREND_CLASSIFICATION_MAX_REQUIRED_TERMS}`);
+    expect(schemaMessage.content).toContain('"additionalProperties":false');
     expect(body.max_tokens).toBe(TREND_CLASSIFICATION_MAX_OUTPUT_TOKENS);
     expect(TREND_CLASSIFICATION_WORST_CASE_OUTPUT_UNITS)
       .toBeLessThan(TREND_CLASSIFICATION_MAX_OUTPUT_TOKENS);
@@ -186,9 +187,11 @@ describe('OpenRouterAiGateway', () => {
     }]);
     const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
     expect(body.plugins).toBeUndefined();
-    expect(body.response_format.json_schema.name).toBe('candidate_assessment');
-    expect(body.response_format.json_schema.schema.properties.decisions.items.required)
-      .toContain('claimSupport');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body.messages.some((message: { content: string }) => (
+      message.content.includes('candidate_assessment')
+      && message.content.includes('claimSupport')
+    ))).toBe(true);
     expect(body.messages[0].content).toContain('supplied candidate');
     expect(body.messages[0].content).toContain('external URLs or facts');
     expect(body.messages[0].content).toContain('unsupported');
@@ -255,7 +258,8 @@ describe('OpenRouterAiGateway', () => {
       sourceUrls: [source.canonicalUrl], publishedAt: null, sourceType: 'code', platform: 'GitHub',
       authorName: null, authorHandle: 'org', externalId: 'node-1', provenanceKind: 'api_record',
     };
-    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ items: [item] })));
+    const localizedItem = { ...item, title: '版本 2' };
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ items: [localizedItem] })));
 
     await expect(makeGateway(fetcher).composeItems({
       keyword: 'agent runtime', candidates: [{
@@ -264,10 +268,75 @@ describe('OpenRouterAiGateway', () => {
           claimSupport: 'supported',
         },
       }],
-    })).resolves.toEqual([item]);
+    })).resolves.toEqual([localizedItem]);
     const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
     expect(body.plugins).toBeUndefined();
-    expect(body.response_format.json_schema.name).toBe('discovery_composition');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body.messages.some((message: { content: string }) => (
+      message.content.includes('discovery_composition')
+    ))).toBe(true);
+  });
+
+  it('repairs English user-facing fields while preserving original source metadata', async () => {
+    const source = validateSourceCandidate({
+      connectorId: 'github', sourceType: 'code', platform: 'GitHub', externalId: 'node-repair',
+      url: 'https://github.com/org/repo/releases/tag/v3', title: 'Version 3', content: 'Migration notes.',
+      excerpt: null, authorName: null, authorHandle: 'org', publishedAt: null, language: 'en', engagement: {},
+      proof: { kind: 'api_record', connectorId: 'github', externalId: 'node-repair' },
+    });
+    const draft = {
+      kind: 'quality', title: 'Version 3 release', summary: 'This release includes migration notes.',
+      reason: 'It contains concrete changes.', sourceUrls: [source.canonicalUrl], publishedAt: null,
+      sourceType: 'code', platform: 'GitHub', authorName: null, authorHandle: 'org', externalId: 'node-repair',
+      provenanceKind: 'api_record',
+    };
+    const repaired = {
+      ...draft, title: '版本 3 发布', summary: '这次发布包含迁移说明。', reason: '内容记录了具体变更。',
+      platform: 'Tampered platform', externalId: 'tampered-id',
+    };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(openRouterResponse(JSON.stringify({ items: [draft] })))
+      .mockResolvedValueOnce(openRouterResponse(JSON.stringify({ items: [repaired] })));
+
+    await expect(makeGateway(fetcher).composeItems({
+      keyword: 'agent runtime', candidates: [{
+        candidate: source, assessment: {
+          id: source.canonicalUrl, accepted: true, kind: 'quality', reason: 'new',
+          claimSupport: 'supported',
+        },
+      }],
+    })).resolves.toEqual([{ ...draft, title: repaired.title, summary: repaired.summary, reason: repaired.reason }]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const repairBody = JSON.parse(String((fetcher.mock.calls[1] as [string, RequestInit])[1].body));
+    expect(repairBody.messages.some((message: { content: string }) => message.content.includes('Simplified Chinese'))).toBe(true);
+  });
+
+  it('drops an item when its one allowed language repair is still invalid', async () => {
+    const source = validateSourceCandidate({
+      connectorId: 'github', sourceType: 'code', platform: 'GitHub', externalId: 'node-drop',
+      url: 'https://github.com/org/repo/releases/tag/v4', title: 'Version 4', content: 'Migration notes.',
+      excerpt: null, authorName: null, authorHandle: 'org', publishedAt: null, language: 'en', engagement: {},
+      proof: { kind: 'api_record', connectorId: 'github', externalId: 'node-drop' },
+    });
+    const valid = {
+      kind: 'quality', title: '版本 4 说明', summary: '包含迁移说明。', reason: '提供具体变更。',
+      sourceUrls: [source.canonicalUrl], publishedAt: null, sourceType: 'code', platform: 'GitHub',
+      authorName: null, authorHandle: 'org', externalId: 'node-drop', provenanceKind: 'api_record',
+    };
+    const invalid = { ...valid, title: 'Version 4 release', summary: 'This is an English summary.', reason: 'English reason.' };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(openRouterResponse(JSON.stringify({ items: [valid, invalid] })))
+      .mockResolvedValueOnce(openRouterResponse(JSON.stringify({ items: [invalid] })));
+
+    await expect(makeGateway(fetcher).composeItems({
+      keyword: 'agent runtime', candidates: [{
+        candidate: source, assessment: {
+          id: source.canonicalUrl, accepted: true, kind: 'quality', reason: 'new',
+          claimSupport: 'supported',
+        },
+      }],
+    })).resolves.toEqual([valid]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it('expands one keyword without asking the user for synonyms', async () => {
@@ -287,18 +356,17 @@ describe('OpenRouterAiGateway', () => {
     expect(body.plugins).toBeUndefined();
     expect(body).toMatchObject({
       max_tokens: 1_024,
-      provider: { require_parameters: true },
-      response_format: {
-        type: 'json_schema',
-        json_schema: {
-          name: 'topic_expansion',
-          strict: true,
-          schema: {
-            required: ['terms', 'searchQueries'],
-          },
-        },
+      provider: {
+        order: ['DeepSeek'],
+        allow_fallbacks: false,
+        require_parameters: true,
       },
+      response_format: { type: 'json_object' },
     });
+    expect(body.messages.some((message: { content: string }) => (
+      message.content.includes('topic_expansion')
+      && message.content.includes('searchQueries')
+    ))).toBe(true);
     expect(body.messages.at(-1).content).toContain('AI Agent');
   });
 

@@ -51,6 +51,10 @@ const statusLabel: Record<Topic['runStatus'], string> = {
   failed: '失败',
 };
 
+const isRunActive = (status: Topic['runStatus']): boolean => (
+  status === 'queued' || status === 'running'
+);
+
 const sourceTypeLabel: Record<SourceType, string> = {
   web: '网页',
   feed: '订阅',
@@ -75,7 +79,13 @@ function useDiscoverySources() {
 }
 
 function useTrendStatus() {
-  return useQuery({ queryKey: ['trend-status'], queryFn: api.trendStatus });
+  return useQuery({
+    queryKey: ['trend-status'],
+    queryFn: api.trendStatus,
+    refetchInterval: (query) => query.state.data && isRunActive(query.state.data.runStatus)
+      ? 1_500
+      : false,
+  });
 }
 
 function QueryState({ isLoading, error, retry }: { isLoading: boolean; error: Error | null; retry: () => void }) {
@@ -172,13 +182,21 @@ function TopicRefreshResults({
   );
 }
 
-function RefreshFeedback({ refresh }: { refresh: RefreshCoordinator }) {
+function RefreshFeedback({
+  refresh,
+  active = refresh.active,
+  targetCount = refresh.targetCount,
+}: {
+  refresh: RefreshCoordinator;
+  active?: boolean;
+  targetCount?: number;
+}) {
   return (
     <>
-      {refresh.active && (
+      {active && (
         <div className="refresh-status" role="status">
           <RefreshCw className="spin" size={16} />
-          <span>正在更新 {refresh.targetCount} 个目标</span>
+          <span>正在更新 {targetCount} 个目标</span>
         </div>
       )}
       <RefreshNotificationToast notification={refresh.notification} />
@@ -250,8 +268,21 @@ function FeedPage() {
     : origin === 'topic'
       ? topics.data !== undefined && hasTopicTargets
       : topics.data !== undefined && trendStatus.data !== undefined;
+  const activeTopicCount = origin === 'trend'
+    ? 0
+    : (topics.data ?? []).filter((topic) => (
+        (!topicId || topic.id === topicId) && isRunActive(topic.runStatus)
+      )).length;
+  const activeTrendCount = origin !== 'topic'
+    && trendStatus.data
+    && isRunActive(trendStatus.data.runStatus)
+    ? 1
+    : 0;
+  const serverTargetCount = activeTopicCount + activeTrendCount;
+  const refreshActive = refresh.active || serverTargetCount > 0;
+  const refreshTargetCount = refresh.active ? refresh.targetCount : serverTargetCount;
   const pull = usePullRefresh({
-    refreshing: refresh.active || !refreshReady,
+    refreshing: refreshActive || !refreshReady,
     onRefresh: async () => { await refresh.startRefresh(); },
   });
   const groups = groupFeedItems(feed.data ?? []);
@@ -269,19 +300,19 @@ function FeedPage() {
         className="icon-button refresh-button"
         title="刷新发现"
         aria-label="刷新发现"
-        aria-busy={refresh.active}
-        disabled={refresh.active || !refreshReady}
+        aria-busy={refreshActive}
+        disabled={refreshActive || !refreshReady}
         onClick={() => void refresh.startRefresh()}
-      ><RefreshCw className={refresh.active ? 'spin' : undefined} size={18} /></button>
+      ><RefreshCw className={refreshActive ? 'spin' : undefined} size={18} /></button>
     } containerProps={pull.containerProps}>
       <div
-        className={`pull-indicator ${pull.pullDistance > 0 ? 'pull-indicator--visible' : ''} ${pull.armed ? 'pull-indicator--armed' : ''} ${refresh.active ? 'pull-indicator--active' : ''}`}
+        className={`pull-indicator ${pull.pullDistance > 0 ? 'pull-indicator--visible' : ''} ${pull.armed ? 'pull-indicator--armed' : ''} ${refreshActive ? 'pull-indicator--active' : ''}`}
         style={{ '--pull-distance': `${pull.pullDistance}px` } as CSSProperties}
         aria-hidden="true"
       >
-        <RefreshCw className={refresh.active ? 'spin' : undefined} size={18} />
+        <RefreshCw className={refreshActive ? 'spin' : undefined} size={18} />
       </div>
-      <RefreshFeedback refresh={refresh} />
+      <RefreshFeedback refresh={refresh} active={refreshActive} targetCount={refreshTargetCount} />
       {origin !== 'topic' && trendStatus.error && (
         <div className="error-banner">
           <AlertCircle size={18} />
@@ -388,12 +419,32 @@ function TopicRow({
   );
 }
 
+function PendingTopicRow({ keyword }: { keyword: string }) {
+  return (
+    <article
+      className="topic-row topic-row--pending"
+      role="status"
+      aria-label={`正在创建 ${keyword}`}
+    >
+      <div className="topic-row__main">
+        <div className="topic-row__title">
+          <h2>{keyword}</h2>
+          <span className="run-state run-state--queued">正在创建</span>
+        </div>
+        <p className="topic-schedule"><RefreshCw className="spin" size={14} />正在保存并排队</p>
+      </div>
+      <RefreshCw className="spin topic-row__pending-icon" size={17} aria-hidden="true" />
+    </article>
+  );
+}
+
 function TopicsPage() {
   const client = useQueryClient();
   const [manualTopicRefreshActive, setManualTopicRefreshActive] = useState(false);
   const topics = useTopics(manualTopicRefreshActive);
   const sources = useDiscoverySources();
   const [keyword, setKeyword] = useState('');
+  const [pendingKeyword, setPendingKeyword] = useState<string | null>(null);
   const refresh = useTopicRefreshManager({
     topics: topics.data ?? [],
     refreshTopic: api.refreshTopic,
@@ -408,12 +459,21 @@ function TopicsPage() {
     mutationFn: api.createTopic,
     onSuccess: (topic) => {
       client.setQueryData<Topic[]>(['topics'], (current = []) => [topic, ...current.filter((item) => item.id !== topic.id)]);
+      setPendingKeyword(null);
       setKeyword('');
+    },
+    onError: (_error, input) => {
+      setPendingKeyword(null);
+      setKeyword((current) => current || input.keyword);
     },
   });
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
-    if (keyword.trim()) create.mutate({ keyword });
+    const submittedKeyword = keyword.trim();
+    if (!submittedKeyword || create.isPending) return;
+    setPendingKeyword(submittedKeyword);
+    setKeyword('');
+    create.mutate({ keyword: submittedKeyword });
   };
 
   return (
@@ -431,13 +491,14 @@ function TopicsPage() {
       {create.error && <div className="error-banner"><AlertCircle size={18} /><span>{create.error.message}</span></div>}
       {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
       <div className="topic-list">
+        {pendingKeyword && <PendingTopicRow keyword={pendingKeyword} />}
         {(topics.data ?? []).map((topic) => <TopicRow
           key={topic.id}
           topic={topic}
-          pending={refresh.pendingTopicIds.includes(topic.id)}
+          pending={refresh.pendingTopicIds.includes(topic.id) || isRunActive(topic.runStatus)}
           onRefresh={() => void refresh.startTopicRefresh(topic.id)}
         />)}
-        {topics.data?.length === 0 && <div className="state"><Search />尚未创建主题</div>}
+        {topics.data?.length === 0 && !pendingKeyword && <div className="state"><Search />尚未创建主题</div>}
       </div>
       <section className="source-status-section">
         <header><h2>信息来源</h2><span>{sources.data?.filter((source) => source.status === 'enabled').length ?? 0} 个已启用</span></header>

@@ -27,6 +27,10 @@ describe('OpenRouterSearchConnector', () => {
 
     const body = JSON.parse(String((fetcher.mock.calls[0]![1] as RequestInit).body));
     expect(body.plugins).toEqual([{ id: 'web' }]);
+    expect(body.provider).toEqual({
+      order: ['DeepSeek'], allow_fallbacks: false, require_parameters: true,
+    });
+    expect(body.response_format).toEqual({ type: 'json_object' });
     expect(body.messages.at(-1).content).toContain('agent runtime latest');
     expect(result).toMatchObject({ requestCount: 1, candidates: [expect.objectContaining({
       connectorId: 'openrouter-search', sourceType: 'web', platform: 'Web', externalId: null,
@@ -40,5 +44,21 @@ describe('OpenRouterSearchConnector', () => {
   it('is disabled when Web Search or the API key is unavailable', () => {
     expect(new OpenRouterSearchConnector({ apiKey: undefined, model: 'm', webSearch: true, timeoutMs: 1_000 }).isEnabled()).toBe(false);
     expect(new OpenRouterSearchConnector({ apiKey: 'key', model: 'm', webSearch: false, timeoutMs: 1_000 }).isEnabled()).toBe(false);
+  });
+
+  it.each([
+    [401, 'OpenRouter API Key 无效或已被撤销'],
+    [402, 'OpenRouter 账户余额或额度不足'],
+    [403, 'OpenRouter API Key 没有执行此请求的权限'],
+  ])('reports the specific OpenRouter error for HTTP %i', async (status, message) => {
+    const connector = new OpenRouterSearchConnector({
+      apiKey: 'openrouter-key', model: 'openrouter/auto', webSearch: true, timeoutMs: 60_000,
+    }, vi.fn().mockResolvedValue(new Response(null, { status })) as typeof fetch);
+
+    await expect(connector.search(plan, new AbortController().signal)).rejects.toMatchObject({
+      code: 'CONNECTOR_AUTH_FAILED',
+      message,
+      retryable: false,
+    });
   });
 });

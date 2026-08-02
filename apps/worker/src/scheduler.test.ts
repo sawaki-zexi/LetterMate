@@ -5,6 +5,7 @@ import {
   TopicScheduleService,
   calculateScheduleUpdate,
   scheduledJobId,
+  startTopicScheduler,
 } from './scheduler.js';
 
 const finishedAt = new Date('2026-07-27T10:00:00.000Z');
@@ -195,5 +196,30 @@ describe('TopicScheduleService', () => {
     await service.scan(finishedAt);
 
     expect(queue.add).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('startTopicScheduler', () => {
+  it('contains a failed scan and runs the next scheduled scan', async () => {
+    vi.useFakeTimers();
+    const logger = { error: vi.fn() };
+    const service = {
+      scan: vi.fn()
+        .mockRejectedValueOnce(new Error('database unavailable'))
+        .mockResolvedValueOnce(0),
+    };
+    const scheduler = startTopicScheduler(service, { intervalMs: 1_000, logger });
+
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(service.scan).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith('Topic scheduler scan failed');
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(service.scan).toHaveBeenCalledTimes(2);
+      await scheduler.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

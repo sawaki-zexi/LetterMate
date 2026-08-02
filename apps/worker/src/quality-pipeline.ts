@@ -13,6 +13,7 @@ import {
   candidateMatchesKeyword,
   type KeywordPolicy,
 } from './keyword-policy.js';
+import { isChineseContent } from './chinese-content.js';
 
 export type QualityAiGateway = Pick<AiGateway, 'evaluateCandidates' | 'composeItems'>;
 export type { QualityAssessment, QualityAssessmentCandidate } from './ai-gateway.js';
@@ -139,6 +140,9 @@ export class QualityPipeline {
     return rawItems.map((raw) => {
       const parsed = discoveryCandidateSchema.safeParse(raw);
       if (!parsed.success) throw new QualityPipelineError();
+      if (!isChineseContent(parsed.data.title) || !isChineseContent(parsed.data.summary) || !isChineseContent(parsed.data.reason)) {
+        return null;
+      }
       let urls: string[];
       try { urls = [...new Set(parsed.data.sourceUrls.map(canonicalizeUrl))]; } catch { throw new QualityPipelineError(); }
       if (urls.length === 0 || urls.some((url) => !allowed.has(url))) throw new QualityPipelineError();
@@ -149,7 +153,7 @@ export class QualityPipeline {
         authorName: source.authorName, authorHandle: source.authorHandle, externalId: source.externalId,
         provenanceKind: source.proof.kind, publishedAt: source.publishedAt,
       });
-    });
+    }).filter((item): item is DiscoveryCandidate => item !== null);
   }
 
   private toAssessmentCandidates(candidates: ValidatedSourceCandidate[]): QualityAssessmentCandidate[] {

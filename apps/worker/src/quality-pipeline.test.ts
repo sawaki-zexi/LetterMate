@@ -18,11 +18,15 @@ const composed = (source: ValidatedSourceCandidate) => ({
   externalId: source.externalId, provenanceKind: source.proof.kind,
 });
 
+const localizedComposed = (source: ValidatedSourceCandidate) => ({
+  ...composed(source), title: '文章标题',
+});
+
 const gateway = (overrides: Partial<QualityAiGateway> = {}): QualityAiGateway => ({
   evaluateCandidates: async ({ candidates }) => candidates.map(({ id }) => ({
     id, accepted: true, kind: 'quality', reason: 'substantive', claimSupport: 'supported',
   })),
-  composeItems: async ({ candidates }) => candidates.map(({ candidate: item }) => composed(item)),
+  composeItems: async ({ candidates }) => candidates.map(({ candidate: item }) => localizedComposed(item)),
   ...overrides,
 });
 
@@ -170,7 +174,7 @@ describe('QualityPipeline', () => {
   it('limits the full text sent to final composition', async () => {
     const source = candidate('large', { content: 'x'.repeat(100_000) });
     const composeItems = vi.fn(async ({ candidates }) => candidates.map(
-      ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => composed(item),
+      ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => localizedComposed(item),
     ));
 
     await new QualityPipeline(
@@ -188,7 +192,7 @@ describe('QualityPipeline', () => {
       content: `${index}`.repeat(20_000),
     }));
     const composeItems = vi.fn(async ({ candidates }) => candidates.map(
-      ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => composed(item),
+      ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => localizedComposed(item),
     ));
 
     await new QualityPipeline(
@@ -357,7 +361,7 @@ describe('QualityPipeline', () => {
         content: 'A substantive candidate body with implementation details, measurements, and limitations.',
       });
       const composeItems = vi.fn(async ({ candidates }) => candidates.map(
-        ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => composed(item),
+        ({ candidate: item }: { candidate: ValidatedSourceCandidate }) => localizedComposed(item),
       ));
       const pipeline = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
         evaluateCandidates: async () => [{
@@ -395,7 +399,7 @@ describe('QualityPipeline', () => {
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' })).resolves.toEqual([]);
 
     const inventing = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
-      composeItems: async () => [{ ...composed(source), sourceUrls: ['https://invented.example/article'] }],
+      composeItems: async () => [{ ...localizedComposed(source), sourceUrls: ['https://invented.example/article'] }],
     }));
     await expect(inventing.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' }))
@@ -432,5 +436,27 @@ describe('QualityPipeline', () => {
     await expect(pipeline.run({ keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
       windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z' }))
       .rejects.toMatchObject({ code: 'QUALITY_RESPONSE_INVALID' });
+  });
+
+  it('filters English composed fields before returning Feed items', async () => {
+    const first = candidate('localized-one', {
+      content: 'A substantive article with architecture, migration steps, measurements, and limitations.',
+    });
+    const second = candidate('localized-two', {
+      content: 'Another substantive article with architecture, migration steps, measurements, and limitations.',
+    });
+    const english = {
+      ...localizedComposed(second), title: 'English release title', summary: 'This is an English summary.', reason: 'English reason.',
+    };
+    const pipeline = new QualityPipeline({ fetchText: vi.fn() } as never, gateway({
+      composeItems: async () => [localizedComposed(first), english],
+    }));
+
+    const result = await pipeline.run({
+      keyword: 'agents', matchPolicy: agentsPolicy, candidates: [first, second], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z', windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+
+    expect(result).toEqual([expect.objectContaining({ sourceUrls: [first.canonicalUrl] })]);
   });
 });

@@ -201,10 +201,35 @@ export class TopicScheduleService {
 
 export function startTopicScheduler(
   service: Pick<TopicScheduleService, 'scan'>,
-  intervalMs = 10 * 60 * 1_000,
-): { close(): void } {
-  void service.scan();
-  const timer = setInterval(() => void service.scan(), intervalMs);
+  options: {
+    intervalMs?: number;
+    logger?: { error(message: string): void };
+  } = {},
+): { close(): Promise<void> } {
+  const logger = options.logger ?? console;
+  let closing = false;
+  let inFlight: Promise<void> | null = null;
+  const scan = () => {
+    if (closing || inFlight !== null) return;
+    const run = Promise.resolve()
+      .then(() => service.scan())
+      .then(() => undefined)
+      .catch(() => {
+        logger.error('Topic scheduler scan failed');
+      });
+    const tracked = run.finally(() => {
+      if (inFlight === tracked) inFlight = null;
+    });
+    inFlight = tracked;
+  };
+  scan();
+  const timer = setInterval(scan, options.intervalMs ?? 10 * 60 * 1_000);
   timer.unref();
-  return { close: () => clearInterval(timer) };
+  return {
+    close: () => {
+      closing = true;
+      clearInterval(timer);
+      return inFlight ?? Promise.resolve();
+    },
+  };
 }

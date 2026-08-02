@@ -94,12 +94,15 @@ interface FetchMockOptions {
   feed?: FeedItem[];
   item?: FeedItem;
   created?: Topic;
+  createdResponse?: Promise<Topic>;
+  createFailure?: boolean;
   sources?: DiscoverySourceStatus[];
   topicCompletionCount?: number;
   trendCompletionCount?: number;
   trendStatusFailures?: number;
   feedRefetchFailures?: number;
   topicCompletionAfterPolls?: number;
+  trendStatus?: TrendStatus;
 }
 
 function installFetchMock({
@@ -108,12 +111,15 @@ function installFetchMock({
   feed = [],
   item,
   created,
+  createdResponse,
+  createFailure = false,
   sources = [],
   topicCompletionCount = 0,
   trendCompletionCount = 0,
   trendStatusFailures: initialTrendStatusFailures = 0,
   feedRefetchFailures: initialFeedRefetchFailures = 0,
   topicCompletionAfterPolls = 1,
+  trendStatus: configuredTrendStatus = initialTrendStatus,
 }: FetchMockOptions = {}) {
   const refreshedTopicIds = new Set<string>();
   let currentTopics = initialTopics;
@@ -129,7 +135,12 @@ function installFetchMock({
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     requests.push({ url, method, body });
 
-    if (url.endsWith('/topics') && method === 'POST') return Response.json(created!, { status: 201 });
+    if (url.endsWith('/topics') && method === 'POST') {
+      if (createFailure) {
+        return Response.json({ code: 'CREATE_FAILED', message: 'Create failed', traceId: 'test' }, { status: 503 });
+      }
+      return Response.json(createdResponse ? await createdResponse : created!, { status: 201 });
+    }
     const topicRefreshMatch = url.match(/\/topics\/([^/]+)\/refresh$/);
     if (topicRefreshMatch && method === 'POST') {
       const topicRefreshId = decodeURIComponent(topicRefreshMatch[1] ?? '');
@@ -161,8 +172,8 @@ function installFetchMock({
         return Response.json({ code: 'TREND_STATUS_UNAVAILABLE', message: '趋势状态暂时不可用', traceId: 'test' }, { status: 503 });
       }
       return Response.json(trendRefreshStarted
-        ? { ...initialTrendStatus, lastRun: runSummary('done-trend', 'succeeded', trendCompletionCount) }
-        : initialTrendStatus);
+        ? { ...configuredTrendStatus, runStatus: 'succeeded', lastRun: runSummary('done-trend', 'succeeded', trendCompletionCount) }
+        : configuredTrendStatus);
     }
     if (url.endsWith('/discovery-sources')) return Response.json(sources);
     if (/\/items\/[^/?]+$/.test(url)) return Response.json(item!);
@@ -496,6 +507,51 @@ describe('discovery workspace', () => {
     expect(topicGetsAfterInterval - topicGetsBeforeInterval).toBe(1);
   });
 
+  it('restores a Topic row refresh indicator from queued server state', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent', runSummary('queued-manual', 'queued'))],
+    });
+    renderApp('/topics');
+
+    const refresh = await screen.findByRole('button', { name: /AI Agent$/ });
+    expect(refresh).toBeDisabled();
+    expect(refresh).toHaveAttribute('aria-busy', 'true');
+    expect(refresh.querySelector('svg')).toHaveClass('spin');
+  });
+
+  it('restores Feed refresh progress from running Topic server state', async () => {
+    installFetchMock({
+      topics: [topic('topic-1', 'AI Agent', runSummary('running-manual', 'running'))],
+      feed: [feedItem('existing', 'topic')],
+    });
+    renderApp('/');
+
+    await screen.findByRole('heading', { name: /existing/ });
+    const refresh = document.querySelector<HTMLButtonElement>('.page-header .refresh-button')!;
+    expect(refresh).toBeDisabled();
+    expect(refresh).toHaveAttribute('aria-busy', 'true');
+    expect(refresh.querySelector('svg')).toHaveClass('spin');
+  });
+
+  it('polls queued trend status until it becomes terminal', async () => {
+    vi.useFakeTimers();
+    installFetchMock({
+      trendStatus: {
+        ...initialTrendStatus,
+        runStatus: 'queued',
+        lastRun: runSummary('queued-trend', 'queued'),
+      },
+    });
+    renderApp('/');
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    const initialRequests = requests.filter(({ url }) => url.endsWith('/trends/status')).length;
+
+    await act(async () => vi.advanceTimersByTimeAsync(1_500));
+
+    expect(requests.filter(({ url }) => url.endsWith('/trends/status')).length)
+      .toBe(initialRequests + 1);
+  });
+
   it('keeps a Topic row locked on stale synchronization and retries it explicitly', async () => {
     installFetchMock({ topics: [topic('topic-1', 'AI Agent')], topicCompletionCount: 2 });
     const { client } = renderApp('/topics');
@@ -597,6 +653,38 @@ describe('discovery workspace', () => {
     expect(await screen.findByText('Hacker News')).toBeVisible();
     expect(screen.getByText('已启用')).toBeVisible();
     expect(screen.getByText('待配置')).toBeVisible();
+  });
+
+  it('shows immediate Topic creation progress before the API responds', async () => {
+    let resolveCreated!: (value: Topic) => void;
+    const createdResponse = new Promise<Topic>((resolve) => { resolveCreated = resolve; });
+    installFetchMock({ createdResponse });
+    renderApp('/topics');
+    await screen.findByText('尚未创建主题');
+
+    fireEvent.change(screen.getByLabelText('主题关键词'), { target: { value: 'Rust' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建主题' }));
+
+    const pending = screen.getByRole('status', { name: /Rust/ });
+    expect(pending).toBeVisible();
+    expect(pending.querySelector('svg')).toHaveClass('spin');
+    resolveCreated(topic('topic-created', 'Rust', runSummary('initial', 'queued')));
+    await waitFor(() => expect(screen.queryByRole('status', { name: /Rust/ })).not.toBeInTheDocument());
+    expect(screen.getByRole('heading', { name: 'Rust' })).toBeVisible();
+  });
+
+  it('removes failed creation progress and restores the submitted keyword', async () => {
+    installFetchMock({ createFailure: true });
+    renderApp('/topics');
+    await screen.findByText('尚未创建主题');
+
+    const input = screen.getByLabelText('主题关键词');
+    fireEvent.change(input, { target: { value: 'Rust' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建主题' }));
+
+    await waitFor(() => expect(screen.queryByRole('status', { name: /Rust/ })).not.toBeInTheDocument());
+    expect(input).toHaveValue('Rust');
+    expect(screen.getByText('Create failed')).toBeVisible();
   });
 
   it('defines stable refresh dimensions and a static reduced-motion state', () => {

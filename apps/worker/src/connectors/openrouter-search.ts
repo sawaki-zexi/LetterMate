@@ -59,15 +59,17 @@ export class OpenRouterSearchConnector implements SourceConnector {
             { role: 'system', content: 'Use web search to find substantive recent source pages. Return JSON only with a results array containing url, title, and excerpt. Copy URLs exactly from search sources. Do not infer publication dates.' },
             { role: 'user', content: JSON.stringify({ keyword: plan.keyword, queries: plan.queries, windowStart: plan.windowStart, windowEnd: plan.windowEnd }) },
           ],
-          plugins: [{ id: 'web' }], provider: { require_parameters: true },
-          response_format: { type: 'json_schema', json_schema: { name: 'web_search_results', strict: true,
-            schema: { type: 'object', properties: { results: { type: 'array', maxItems: 30, items: { type: 'object', properties: {
-              url: { type: 'string', format: 'uri' }, title: { type: 'string' }, excerpt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-            }, required: ['url', 'title', 'excerpt'], additionalProperties: false } } }, required: ['results'], additionalProperties: false } } },
+          plugins: [{ id: 'web' }],
+          provider: {
+            order: ['DeepSeek'], allow_fallbacks: false, require_parameters: true,
+          },
+          response_format: { type: 'json_object' },
         }),
       });
       if (response.status === 429) throw new ConnectorError('CONNECTOR_RATE_LIMITED', 'OpenRouter Web Search rate limit reached', true);
-      if ([401, 402, 403].includes(response.status)) throw new ConnectorError('CONNECTOR_AUTH_FAILED', 'OpenRouter credentials are unavailable', false);
+      if (response.status === 401) throw new ConnectorError('CONNECTOR_AUTH_FAILED', 'OpenRouter API Key 无效或已被撤销', false);
+      if (response.status === 402) throw new ConnectorError('CONNECTOR_AUTH_FAILED', 'OpenRouter 账户余额或额度不足', false);
+      if (response.status === 403) throw new ConnectorError('CONNECTOR_AUTH_FAILED', 'OpenRouter API Key 没有执行此请求的权限', false);
       if (!response.ok) throw new ConnectorError('CONNECTOR_UPSTREAM_UNAVAILABLE', 'OpenRouter Web Search is temporarily unavailable', response.status >= 500);
       let payload: unknown; try { payload = await response.json(); } catch { throw new ConnectorError('CONNECTOR_RESPONSE_INVALID', 'OpenRouter Web Search returned an invalid response', false); }
       const parsed = responseSchema.safeParse(payload); if (!parsed.success) throw new ConnectorError('CONNECTOR_RESPONSE_INVALID', 'OpenRouter Web Search returned an invalid response', false);
