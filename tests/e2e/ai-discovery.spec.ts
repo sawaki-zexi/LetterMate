@@ -4,6 +4,69 @@ import { randomUUID } from 'node:crypto';
 
 const forbiddenPublicLanguage = /可信|已核实|证据数量|已确认|待核实|已驳回|证据链|来源排名|评分|\b(?:trust|trusted|trustworthy|verified|confirmed|unverified|rejected|rank|ranking|score|scoring|rating)\b|\b(?:pending verification|evidence (?:chain|count)|source (?:rank|ranking))\b/iu;
 
+test('edits managed topic terms and preserves inactive feed history after deletion', async ({ page }, testInfo) => {
+  const keyword = `history-${randomUUID().slice(0, 8)}`;
+  const updatedKeyword = `${keyword}-updated`;
+  const userId = `e2e-management-${testInfo.project.name}-${randomUUID()}`;
+  const requestHeaders = { 'x-user-id': userId };
+  await page.route('**/api/v1/**', async (route) => route.continue({
+    headers: { ...route.request().headers(), 'x-user-id': userId },
+  }));
+
+  await page.goto('/topics');
+  await page.getByLabel('主题关键词').fill(keyword);
+  await page.getByRole('button', { name: '创建主题' }).click();
+  await expect(page.getByRole('heading', { name: keyword })).toBeVisible();
+  await expect.poll(async () => {
+    const response = await page.request.get('/api/v1/topics', { headers: requestHeaders });
+    const topics = await response.json() as Topic[];
+    return topics[0]?.runStatus;
+  }).toBe('succeeded');
+
+  const topicsResponse = await page.request.get('/api/v1/topics', { headers: requestHeaders });
+  const [createdTopic] = await topicsResponse.json() as Topic[];
+  if (!createdTopic) throw new Error('Created Topic response was empty');
+
+  await page.reload();
+  await page.getByRole('button', { name: `编辑 ${keyword} 关键词` }).click();
+  await page.getByLabel('主关键词').fill(updatedKeyword);
+  await page.getByLabel('扩展词 1').fill(`${updatedKeyword} release`);
+  await page.getByRole('button', { name: '添加扩展词' }).click();
+  const addedTerm = page.getByRole('textbox', {
+    name: `扩展词 ${createdTopic.expandedTerms.length + 1}`,
+    exact: true,
+  });
+  await addedTerm.fill(`${updatedKeyword} docs`);
+  const updateResponse = page.waitForResponse((response) => (
+    response.request().method() === 'PATCH'
+      && new URL(response.url()).pathname === `/api/v1/topics/${createdTopic.id}`
+  ));
+  await page.getByRole('button', { name: '保存' }).click();
+  expect((await updateResponse).ok()).toBe(true);
+  await expect(page.getByRole('heading', { name: updatedKeyword })).toBeVisible();
+  await expect(page.getByLabel('AI 扩展词').getByText(`${updatedKeyword} release`)).toBeVisible();
+  await expect(page.getByLabel('AI 扩展词').getByText(`${updatedKeyword} docs`)).toBeVisible();
+
+  await page.getByRole('link', { name: '发现' }).last().click();
+  await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` }).first()).toBeVisible();
+  await expect(page.getByText('关键词已失效').first()).toBeVisible();
+
+  await page.getByRole('link', { name: '主题' }).last().click();
+  await page.getByRole('button', { name: `删除 ${updatedKeyword} 关键词` }).click();
+  await expect(page.getByRole('dialog', { name: '删除关键词确认' })).toBeVisible();
+  const deleteResponse = page.waitForResponse((response) => (
+    response.request().method() === 'DELETE'
+      && new URL(response.url()).pathname === `/api/v1/topics/${createdTopic.id}`
+  ));
+  await page.getByRole('button', { name: '确认删除' }).click();
+  expect((await deleteResponse).ok()).toBe(true);
+  await expect(page.getByRole('heading', { name: updatedKeyword })).toHaveCount(0);
+
+  await page.getByRole('link', { name: '发现' }).last().click();
+  await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` }).first()).toBeVisible();
+  await expect(page.getByText('关键词已失效').first()).toBeVisible();
+});
+
 test('creates a precise topic and exercises the unified discovery lifecycle', async ({ page }, testInfo) => {
   const keyword = 'gpt-5.7';
   const userId = [
@@ -39,6 +102,12 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   expect(enqueuedTopics).toHaveLength(1);
   expect(['queued', 'running']).toContain(enqueuedTopics[0]?.runStatus);
   await expect(page.getByRole('heading', { name: keyword })).toBeVisible();
+  await expect.poll(async () => {
+    const response = await page.request.get('/api/v1/topics', { headers: requestHeaders });
+    const topics = await response.json() as Topic[];
+    return topics[0]?.runStatus;
+  }).toBe('succeeded');
+  await page.reload();
   const expandedTerms = page.getByLabel('AI 扩展词');
   await expect(expandedTerms.getByText('gpt-5.7', { exact: true })).toBeVisible();
   await expect(expandedTerms.getByText('gpt 5.7', { exact: true })).toBeVisible();
@@ -54,6 +123,16 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   const topicId = createdTopics[0]?.id;
   expect(topicId).toBeTruthy();
   if (!topicId) throw new Error('Created Topic response did not include an id');
+
+  const initialTrendRefresh = await page.request.post('/api/v1/trends/refresh', {
+    headers: requestHeaders,
+  });
+  expect(initialTrendRefresh.ok()).toBe(true);
+  await expect.poll(async () => {
+    const response = await page.request.get('/api/v1/trends/status', { headers: requestHeaders });
+    const status = await response.json() as TrendStatus;
+    return status.runStatus;
+  }).toBe('succeeded');
 
   await page.getByRole('link', { name: '发现' }).last().click();
   await expect(page.getByText('gpt-5.7 Agent 工程实践指南').first()).toBeVisible();
@@ -96,7 +175,7 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   expect(['queued', 'running']).toContain(enqueuedManualTopics[0]?.runStatus);
   expect(['queued', 'running']).toContain(enqueuedManualTrend.runStatus);
   const completion = page.getByLabel('刷新结果');
-  await expect(completion).toHaveText(/刷新完成，新增 \d+ 条内容/);
+  await expect(completion).toHaveText(/刷新完成，(?:新增 \d+ 条内容|暂无新增内容)/);
   await expect(refreshButton).toHaveAttribute('aria-busy', 'false');
 
   const topicsResponse = await page.request.get('/api/v1/topics', { headers: requestHeaders });
@@ -117,7 +196,9 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
     throw new Error('Both Topic and trend must expose one later succeeded manual run');
   }
   const persistedNewItemCount = topicManualRun.newItemCount + trendManualRun.newItemCount;
-  await expect(completion).toHaveText(`刷新完成，新增 ${persistedNewItemCount} 条内容`);
+  await expect(completion).toHaveText(persistedNewItemCount > 0
+    ? `刷新完成，新增 ${persistedNewItemCount} 条内容`
+    : '刷新完成，暂无新增内容');
 
   await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` }).first()).toBeVisible();
   await expect(page.locator('.origin-label', { hasText: '来自全网趋势' }).first()).toBeVisible();

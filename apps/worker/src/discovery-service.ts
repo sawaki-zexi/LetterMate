@@ -191,7 +191,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         runId: run.id,
         keyword: previous.keyword,
         expandedTerms: previous.expandedTerms,
-        initialExpansion: trigger === 'initial' && !previous.variantsInitialized,
+        initialExpansion: !previous.variantsInitialized,
       };
     });
   }
@@ -254,7 +254,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
       }
       const topicState = await transaction.topic.findFirst({
         where: { id: input.topicId },
-        select: { manualRefreshPending: true },
+        select: { manualRefreshPending: true, variantsInitialized: true, deletedAt: true },
       });
       const run = await transaction.discoveryRun.findUnique({
         where: { id: input.runId },
@@ -281,7 +281,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
       ).length;
 
       for (const { item, sourceUrls, canonicalPrimaryUrl } of normalizedItems) {
-        const data = {
+        const mutableData = {
           kind: item.kind,
           title: item.title,
           summary: item.summary,
@@ -294,14 +294,16 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
           authorHandle: item.authorHandle,
           externalId: item.externalId,
           provenanceKind: item.provenanceKind,
-          topicKeyword: run.keywordSnapshot,
         } as const;
         await transaction.discoveryItem.upsert({
           where: {
             topicId_canonicalPrimaryUrl: { topicId: input.topicId, canonicalPrimaryUrl },
           },
-          create: { topicId: input.topicId, canonicalPrimaryUrl, ...data },
-          update: data,
+          create: {
+            topicId: input.topicId, canonicalPrimaryUrl, topicKeyword: run.keywordSnapshot,
+            ...mutableData,
+          },
+          update: mutableData,
         });
       }
       await transaction.discoveryRun.update({
@@ -319,22 +321,25 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
       await transaction.topic.update({
         where: { id: input.topicId },
         data: {
-          ...(input.initializeVariants ? {
+          ...(input.initializeVariants && !topicState?.variantsInitialized ? {
             expandedTerms: unique(input.expandedTerms),
             variantsInitialized: true,
           } : {}),
-          runStatus: topicState?.manualRefreshPending ? 'queued' : 'succeeded',
-          queuedTrigger: topicState?.manualRefreshPending ? 'manual' : null,
+          runStatus: topicState?.deletedAt
+            ? 'failed'
+            : topicState?.manualRefreshPending ? 'queued' : 'succeeded',
+          queuedTrigger: !topicState?.deletedAt && topicState?.manualRefreshPending ? 'manual' : null,
+          ...(topicState?.deletedAt ? { nextRunAt: null } : {}),
           lastRunAt: input.finishedAt,
           lastError: Prisma.DbNull,
           activeRunId: null,
           runLeaseUntil: null,
-          ...(input.schedule ?? {}),
+          ...(!topicState?.deletedAt ? input.schedule ?? {} : {}),
         },
       });
       return {
         newItemCount,
-        pendingManualRefresh: topicState?.manualRefreshPending ?? false,
+        pendingManualRefresh: !topicState?.deletedAt && (topicState?.manualRefreshPending ?? false),
       };
     }, persistenceTransactionOptions(input.persistenceTimeoutMs));
   }

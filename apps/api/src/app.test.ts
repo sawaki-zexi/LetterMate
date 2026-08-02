@@ -22,6 +22,18 @@ class RecordingQueue implements TopicQueue {
   async close() {}
 }
 
+class FailOnceTopicQueue extends RecordingQueue {
+  private failed = false;
+
+  override async enqueue(data: DiscoveryJobData) {
+    if (!this.failed) {
+      this.failed = true;
+      throw new Error('Redis unavailable');
+    }
+    await super.enqueue(data);
+  }
+}
+
 class RecordingTrendQueue implements TrendQueue {
   jobs: Array<Extract<TrendJobData, { trigger: 'manual' }>> = [];
 
@@ -174,6 +186,36 @@ describe('AI discovery API', () => {
 
     expect(response.body).toMatchObject({ keyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'] });
     expect(queue.jobs).toContainEqual({ topicId: topic.id, userId: 'user-a', trigger: 'manual' });
+  });
+
+  it('compensates a failed update enqueue so the topic can be refreshed again', async () => {
+    const failingQueue = new FailOnceTopicQueue();
+    const localApp = await createApiApp({
+      store, queue: failingQueue, trendQueue, aiConfigured: true, discoverySources,
+    });
+    const topic = store.seedTopic('user-a', 'gpt-5.7');
+
+    await request(localApp.getHttpServer()).patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ keyword: 'gpt-5.8', expandedTerms: [] })
+      .expect(500);
+    await request(localApp.getHttpServer()).get('/api/v1/topics')
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body[0]).toMatchObject({
+        runStatus: 'failed',
+        lastError: {
+          code: 'TOPIC_QUEUE_UNAVAILABLE',
+          message: '发现任务暂时无法入队，请稍后重试',
+        },
+      }));
+    await request(localApp.getHttpServer()).post(`/api/v1/topics/${topic.id}/refresh`)
+      .set('x-user-id', 'user-a')
+      .expect(202);
+    expect(failingQueue.jobs).toContainEqual({
+      topicId: topic.id, userId: 'user-a', trigger: 'manual',
+    });
+    await localApp.close();
   });
 
   it('soft deletes owned topics while retaining historical feed items', async () => {

@@ -42,6 +42,7 @@ export interface TopicStore {
   createTopic(userId: string, keyword: string, normalizedKeyword: string): Promise<Topic>;
   updateTopic(userId: string, id: string, input: TopicUpdate): Promise<QueueRefreshResult | null>;
   deleteTopic(userId: string, id: string): Promise<boolean>;
+  compensateTopicRefresh(userId: string, id: string): Promise<boolean>;
   listTopics(userId: string): Promise<Topic[]>;
   findTopic(userId: string, id: string): Promise<Topic | null>;
   queueRefresh(userId: string, id: string): Promise<QueueRefreshResult | null>;
@@ -99,6 +100,10 @@ export interface TrendRefreshRegistration {
 }
 
 const TREND_QUEUE_REGISTRATION_MS = 20 * 60_000;
+const TOPIC_QUEUE_ERROR: SafeError = {
+  code: 'TOPIC_QUEUE_UNAVAILABLE',
+  message: '发现任务暂时无法入队，请稍后重试',
+};
 
 type TopicWithRuns = PrismaTopic & { runs?: PrismaDiscoveryRun[] };
 type TrendMonitorWithRuns = PrismaTrendMonitor & { runs?: PrismaTrendRun[] };
@@ -266,24 +271,19 @@ export class PrismaTopicStore implements TopicStore {
 
   async updateTopic(userId: string, id: string, input: TopicUpdate): Promise<QueueRefreshResult | null> {
     try {
-      const existing = await this.prisma.topic.findFirst({ where: { id, userId, deletedAt: null } });
-      if (!existing) return null;
-      const topic = await this.prisma.topic.update({
-        where: { id },
+      const updated = await this.prisma.topic.updateMany({
+        where: { id, userId, deletedAt: null },
         data: {
           keyword: input.keyword,
           normalizedKeyword: input.normalizedKeyword,
           expandedTerms: input.expandedTerms,
           variantsInitialized: true,
-          runStatus: 'succeeded',
-          queuedTrigger: null,
           nextRunAt: null,
           productiveRunStreak: 0,
           emptyRunStreak: 0,
         },
-        include: latestRunInclude,
       });
-      if (topic.userId !== userId || topic.deletedAt !== null) return null;
+      if (updated.count !== 1) return null;
       return this.queueRefresh(userId, id);
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
@@ -294,14 +294,33 @@ export class PrismaTopicStore implements TopicStore {
   }
 
   async deleteTopic(userId: string, id: string): Promise<boolean> {
-    const deleted = await this.prisma.topic.updateMany({
-      where: { id, userId, deletedAt: null },
-      data: {
-        deletedAt: new Date(), nextRunAt: null, runStatus: 'failed', queuedTrigger: null,
-        activeRunId: null, runLeaseUntil: null, manualRefreshPending: false,
-      },
+    return this.prisma.$transaction(async (transaction) => {
+      const deletedAt = new Date();
+      const active = await transaction.topic.updateMany({
+        where: { id, userId, deletedAt: null, activeRunId: { not: null } },
+        data: { deletedAt, nextRunAt: null, queuedTrigger: null, manualRefreshPending: false },
+      });
+      if (active.count === 1) return true;
+      const inactive = await transaction.topic.updateMany({
+        where: { id, userId, deletedAt: null, activeRunId: null },
+        data: {
+          deletedAt, nextRunAt: null, runStatus: 'failed', queuedTrigger: null,
+          runLeaseUntil: null, manualRefreshPending: false,
+        },
+      });
+      return inactive.count === 1;
     });
-    return deleted.count === 1;
+  }
+
+  async compensateTopicRefresh(userId: string, id: string): Promise<boolean> {
+    const compensated = await this.prisma.topic.updateMany({
+      where: {
+        id, userId, deletedAt: null, activeRunId: null,
+        runStatus: 'queued', queuedTrigger: { in: ['initial', 'manual'] },
+      },
+      data: { runStatus: 'failed', queuedTrigger: null, lastError: TOPIC_QUEUE_ERROR },
+    });
+    return compensated.count === 1;
   }
 
   async queueRefresh(userId: string, id: string): Promise<QueueRefreshResult | null> {
@@ -321,7 +340,7 @@ export class PrismaTopicStore implements TopicStore {
         });
         if (!topic) return null;
         if (pending.count === 1) {
-          return { topic: mapTopic(topic), shouldEnqueue: true };
+          return { topic: mapTopic(topic), shouldEnqueue: false };
         }
         if (topic.runStatus === 'running' || topic.runStatus === 'queued') {
           return { topic: mapTopic(topic), shouldEnqueue: false };
@@ -588,7 +607,7 @@ export class PrismaTopicStore implements TopicStore {
 
 export class MemoryTopicStore implements TopicStore {
   private readonly topics: Array<Topic & { deletedAt: string | null; variantsInitialized: boolean }> = [];
-  private readonly items: DiscoveryItem[] = [];
+  private readonly items: Array<DiscoveryItem & { topicKeyword: string }> = [];
   private readonly radarItems: Array<TrendFeedItem & { userId: string }> = [];
   private readonly pendingManualRefreshes = new Set<string>();
   private readonly trendMonitors = new Map<string, TrendStatus & {
@@ -613,7 +632,7 @@ export class MemoryTopicStore implements TopicStore {
       throw new TopicAlreadyExistsError();
     }
     const startedAt = this.now().toISOString();
-    const topic: Topic = {
+    const topic: Topic & { deletedAt: string | null; variantsInitialized: boolean } = {
       id: randomUUID(),
       userId,
       keyword,
@@ -655,7 +674,6 @@ export class MemoryTopicStore implements TopicStore {
     topic.keyword = input.keyword;
     topic.expandedTerms = input.expandedTerms;
     topic.variantsInitialized = true;
-    topic.runStatus = 'succeeded';
     topic.nextRunAt = null;
     topic.lastError = null;
     return this.queueRefresh(userId, id);
@@ -666,18 +684,29 @@ export class MemoryTopicStore implements TopicStore {
     if (!topic) return false;
     topic.deletedAt = this.now().toISOString();
     topic.nextRunAt = null;
+    if (topic.runStatus !== 'running') topic.runStatus = 'failed';
+    return true;
+  }
+
+  async compensateTopicRefresh(userId: string, id: string): Promise<boolean> {
+    const topic = this.topics.find((candidate) => (
+      candidate.userId === userId && candidate.id === id && candidate.deletedAt === null
+    ));
+    if (!topic || topic.runStatus !== 'queued') return false;
     topic.runStatus = 'failed';
+    topic.lastError = TOPIC_QUEUE_ERROR;
     return true;
   }
 
   async queueRefresh(userId: string, id: string): Promise<QueueRefreshResult | null> {
-    const topic = this.topics.find((candidate) => candidate.userId === userId && candidate.id === id);
+    const topic = this.topics.find((candidate) => (
+      candidate.userId === userId && candidate.id === id && candidate.deletedAt === null
+    ));
     if (!topic) return null;
     if (topic.runStatus === 'running') {
-      const shouldEnqueue = !this.pendingManualRefreshes.has(id);
       this.pendingManualRefreshes.add(id);
       topic.lastError = null;
-      return { topic: structuredClone(topic), shouldEnqueue };
+      return { topic: structuredClone(topic), shouldEnqueue: false };
     }
     if (topic.runStatus === 'queued') {
       if (
@@ -712,8 +741,8 @@ export class MemoryTopicStore implements TopicStore {
       .map((item) => {
         const topic = this.topics.find((candidate) => candidate.id === item.topicId);
         return topicFeedItemSchema.parse({
-          ...item, origin: 'topic', topicKeyword: (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword ?? topic?.keyword,
-          topicKeywordActive: topic?.deletedAt === null && topic.keyword === (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword,
+          ...item, origin: 'topic',
+          topicKeywordActive: topic?.deletedAt === null && topic.keyword === item.topicKeyword,
         });
       });
     const radarItems = filter.origin === 'topic' || filter.topicId ? [] : this.radarItems
@@ -734,8 +763,8 @@ export class MemoryTopicStore implements TopicStore {
       const topic = this.topics.find((candidate) => candidate.id === item.topicId);
       return ownsTopic
         ? structuredClone(topicFeedItemSchema.parse({
-            ...item, origin: 'topic', topicKeyword: (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword ?? topic?.keyword,
-            topicKeywordActive: topic?.deletedAt === null && topic.keyword === (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword,
+            ...item, origin: 'topic',
+            topicKeywordActive: topic?.deletedAt === null && topic.keyword === item.topicKeyword,
           }))
         : null;
     }

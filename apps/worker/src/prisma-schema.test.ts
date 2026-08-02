@@ -9,14 +9,14 @@ const modelSource = (modelName: string) => (
 );
 
 const fieldLine = (modelName: string, fieldName: string) => (
-  modelSource(modelName).match(new RegExp(`^  ${fieldName}\\s+([^\\n]+)$`, 'm'))?.[1] ?? ''
+  modelSource(modelName).match(new RegExp(`^ {2}${fieldName}\\s+([^\\n]+)$`, 'm'))?.[1] ?? ''
 );
 
 const fieldNames = (modelName: string) => (
-  [...modelSource(modelName).matchAll(/^  (\w+)\s+/gm)].map((match) => match[1])
+  [...modelSource(modelName).matchAll(/^ {2}(\w+)\s+/gm)].map((match) => match[1]!)
 );
 
-const modelNames = () => [...schema.matchAll(/^model (\w+) \{/gm)].map((match) => match[1]);
+const modelNames = () => [...schema.matchAll(/^model (\w+) \{/gm)].map((match) => match[1]!);
 
 const relation = (modelName: string, fieldName: string) => {
   const line = fieldLine(modelName, fieldName);
@@ -34,7 +34,7 @@ const relation = (modelName: string, fieldName: string) => {
 const uniqueConstraints = (modelName: string) => {
   return [
     ...[...modelSource(modelName).matchAll(/@@unique\(\[([^\]]+)\]\)/g)]
-      .map((match) => match[1].split(', ').map((field) => field.trim())),
+      .map((match) => match[1]!.split(', ').map((field) => field.trim())),
     ...fieldNames(modelName).filter((fieldName) => fieldLine(modelName, fieldName).includes('@unique'))
       .map((fieldName) => [fieldName]),
   ];

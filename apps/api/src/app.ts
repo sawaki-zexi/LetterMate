@@ -138,7 +138,12 @@ class ApiController {
         input.keyword,
         normalizeKeyword(input.keyword),
       );
-      await this.queue.enqueue({ topicId: topic.id, userId, trigger: 'initial' });
+      try {
+        await this.queue.enqueue({ topicId: topic.id, userId, trigger: 'initial' });
+      } catch (error) {
+        await this.store.compensateTopicRefresh(userId, topic.id);
+        throw error;
+      }
       return topic;
     } catch (error) {
       if (error instanceof TopicAlreadyExistsError) {
@@ -171,7 +176,12 @@ class ApiController {
       });
       if (!updated) throw new NotFoundException(errorBody('TOPIC_NOT_FOUND', '关键词不存在'));
       if (updated.shouldEnqueue) {
-        await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
+        try {
+          await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
+        } catch (error) {
+          await this.store.compensateTopicRefresh(userId, id);
+          throw error;
+        }
       }
       return updated.topic;
     } catch (error) {

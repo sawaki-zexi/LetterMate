@@ -55,6 +55,8 @@ LetterMate 将完整关键词追踪与自动技术趋势发现合并到一个 Fe
 - 核心事实支持门控、历史增量判断和多层去重。
 - `hot | quality` 分类、中文摘要、推荐理由和可回溯原始链接。
 - Topic 的 6/12/24 小时自适应调度与趋势监控持久化周期。
+- Topic 主关键词及扩展词可编辑、删除；AI 只在首次运行生成扩展词，之后完全由用户管理。
+- 修改或删除 Topic 不删除历史 Feed；历史卡片保留发现时关键词并显示“关键词已失效”。
 - 统一 Feed、来源/分类/时间筛选和自然日期分组。
 - 点击刷新与移动端下拉刷新，完成数量来自持久化运行摘要。
 - 桌面、平板、手机和 320px 紧凑视口支持。
@@ -190,6 +192,8 @@ npm run dev -w @lettermate/worker
 | --- | --- | --- |
 | `POST` | `/topics` | 创建完整关键词 Topic 并入队首次运行 |
 | `GET` | `/topics` | 获取 Topic、调度和最新运行摘要 |
+| `PATCH` | `/topics/:id` | 修改主关键词和用户管理的扩展词，并入队新关键词发现 |
+| `DELETE` | `/topics/:id` | 从活动列表软删除 Topic，保留历史 Feed |
 | `POST` | `/topics/:id/refresh` | 登记 Topic 手动刷新 |
 | `GET` | `/trends/status` | 获取趋势 Monitor 和最新运行摘要 |
 | `POST` | `/trends/refresh` | 登记趋势手动刷新 |

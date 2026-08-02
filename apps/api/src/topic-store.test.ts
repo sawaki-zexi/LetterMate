@@ -20,13 +20,14 @@ describe('topic store multi-source mappings', () => {
       keyword: 'GPT-5.8', normalizedKeyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'],
     });
     expect(updated).toMatchObject({
-      shouldEnqueue: true,
+      shouldEnqueue: false,
       topic: { id: original.id, keyword: 'GPT-5.8', expandedTerms: ['gpt 5.8'] },
     });
 
     expect(await store.deleteTopic('user-2', original.id)).toBe(false);
     expect(await store.deleteTopic('user-1', original.id)).toBe(true);
     expect(await store.listTopics('user-1')).toEqual([]);
+    expect(await store.queueRefresh('user-1', original.id)).toBeNull();
     expect(await store.listFeed('user-1', { origin: 'topic', since: null })).toEqual([
       expect.objectContaining({
         id: historicItem.id,
@@ -612,7 +613,7 @@ describe('topic store multi-source mappings', () => {
     const first = await store.queueRefresh('user-1', 'topic-1');
     const second = await store.queueRefresh('user-1', 'topic-1');
 
-    expect(first).toMatchObject({ shouldEnqueue: true, topic: { runStatus: 'running' } });
+    expect(first).toMatchObject({ shouldEnqueue: false, topic: { runStatus: 'running' } });
     expect(second).toMatchObject({ shouldEnqueue: false, topic: { runStatus: 'running' } });
     expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenNthCalledWith(1, {
       where: {

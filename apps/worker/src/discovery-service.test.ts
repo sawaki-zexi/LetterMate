@@ -26,6 +26,7 @@ const topicRow = {
   productiveRunStreak: 1,
   emptyRunStreak: 0,
   runStatus: 'succeeded' as const,
+  variantsInitialized: true,
   lastError: null,
 };
 
@@ -202,6 +203,9 @@ describe('PrismaDiscoveryRepository', () => {
 
   it('upserts source-aware items and completes a scheduled run', async () => {
     const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, manualRefreshPending: false, variantsInitialized: false, deletedAt: null,
+    });
     const repository = new PrismaDiscoveryRepository(prisma);
 
     const result = await repository.saveSuccess({
@@ -260,6 +264,8 @@ describe('PrismaDiscoveryRepository', () => {
         provenanceKind: 'api_record',
       }),
     });
+    expect(transaction.discoveryItem.upsert.mock.calls[0]?.[0].update)
+      .not.toHaveProperty('topicKeyword');
     expect(transaction.discoveryRun.update).toHaveBeenCalledWith({
       where: { id: 'run-1' },
       data: expect.objectContaining({
@@ -659,6 +665,58 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
       expect.any(Date),
     );
     expect(gateway.expandTopic).toHaveBeenCalledTimes(2);
+  });
+
+  it('performs the one-time expansion when an uninitialized topic is retried manually', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, variantsInitialized: false, activeRunId: null, runLeaseUntil: null,
+    });
+
+    const begun = await new PrismaDiscoveryRepository(prisma).beginRun(
+      'topic-1', 'manual', new Date('2026-07-27T09:00:00.000Z'),
+    );
+
+    expect(begun).toMatchObject({ initialExpansion: true });
+  });
+
+  it('does not overwrite user-managed variants when an initial run finishes', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, manualRefreshPending: true, variantsInitialized: true, deletedAt: null,
+    });
+
+    await new PrismaDiscoveryRepository(prisma).saveSuccess({
+      runId: 'run-1', topicId: 'topic-1', trigger: 'initial', expandedTerms: ['ai generated'],
+      initializeVariants: true, items: [], connectorSummary: {
+        successfulConnectorIds: ['rss'], skippedConnectorIds: [], failures: [],
+      }, candidateCount: 0, acceptedCount: 0, finishedAt, persistenceTimeoutMs: 12_345,
+    });
+
+    const topicUpdate = transaction.topic.update.mock.calls.at(-1)?.[0].data;
+    expect(topicUpdate).not.toHaveProperty('expandedTerms');
+    expect(topicUpdate).not.toHaveProperty('variantsInitialized');
+    expect(topicUpdate).toMatchObject({ runStatus: 'queued', queuedTrigger: 'manual' });
+  });
+
+  it('persists accepted items but does not reactivate a topic deleted during its run', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, manualRefreshPending: false, variantsInitialized: true, deletedAt: finishedAt,
+    });
+
+    const result = await new PrismaDiscoveryRepository(prisma).saveSuccess({
+      runId: 'run-1', topicId: 'topic-1', trigger: 'manual', expandedTerms: [],
+      initializeVariants: false, items: [item], connectorSummary: {
+        successfulConnectorIds: ['rss'], skippedConnectorIds: [], failures: [],
+      }, candidateCount: 1, acceptedCount: 1, finishedAt, persistenceTimeoutMs: 12_345,
+    });
+
+    expect(result).toEqual({ newItemCount: 1, pendingManualRefresh: false });
+    expect(transaction.discoveryItem.upsert).toHaveBeenCalledOnce();
+    expect(transaction.topic.update.mock.calls.at(-1)?.[0].data).toMatchObject({
+      runStatus: 'failed', queuedTrigger: null, nextRunAt: null,
+    });
   });
 
   it('uses the frozen user-managed variants without asking AI to expand again', async () => {
