@@ -419,11 +419,22 @@ function TopicRow({
       <div className="topic-editor">
         <label>主关键词<input value={draftKeyword} maxLength={100} onChange={(event) => setDraftKeyword(event.target.value)} /></label>
         <div className="variant-editor" aria-label="扩展词">
-          {draftTerms.map((term, index) => <div className="variant-editor__row" key={`${index}-${term}`}>
-            <input aria-label={`扩展词 ${index + 1}`} value={term} maxLength={100} onChange={(event) => setDraftTerms((current) => current.map((value, itemIndex) => itemIndex === index ? event.target.value : value))} />
-            <button className="icon-button" type="button" aria-label={`删除 ${term || `扩展词 ${index + 1}`}`} onClick={() => setDraftTerms((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={16} /></button>
-          </div>)}
-          <button className="text-button" type="button" onClick={() => setDraftTerms((current) => [...current, ''])}><Plus size={16} />添加扩展词</button>
+          <div className="variant-editor__chips">
+            {draftTerms.map((term, index) => <div className="variant-chip" key={index}>
+              <input
+                autoFocus={index === draftTerms.length - 1 && !term}
+                aria-label={`扩展词 ${index + 1}`}
+                value={term}
+                maxLength={100}
+                size={Math.max(4, term.length)}
+                onChange={(event) => setDraftTerms((current) => current.map((value, itemIndex) => itemIndex === index ? event.target.value : value))}
+              />
+              <button className="variant-chip__remove" type="button" aria-label={`删除 ${term || `扩展词 ${index + 1}`}`} onClick={() => setDraftTerms((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>
+            </div>)}
+            <button className="text-button variant-editor__add" type="button" onClick={() => {
+              setDraftTerms((current) => [...current, '']);
+            }}><Plus size={16} />添加扩展词</button>
+          </div>
         </div>
         {error && <p className="inline-error"><AlertCircle size={15} />{error}</p>}
         <div className="topic-editor__actions">
