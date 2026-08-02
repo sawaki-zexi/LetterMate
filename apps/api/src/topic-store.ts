@@ -157,12 +157,12 @@ function mapItem(item: PrismaDiscoveryItem): DiscoveryItem {
   });
 }
 
-function mapTopicFeedItem(item: PrismaDiscoveryItem & { topic?: { deletedAt: Date | null } }): FeedItem {
+function mapTopicFeedItem(item: PrismaDiscoveryItem & { topic?: { deletedAt: Date | null; keyword: string } }): FeedItem {
   return topicFeedItemSchema.parse({
     ...mapItem(item),
     origin: 'topic',
     topicKeyword: item.topicKeyword,
-    topicKeywordActive: item.topic?.deletedAt === null,
+    topicKeywordActive: item.topic?.deletedAt === null && item.topic.keyword === item.topicKeyword,
   });
 }
 
@@ -376,7 +376,7 @@ export class PrismaTopicStore implements TopicStore {
               ...(filter.topicId ? { id: filter.topicId } : {}),
             },
           },
-          include: { topic: { select: { deletedAt: true } } },
+          include: { topic: { select: { deletedAt: true, keyword: true } } },
           orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
         });
     const radarPromise = filter.origin === 'topic' || filter.topicId
@@ -399,7 +399,7 @@ export class PrismaTopicStore implements TopicStore {
   async findItem(userId: string, id: string): Promise<FeedItem | null> {
     const item = await this.prisma.discoveryItem.findFirst({
       where: { id, topic: { userId } },
-      include: { topic: { select: { deletedAt: true } } },
+      include: { topic: { select: { deletedAt: true, keyword: true } } },
     });
     if (item) return mapTopicFeedItem(item);
     const radar = await this.prisma.radarItem.findFirst({ where: { id, userId } });
@@ -713,7 +713,7 @@ export class MemoryTopicStore implements TopicStore {
         const topic = this.topics.find((candidate) => candidate.id === item.topicId);
         return topicFeedItemSchema.parse({
           ...item, origin: 'topic', topicKeyword: (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword ?? topic?.keyword,
-          topicKeywordActive: topic?.deletedAt === null,
+          topicKeywordActive: topic?.deletedAt === null && topic.keyword === (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword,
         });
       });
     const radarItems = filter.origin === 'topic' || filter.topicId ? [] : this.radarItems
@@ -735,7 +735,7 @@ export class MemoryTopicStore implements TopicStore {
       return ownsTopic
         ? structuredClone(topicFeedItemSchema.parse({
             ...item, origin: 'topic', topicKeyword: (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword ?? topic?.keyword,
-            topicKeywordActive: topic?.deletedAt === null,
+            topicKeywordActive: topic?.deletedAt === null && topic.keyword === (item as DiscoveryItem & { topicKeyword?: string }).topicKeyword,
           }))
         : null;
     }
