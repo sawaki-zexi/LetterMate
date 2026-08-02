@@ -28,7 +28,7 @@ import type { DynamicModule, INestApplication, NestModule, OnModuleDestroy } fro
 import { NestFactory } from '@nestjs/core';
 import { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
-import { z } from 'zod';
+import type { z } from 'zod';
 import {
   MemoryTopicStore,
   PrismaTopicStore,
