@@ -233,6 +233,48 @@ describe('AI discovery API', () => {
       .expect(200).expect(({ body }) => expect(body).toMatchObject({ topicKeywordActive: false }));
   });
 
+  it('returns Topic keyword snapshots and lifecycle state in Feed responses', async () => {
+    const topic = store.seedTopic('user-a', 'AI Agent');
+    store.seedItem(topic.id, 'quality');
+
+    const active = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(active.body[0]).toMatchObject({
+      origin: 'topic',
+      topicKeyword: 'AI Agent',
+      topicKeywordActive: true,
+    });
+
+    await request(app.getHttpServer())
+      .patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ keyword: 'Agent Framework', expandedTerms: [] })
+      .expect(200);
+    const renamed = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(renamed.body[0]).toMatchObject({
+      topicKeyword: 'AI Agent',
+      topicKeywordActive: false,
+    });
+
+    await request(app.getHttpServer())
+      .delete(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(204);
+    const deleted = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(deleted.body[0]).toMatchObject({
+      topicKeyword: 'AI Agent',
+      topicKeywordActive: false,
+    });
+  });
+
   it('hides topic update and deletion across ownership boundaries', async () => {
     const topic = store.seedTopic('user-b', 'Private');
     await request(app.getHttpServer()).patch(`/api/v1/topics/${topic.id}`)

@@ -138,6 +138,7 @@ describe('topic store multi-source mappings', () => {
           externalId: '100',
           provenanceKind: 'api_record',
           topicKeyword: 'Project',
+          topic: { deletedAt: null, keyword: 'Project' },
         }]),
       },
       radarItem: { findMany: vi.fn().mockResolvedValue([]) },
@@ -155,6 +156,8 @@ describe('topic store multi-source mappings', () => {
       externalId: '100',
       provenanceKind: 'api_record',
       origin: 'topic',
+      topicKeyword: 'Project',
+      topicKeywordActive: true,
     });
   });
 
