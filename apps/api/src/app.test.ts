@@ -163,6 +163,42 @@ describe('AI discovery API', () => {
     });
   });
 
+  it('updates owned topic keywords and variants and enqueues discovery', async () => {
+    const topic = store.seedTopic('user-a', 'gpt-5.7');
+
+    const response = await request(app.getHttpServer())
+      .patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ keyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'] })
+      .expect(200);
+
+    expect(response.body).toMatchObject({ keyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'] });
+    expect(queue.jobs).toContainEqual({ topicId: topic.id, userId: 'user-a', trigger: 'manual' });
+  });
+
+  it('soft deletes owned topics while retaining historical feed items', async () => {
+    const topic = store.seedTopic('user-a', 'gpt-5.7');
+    const item = store.seedItem(topic.id, 'quality');
+
+    await request(app.getHttpServer())
+      .delete(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(204);
+
+    await request(app.getHttpServer()).get('/api/v1/topics').set('x-user-id', 'user-a')
+      .expect(200, []);
+    await request(app.getHttpServer()).get(`/api/v1/items/${item.id}`).set('x-user-id', 'user-a')
+      .expect(200).expect(({ body }) => expect(body).toMatchObject({ topicKeywordActive: false }));
+  });
+
+  it('hides topic update and deletion across ownership boundaries', async () => {
+    const topic = store.seedTopic('user-b', 'Private');
+    await request(app.getHttpServer()).patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a').send({ keyword: 'Changed', expandedTerms: [] }).expect(404);
+    await request(app.getHttpServer()).delete(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a').expect(404);
+  });
+
   it('isolates feed and item details by user', async () => {
     const topic = store.seedTopic('user-b', 'Private');
     const item = store.seedItem(topic.id, 'quality');
