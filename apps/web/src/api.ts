@@ -6,9 +6,11 @@ import {
   feedOriginSchema,
   feedRangeSchema,
   topicInputSchema,
+  topicUpdateInputSchema,
   topicSchema,
   trendStatusSchema,
   type TopicInput,
+  type TopicUpdateInput,
 } from '@lettermate/contracts';
 import { z } from 'zod';
 
@@ -70,12 +72,29 @@ async function apiRequest<T>(
   return schema.parse(await response.json());
 }
 
+async function apiDelete(path: string): Promise<void> {
+  const response = await fetch(`/api/v1${path}`, { method: 'DELETE', headers });
+  if (!response.ok) {
+    const raw = await response.json().catch(() => null);
+    const parsed = apiErrorSchema.safeParse(raw);
+    throw parsed.success
+      ? new ApiError(parsed.data.code, parsed.data.message, response.status)
+      : new ApiError('HTTP_ERROR', `请求失败 (${response.status})`, response.status);
+  }
+}
+
 export const api = {
   topics: () => apiRequest('/topics', z.array(topicSchema)),
   createTopic: (input: TopicInput) => apiRequest('/topics', topicSchema, {
     method: 'POST',
     body: JSON.stringify(topicInputSchema.parse(input)),
   }),
+  updateTopic: (id: string, input: TopicUpdateInput) => apiRequest(
+    `/topics/${encodeURIComponent(id)}`,
+    topicSchema,
+    { method: 'PATCH', body: JSON.stringify(topicUpdateInputSchema.parse(input)) },
+  ),
+  deleteTopic: (id: string) => apiDelete(`/topics/${encodeURIComponent(id)}`),
   refreshTopic: (id: string) => apiRequest(`/topics/${encodeURIComponent(id)}/refresh`, topicSchema, { method: 'POST' }),
   feed: (filter: FeedFilter = {}) => {
     const parsed = feedFilterSchema.parse(filter);

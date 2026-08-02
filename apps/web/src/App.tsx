@@ -17,8 +17,12 @@ import {
   Menu,
   Newspaper,
   Plus,
+  Pencil,
   RefreshCw,
+  Save,
   Search,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { useEffect, useState, type CSSProperties } from 'react';
 import { NavLink, Route, Routes, useParams } from 'react-router-dom';
@@ -286,9 +290,6 @@ function FeedPage() {
     onRefresh: async () => { await refresh.startRefresh(); },
   });
   const groups = groupFeedItems(feed.data ?? []);
-  const topicKeywordById = new Map(
-    (topics.data ?? []).map((topic) => [topic.id, topic.keyword]),
-  );
 
   useEffect(() => {
     if (topicId && topics.data && !hasSelectedTopic) setSourceSelection('all');
@@ -367,14 +368,10 @@ function FeedPage() {
             <h2>{group.label}</h2>
             <div className="discovery-list">
               {group.items.map((item) => {
-                const topicKeyword = item.origin === 'topic'
-                  ? topicKeywordById.get(item.topicId)
-                  : undefined;
                 return (
                   <DiscoveryCard
                     key={item.id}
                     item={item}
-                    {...(topicKeyword ? { topicKeyword } : {})}
                     detailHref={`/items/${item.id}`}
                     headingLevel={3}
                   />
@@ -392,11 +389,50 @@ function TopicRow({
   topic,
   pending,
   onRefresh,
+  onUpdate,
+  onDelete,
 }: {
   topic: Topic;
   pending: boolean;
   onRefresh: () => void;
+  onUpdate: (input: { keyword: string; expandedTerms: string[] }) => Promise<void>;
+  onDelete: () => Promise<void>;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [draftKeyword, setDraftKeyword] = useState(topic.keyword);
+  const [draftTerms, setDraftTerms] = useState(topic.expandedTerms);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const save = async () => {
+    if (!draftKeyword.trim() || saving) return;
+    setSaving(true); setError(null);
+    try {
+      await onUpdate({ keyword: draftKeyword.trim(), expandedTerms: draftTerms.map((term) => term.trim()).filter(Boolean) });
+      setEditing(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '保存失败');
+    } finally { setSaving(false); }
+  };
+  if (editing) return (
+    <article className="topic-row topic-row--editing">
+      <div className="topic-editor">
+        <label>主关键词<input value={draftKeyword} maxLength={100} onChange={(event) => setDraftKeyword(event.target.value)} /></label>
+        <div className="variant-editor" aria-label="扩展词">
+          {draftTerms.map((term, index) => <div className="variant-editor__row" key={`${index}-${term}`}>
+            <input aria-label={`扩展词 ${index + 1}`} value={term} maxLength={100} onChange={(event) => setDraftTerms((current) => current.map((value, itemIndex) => itemIndex === index ? event.target.value : value))} />
+            <button className="icon-button" type="button" aria-label={`删除 ${term || `扩展词 ${index + 1}`}`} onClick={() => setDraftTerms((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={16} /></button>
+          </div>)}
+          <button className="text-button" type="button" onClick={() => setDraftTerms((current) => [...current, ''])}><Plus size={16} />添加扩展词</button>
+        </div>
+        {error && <p className="inline-error"><AlertCircle size={15} />{error}</p>}
+        <div className="topic-editor__actions">
+          <button className="button" type="button" disabled={saving || !draftKeyword.trim()} onClick={() => void save()}><Save size={16} />保存</button>
+          <button className="text-button" type="button" disabled={saving} onClick={() => setEditing(false)}><X size={16} />取消</button>
+        </div>
+      </div>
+    </article>
+  );
   return (
     <article className="topic-row">
       <div className="topic-row__main">
@@ -407,7 +443,7 @@ function TopicRow({
         {topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term) => <span key={term}>{term}</span>)}</div>}
         {topic.lastError && <p className="inline-error"><AlertCircle size={15} />{topic.lastError.message}</p>}
       </div>
-      <button
+      <div className="topic-row__actions"><button
         className="icon-button refresh-button"
         title="重新搜索"
         aria-label={`刷新 ${topic.keyword}`}
@@ -415,6 +451,13 @@ function TopicRow({
         disabled={pending}
         onClick={onRefresh}
       ><RefreshCw className={pending ? 'spin' : undefined} size={17} /></button>
+      <button className="icon-button" title="编辑" aria-label={`编辑 ${topic.keyword} 关键词`} onClick={() => { setDraftKeyword(topic.keyword); setDraftTerms(topic.expandedTerms); setEditing(true); }}><Pencil size={17} /></button>
+      <button className="icon-button icon-button--danger" title="删除" aria-label={`删除 ${topic.keyword} 关键词`} onClick={() => setConfirmingDelete(true)}><Trash2 size={17} /></button></div>
+      {confirmingDelete && <div className="dialog-backdrop"><div className="confirm-dialog" role="dialog" aria-modal="true" aria-label="删除关键词确认">
+        <h3>删除“{topic.keyword}”？</h3><p>关键词将从列表移除，历史内容仍会保留并标记为失效。</p>
+        {error && <p className="inline-error">{error}</p>}
+        <div><button className="text-button" onClick={() => setConfirmingDelete(false)}>取消</button><button className="button button--danger" autoFocus disabled={saving} onClick={() => { setSaving(true); setError(null); void onDelete().catch((cause) => setError(cause instanceof Error ? cause.message : '删除失败')).finally(() => setSaving(false)); }}>确认删除</button></div>
+      </div></div>}
     </article>
   );
 }
@@ -467,6 +510,20 @@ function TopicsPage() {
       setKeyword((current) => current || input.keyword);
     },
   });
+  const update = useMutation({
+    mutationFn: ({ id, input }: { id: string; input: { keyword: string; expandedTerms: string[] } }) => api.updateTopic(id, input),
+    onSuccess: (topic) => {
+      client.setQueryData<Topic[]>(['topics'], (current = []) => current.map((item) => item.id === topic.id ? topic : item));
+      void client.invalidateQueries({ queryKey: ['feed'] });
+    },
+  });
+  const remove = useMutation({
+    mutationFn: api.deleteTopic,
+    onSuccess: (_result, id) => {
+      client.setQueryData<Topic[]>(['topics'], (current = []) => current.filter((item) => item.id !== id));
+      void client.invalidateQueries({ queryKey: ['feed'] });
+    },
+  });
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     const submittedKeyword = keyword.trim();
@@ -497,6 +554,8 @@ function TopicsPage() {
           topic={topic}
           pending={refresh.pendingTopicIds.includes(topic.id) || isRunActive(topic.runStatus)}
           onRefresh={() => void refresh.startTopicRefresh(topic.id)}
+          onUpdate={(input) => update.mutateAsync({ id: topic.id, input }).then(() => undefined)}
+          onDelete={() => remove.mutateAsync(topic.id)}
         />)}
         {topics.data?.length === 0 && !pendingKeyword && <div className="state"><Search />尚未创建主题</div>}
       </div>

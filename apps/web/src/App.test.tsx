@@ -74,7 +74,7 @@ function feedItem(
     provenanceKind: 'api_record' as const,
   };
   return origin === 'topic'
-    ? { ...common, origin, topicId }
+    ? { ...common, origin, topicId, topicKeyword: 'gpt-5.7', topicKeywordActive: true }
     : { ...common, origin, topicId: null };
 }
 
