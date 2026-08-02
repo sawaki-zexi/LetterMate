@@ -108,7 +108,9 @@ describe('PrismaDiscoveryRepository', () => {
 
     const runId = await repository.beginRun('topic-1', 'scheduled', startedAt);
 
-    expect(runId).toBe('run-1');
+    expect(runId).toMatchObject({
+      runId: 'run-1', keyword: 'AI Agent', expandedTerms: ['agent'], initialExpansion: false,
+    });
     expect(transaction.discoveryRun.create).toHaveBeenCalledWith({
       data: {
         id: expect.any(String),
@@ -172,7 +174,9 @@ describe('PrismaDiscoveryRepository', () => {
       startedAt,
     );
 
-    expect(runId).toBe('run-1');
+    expect(runId).toMatchObject({
+      runId: 'run-1', keyword: 'AI Agent', expandedTerms: ['agent'], initialExpansion: false,
+    });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
         id: 'topic-1', deletedAt: null,
@@ -205,6 +209,7 @@ describe('PrismaDiscoveryRepository', () => {
       topicId: 'topic-1',
       trigger: 'scheduled',
       expandedTerms: ['agent', 'agent'],
+      initializeVariants: true,
       items: [item],
       connectorSummary: {
         successfulConnectorIds: ['twitterapi-io'],
@@ -654,6 +659,24 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
       expect.any(Date),
     );
     expect(gateway.expandTopic).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the frozen user-managed variants without asking AI to expand again', async () => {
+    const { service, repository, gateway, router } = createOrchestration();
+    repository.beginRun.mockResolvedValue({
+      runId: 'run-1',
+      keyword: 'AI Agent',
+      expandedTerms: [],
+      initialExpansion: false,
+    });
+
+    await service.run('topic-1', 'user-1', 'scheduled');
+
+    expect(gateway.expandTopic).not.toHaveBeenCalled();
+    expect(router.route).toHaveBeenCalledWith(expect.objectContaining({
+      keyword: 'AI Agent',
+      expanded: { terms: [], searchQueries: [] },
+    }));
   });
 
   it('fails safely when every selected connector fails', async () => {

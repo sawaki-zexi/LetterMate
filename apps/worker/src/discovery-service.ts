@@ -33,6 +33,7 @@ export interface SaveSuccessInput {
   topicId: string;
   trigger: DiscoveryTrigger;
   expandedTerms: string[];
+  initializeVariants?: boolean;
   items: DiscoveryCandidate[];
   connectorSummary: SafeConnectorRunSummary;
   candidateCount: number;
@@ -40,6 +41,13 @@ export interface SaveSuccessInput {
   finishedAt: Date;
   persistenceTimeoutMs: number;
   schedule?: TopicScheduleUpdate;
+}
+
+export interface BegunDiscoveryRun {
+  runId: string;
+  keyword: string;
+  expandedTerms: string[];
+  initialExpansion: boolean;
 }
 
 export interface SaveFailureInput {
@@ -54,7 +62,7 @@ export interface SaveFailureInput {
 
 export interface DiscoveryRepository {
   findOwnedTopic(topicId: string, userId: string): Promise<Topic | null>;
-  beginRun(topicId: string, trigger: DiscoveryTrigger, startedAt: Date): Promise<string | null>;
+  beginRun(topicId: string, trigger: DiscoveryTrigger, startedAt: Date): Promise<BegunDiscoveryRun | string | null>;
   listHistoryUrls(topicId: string): Promise<string[]>;
   getScheduleState(topicId: string): Promise<TopicScheduleState>;
   saveSuccess(input: SaveSuccessInput): Promise<{
@@ -126,11 +134,11 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
     topicId: string,
     trigger: DiscoveryTrigger,
     startedAt: Date,
-  ): Promise<string | null> {
+  ): Promise<BegunDiscoveryRun | null> {
     return this.prisma.$transaction(async (transaction) => {
       const previous = await transaction.topic.findFirst({
         where: { id: topicId, deletedAt: null },
-        select: { activeRunId: true, runStatus: true, runLeaseUntil: true, keyword: true, expandedTerms: true },
+        select: { activeRunId: true, runStatus: true, runLeaseUntil: true, keyword: true, expandedTerms: true, variantsInitialized: true },
       });
       if (!previous) return null;
       const runId = randomUUID();
@@ -179,7 +187,12 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         },
         select: { id: true },
       });
-      return run.id;
+      return {
+        runId: run.id,
+        keyword: previous.keyword,
+        expandedTerms: previous.expandedTerms,
+        initialExpansion: trigger === 'initial' && !previous.variantsInitialized,
+      };
     });
   }
 
@@ -306,7 +319,10 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
       await transaction.topic.update({
         where: { id: input.topicId },
         data: {
-          expandedTerms: unique(input.expandedTerms),
+          ...(input.initializeVariants ? {
+            expandedTerms: unique(input.expandedTerms),
+            variantsInitialized: true,
+          } : {}),
           runStatus: topicState?.manualRefreshPending ? 'queued' : 'succeeded',
           queuedTrigger: topicState?.manualRefreshPending ? 'manual' : null,
           lastRunAt: input.finishedAt,
@@ -446,24 +462,27 @@ export class TopicDiscoveryService {
     if (!topic) return;
 
     const startedAt = this.now();
-    const runId = await this.repository.beginRun(topicId, trigger, startedAt);
-    if (runId === null) return;
+    const claim = await this.repository.beginRun(topicId, trigger, startedAt);
+    if (claim === null) return;
+    const begun: BegunDiscoveryRun = typeof claim === 'string'
+      ? { runId: claim, keyword: topic.keyword, expandedTerms: topic.expandedTerms, initialExpansion: true }
+      : claim;
+    const { runId } = begun;
     const controller = new AbortController();
     const deadlineAt = Date.now() + this.timeoutMs;
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     let pendingManualRefresh = false;
     try {
-      buildKeywordPolicy(topic.keyword);
-      const expanded = await this.gateway.expandTopic({
-        keyword: topic.keyword,
-        signal: controller.signal,
-      });
+      buildKeywordPolicy(begun.keyword);
+      const expanded = begun.initialExpansion
+        ? await this.gateway.expandTopic({ keyword: begun.keyword, signal: controller.signal })
+        : { terms: begun.expandedTerms, searchQueries: begun.expandedTerms };
       this.throwIfTimedOut(controller.signal, deadlineAt);
       const expandedTerms = unique([...expanded.terms, ...expanded.searchQueries]);
       const windowEnd = this.now();
       const windowStart = new Date(windowEnd.getTime() - 7 * 24 * 60 * 60 * 1_000);
       const plan = this.router.route({
-        keyword: topic.keyword,
+        keyword: begun.keyword,
         windowStart: windowStart.toISOString(),
         windowEnd: windowEnd.toISOString(),
         expanded,
@@ -484,7 +503,7 @@ export class TopicDiscoveryService {
         );
       }
       const items = await this.qualityPipeline.run({
-        keyword: topic.keyword,
+        keyword: begun.keyword,
         matchPolicy: plan.matchPolicy,
         candidates: connectorResult.candidates,
         historyUrls,
@@ -514,6 +533,7 @@ export class TopicDiscoveryService {
         topicId,
         trigger,
         expandedTerms,
+        initializeVariants: begun.initialExpansion,
         items,
         connectorSummary: {
           successfulConnectorIds: connectorResult.successfulConnectorIds,
