@@ -30,6 +30,13 @@ import {
 } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
+import {
+  buildTopicRankQuery,
+  buildTrendRankQuery,
+  memorySearchRelevance,
+  sortRankedFeed,
+  type RankedId,
+} from './feed-search.js';
 
 export class TopicAlreadyExistsError extends Error {
   constructor() {
@@ -66,6 +73,7 @@ export interface FeedStoreFilter {
   kind?: DiscoveryKind;
   since: Date | null;
   origin: FeedOrigin;
+  query?: string;
 }
 
 export interface QueueRefreshResult {
@@ -312,6 +320,56 @@ export class PrismaTopicStore implements TopicStore {
         { publishedAt: null, discoveredAt: { gte: filter.since } },
       ],
     } : {};
+    if (filter.query) {
+      const searchFilter = { ...filter, query: filter.query };
+      const topicRankPromise = filter.origin === 'trend'
+        ? Promise.resolve([] as RankedId[])
+        : this.prisma.$queryRaw<RankedId[]>(buildTopicRankQuery(userId, searchFilter));
+      const radarRankPromise = filter.origin === 'topic' || filter.topicId
+        ? Promise.resolve([] as RankedId[])
+        : this.prisma.$queryRaw<RankedId[]>(buildTrendRankQuery(userId, searchFilter));
+      const [topicRanks, radarRanks] = await Promise.all([
+        topicRankPromise,
+        radarRankPromise,
+      ]);
+      const topicRankById = new Map(topicRanks.map((rank) => [rank.id, rank.relevance]));
+      const radarRankById = new Map(radarRanks.map((rank) => [rank.id, rank.relevance]));
+      const [topicItems, radarItems] = await Promise.all([
+        topicRanks.length === 0
+          ? Promise.resolve([] as PrismaDiscoveryItem[])
+          : this.prisma.discoveryItem.findMany({
+              where: {
+                id: { in: topicRanks.map(({ id }) => id) },
+                ...(filter.kind ? { kind: filter.kind } : {}),
+                ...timeWhere,
+                topic: {
+                  userId,
+                  ...(filter.topicId ? { id: filter.topicId } : {}),
+                },
+              },
+            }),
+        radarRanks.length === 0
+          ? Promise.resolve([] as PrismaRadarItem[])
+          : this.prisma.radarItem.findMany({
+              where: {
+                id: { in: radarRanks.map(({ id }) => id) },
+                userId,
+                ...(filter.kind ? { kind: filter.kind } : {}),
+                ...timeWhere,
+              },
+            }),
+      ]);
+      return sortRankedFeed([
+        ...topicItems.map((item) => ({
+          item: mapTopicFeedItem(item),
+          relevance: topicRankById.get(item.id) ?? 0,
+        })),
+        ...radarItems.map((item) => ({
+          item: mapRadarFeedItem(item),
+          relevance: radarRankById.get(item.id) ?? 0,
+        })),
+      ]);
+    }
     const topicPromise = filter.origin === 'trend'
       ? Promise.resolve([] as PrismaDiscoveryItem[])
       : this.prisma.discoveryItem.findMany({
@@ -635,6 +693,12 @@ export class MemoryTopicStore implements TopicStore {
         (!filter.kind || item.kind === filter.kind) &&
         (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()))
       .map(({ userId: _userId, ...item }) => trendFeedItemSchema.parse(item));
+    if (filter.query) {
+      return sortRankedFeed([...topicItems, ...radarItems].flatMap((item) => {
+        const relevance = memorySearchRelevance(item, filter.query!);
+        return relevance === null ? [] : [{ item, relevance }];
+      })).map((item) => structuredClone(item));
+    }
     return sortFeed([...topicItems, ...radarItems]).map((item) => structuredClone(item));
   }
 

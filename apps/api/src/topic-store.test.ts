@@ -1,3 +1,4 @@
+import type { DiscoveryCandidate } from '@lettermate/contracts';
 import type { PrismaClient } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -5,6 +6,28 @@ import {
   trendStatusSchema,
 } from '@lettermate/contracts';
 import { MemoryTopicStore, PrismaTopicStore } from './topic-store.js';
+
+const candidate = (
+  title: string,
+  summary: string,
+  reason: string,
+  slug: string,
+  overrides: Partial<DiscoveryCandidate> = {},
+): DiscoveryCandidate => ({
+  kind: 'quality',
+  title,
+  summary,
+  reason,
+  sourceUrls: [`https://example.com/${slug}`],
+  publishedAt: '2026-08-02T08:00:00.000Z',
+  sourceType: 'web',
+  platform: 'Example',
+  authorName: null,
+  authorHandle: null,
+  externalId: null,
+  provenanceKind: 'fetched_page',
+  ...overrides,
+});
 
 describe('topic store multi-source mappings', () => {
   it('maps the latest Prisma discovery run as a strict public summary', async () => {
@@ -211,6 +234,64 @@ describe('topic store multi-source mappings', () => {
     ]));
     expect(await store.listFeed('user-1', { origin: 'topic', since: null })).toHaveLength(1);
     expect(await store.listFeed('user-1', { origin: 'trend', since: null })).toHaveLength(2);
+  });
+
+  it('searches owner articles and ranks title, summary, then recommendation reason', async () => {
+    const store = new MemoryTopicStore(() => new Date('2026-08-02T12:00:00.000Z'));
+    const topic = store.seedTopic('user-1', 'Agents');
+    const otherTopic = store.seedTopic('user-2', 'Private');
+    await store.completeFakeDiscovery('user-1', topic.id, {
+      expandedTerms: [],
+      items: [
+        candidate('智能体工程实践', '普通摘要', '普通理由', 'title-match'),
+        candidate('摘要匹配文章', '这篇文章讨论智能体工程', '普通理由', 'summary-match'),
+        candidate('理由匹配文章', '普通摘要', '推荐阅读智能体工程实践', 'reason-match'),
+        candidate('完全无关文章', '普通摘要', '普通理由', 'unmatched'),
+      ],
+    });
+    await store.completeFakeDiscovery('user-2', otherTopic.id, {
+      expandedTerms: [],
+      items: [candidate('智能体工程私有文章', '普通摘要', '普通理由', 'private-match')],
+    });
+
+    const items = await store.listFeed('user-1', {
+      origin: 'all', since: null, query: '智能体工程',
+    });
+
+    expect(items.map((item) => item.title)).toEqual([
+      '智能体工程实践', '摘要匹配文章', '理由匹配文章',
+    ]);
+  });
+
+  it('combines persisted search with Topic, kind, and effective-time filters', async () => {
+    const store = new MemoryTopicStore(() => new Date('2026-08-02T12:00:00.000Z'));
+    const selected = store.seedTopic('user-1', 'Selected');
+    const excluded = store.seedTopic('user-1', 'Excluded');
+    await store.completeFakeDiscovery('user-1', selected.id, {
+      expandedTerms: [],
+      items: [
+        candidate('工程新文章', '摘要', '理由', 'selected-new'),
+        candidate('普通新文章', '摘要', '理由', 'selected-unmatched'),
+        candidate('工程旧文章', '摘要', '理由', 'selected-old', {
+          publishedAt: '2026-07-01T08:00:00.000Z',
+        }),
+        candidate('工程热点文章', '摘要', '理由', 'selected-hot', { kind: 'hot' }),
+      ],
+    });
+    await store.completeFakeDiscovery('user-1', excluded.id, {
+      expandedTerms: [],
+      items: [candidate('工程其他主题', '摘要', '理由', 'excluded-topic')],
+    });
+
+    const items = await store.listFeed('user-1', {
+      origin: 'topic',
+      topicId: selected.id,
+      kind: 'quality',
+      since: new Date('2026-08-01T00:00:00.000Z'),
+      query: '工程',
+    });
+
+    expect(items.map((item) => item.title)).toEqual(['工程新文章']);
   });
 
   it('returns only the owner Radar detail and safe trend status', async () => {
