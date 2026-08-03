@@ -711,6 +711,24 @@ describe('discovery workspace', () => {
     expect(requests.some(({ method }) => method === 'PATCH')).toBe(false);
   });
 
+  it('removes an expanded term directly from the Topic row', async () => {
+    const existing = {
+      ...topic('topic-1', 'AI Agent'),
+      expandedTerms: ['AI agent', '智能体'],
+    };
+    installFetchMock({ topics: [existing] });
+    renderApp('/topics');
+
+    fireEvent.click(await screen.findByRole('button', { name: '删除扩展词 智能体' }));
+
+    await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
+      keyword: 'AI Agent',
+      expandedTerms: ['AI agent'],
+    }));
+    expect(screen.queryByRole('textbox', { name: '扩展词 1' })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('智能体')).not.toBeInTheDocument());
+  });
+
   it('shows immediate Topic creation progress before the API responds', async () => {
     let resolveCreated!: (value: Topic) => void;
     const createdResponse = new Promise<Topic>((resolve) => { resolveCreated = resolve; });

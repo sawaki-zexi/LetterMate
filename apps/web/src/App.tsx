@@ -414,6 +414,18 @@ function TopicRow({
       setError(cause instanceof Error ? cause.message : '保存失败');
     } finally { setSaving(false); }
   };
+  const removeTerm = async (index: number) => {
+    if (saving) return;
+    setSaving(true); setError(null);
+    try {
+      await onUpdate({
+        keyword: topic.keyword,
+        expandedTerms: topic.expandedTerms.filter((_, itemIndex) => itemIndex !== index),
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '删除扩展词失败');
+    } finally { setSaving(false); }
+  };
   if (editing) return (
     <article className="topic-row topic-row--editing">
       <div className="topic-editor">
@@ -451,7 +463,10 @@ function TopicRow({
         <p className="topic-schedule"><Clock3 size={14} />{topic.nextRunAt
           ? `下次自动更新 ${new Date(topic.nextRunAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · 每 ${topic.scheduleIntervalHours} 小时`
           : `每 ${topic.scheduleIntervalHours} 小时 · 等待首次自动更新`}</p>
-        {topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term) => <span key={term}>{term}</span>)}</div>}
+        {topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term, index) => <span key={term}>
+          <button className="term-list__remove" type="button" disabled={saving} aria-label={`删除扩展词 ${term}`} onClick={() => void removeTerm(index)}><X size={12} /></button>
+          <span>{term}</span>
+        </span>)}</div>}
         {topic.lastError && <p className="inline-error"><AlertCircle size={15} />{topic.lastError.message}</p>}
       </div>
       <div className="topic-row__actions"><button
