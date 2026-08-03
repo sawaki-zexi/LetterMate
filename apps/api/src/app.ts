@@ -3,6 +3,7 @@ import {
   discoverySourceStatusSchema,
   feedQuerySchema,
   topicInputSchema,
+  topicUpdateInputSchema,
   type DiscoverySourceStatus,
 } from '@lettermate/contracts';
 import { normalizeKeyword } from '@lettermate/domain';
@@ -11,6 +12,7 @@ import {
   Body,
   ConflictException,
   Controller,
+  Delete,
   Get,
   Headers,
   HttpCode,
@@ -19,6 +21,7 @@ import {
   Module,
   NotFoundException,
   Param,
+  Patch,
   Post,
   Query,
   ServiceUnavailableException,
@@ -119,7 +122,12 @@ class ApiController {
         input.keyword,
         normalizeKeyword(input.keyword),
       );
-      await this.queue.enqueue({ topicId: topic.id, userId, trigger: 'initial' });
+      try {
+        await this.queue.enqueue({ topicId: topic.id, userId, trigger: 'initial' });
+      } catch (error) {
+        await this.store.compensateTopicRefresh(userId, topic.id);
+        throw error;
+      }
       return topic;
     } catch (error) {
       if (error instanceof TopicAlreadyExistsError) {
@@ -134,6 +142,49 @@ class ApiController {
   @Get('topics')
   listTopics(@Headers('x-user-id') header?: string) {
     return this.store.listTopics(authenticatedUser(header));
+  }
+
+  @Patch('topics/:id')
+  async updateTopic(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+    @Body() body: unknown,
+  ) {
+    this.assertAiConfigured();
+    const userId = authenticatedUser(header);
+    const input = parseOrThrow(topicUpdateInputSchema, body, '关键词设置无效');
+    try {
+      const updated = await this.store.updateTopic(userId, id, {
+        ...input,
+        normalizedKeyword: normalizeKeyword(input.keyword),
+      });
+      if (!updated) throw new NotFoundException(errorBody('TOPIC_NOT_FOUND', '关键词不存在'));
+      if (updated.shouldEnqueue) {
+        try {
+          await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
+        } catch (error) {
+          await this.store.compensateTopicRefresh(userId, id);
+          throw error;
+        }
+      }
+      return updated.topic;
+    } catch (error) {
+      if (error instanceof TopicAlreadyExistsError) {
+        throw new ConflictException(errorBody('TOPIC_ALREADY_EXISTS', '关键词已存在'));
+      }
+      throw error;
+    }
+  }
+
+  @Delete('topics/:id')
+  @HttpCode(204)
+  async deleteTopic(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+  ) {
+    if (!await this.store.deleteTopic(authenticatedUser(header), id)) {
+      throw new NotFoundException(errorBody('TOPIC_NOT_FOUND', '关键词不存在'));
+    }
   }
 
   @Post('topics/:id/refresh')

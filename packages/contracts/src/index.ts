@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 export const discoveryQueueName = 'topic-discovery';
 export const trendQueueName = 'trend-discovery';
+export const maxTopicExpandedTerms = 32;
 
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
 export const runStatusSchema = z.enum(['queued', 'running', 'succeeded', 'failed']);
@@ -56,6 +57,26 @@ export const feedQuerySchema = z.strictObject({
       message: 'topicId cannot be combined with trend origin',
     });
   }
+});
+
+export const topicUpdateInputSchema = z.object({
+  keyword: z.string().trim().min(1).max(100),
+  expandedTerms: z.array(z.string().trim().min(1).max(100)).max(maxTopicExpandedTerms),
+}).superRefine(({ expandedTerms }, context) => {
+  const normalizedTerms = new Set<string>();
+
+  expandedTerms.forEach((term, index) => {
+    const normalizedTerm = term.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (normalizedTerms.has(normalizedTerm)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: '扩展词不能重复',
+        path: ['expandedTerms', index],
+      });
+      return;
+    }
+    normalizedTerms.add(normalizedTerm);
+  });
 });
 
 export const safeErrorSchema = z.object({
@@ -147,6 +168,8 @@ export const discoveryItemSchema = discoveryCandidateSchema.extend({
 export const topicFeedItemSchema = discoveryItemSchema.extend({
   origin: z.literal('topic'),
   topicId: z.string().min(1),
+  topicKeyword: z.string().trim().min(1).max(100),
+  topicKeywordActive: z.boolean(),
 }).strict();
 
 export const trendFeedItemSchema = discoveryItemSchema.omit({ topicId: true }).extend({
@@ -186,6 +209,7 @@ export const apiErrorSchema = z.object({
 });
 
 export type TopicInput = z.infer<typeof topicInputSchema>;
+export type TopicUpdateInput = z.infer<typeof topicUpdateInputSchema>;
 export type Topic = z.infer<typeof topicSchema>;
 export type DiscoveryCandidate = z.infer<typeof discoveryCandidateSchema>;
 export type DiscoveryResult = z.infer<typeof discoveryResultSchema>;

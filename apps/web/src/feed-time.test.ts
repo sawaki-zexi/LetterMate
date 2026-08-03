@@ -11,6 +11,8 @@ function item(
     id,
     origin: 'topic',
     topicId: 'topic-1',
+    topicKeyword: 'gpt-5.7',
+    topicKeywordActive: true,
     kind: 'quality',
     title: id,
     summary: '摘要',

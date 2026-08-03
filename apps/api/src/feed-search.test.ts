@@ -30,7 +30,13 @@ const feedItem = (
   provenanceKind: 'fetched_page' as const,
   };
   return origin === 'topic'
-    ? { ...base, origin, topicId: 'topic-1' }
+    ? {
+        ...base,
+        origin,
+        topicId: 'topic-1',
+        topicKeyword: 'AI Agent',
+        topicKeywordActive: true,
+      }
     : { ...base, origin, topicId: null };
 };
 

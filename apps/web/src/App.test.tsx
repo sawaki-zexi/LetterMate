@@ -74,7 +74,7 @@ function feedItem(
     provenanceKind: 'api_record' as const,
   };
   return origin === 'topic'
-    ? { ...common, origin, topicId }
+    ? { ...common, origin, topicId, topicKeyword: 'gpt-5.7', topicKeywordActive: true }
     : { ...common, origin, topicId: null };
 }
 
@@ -145,6 +145,14 @@ function installFetchMock({
         return Response.json({ code: 'CREATE_FAILED', message: 'Create failed', traceId: 'test' }, { status: 503 });
       }
       return Response.json(createdResponse ? await createdResponse : created!, { status: 201 });
+    }
+    const topicUpdateMatch = url.match(/\/topics\/([^/]+)$/);
+    if (topicUpdateMatch && method === 'PATCH') {
+      const topicId = decodeURIComponent(topicUpdateMatch[1] ?? '');
+      const existing = currentTopics.find((candidate) => candidate.id === topicId)!;
+      const updated = { ...existing, ...(body as { keyword: string; expandedTerms: string[] }) };
+      currentTopics = currentTopics.map((candidate) => candidate.id === topicId ? updated : candidate);
+      return Response.json(updated);
     }
     const topicRefreshMatch = url.match(/\/topics\/([^/]+)\/refresh$/);
     if (topicRefreshMatch && method === 'POST') {
@@ -753,6 +761,80 @@ describe('discovery workspace', () => {
     expect(await screen.findByText('Hacker News')).toBeVisible();
     expect(screen.getByText('已启用')).toBeVisible();
     expect(screen.getByText('待配置')).toBeVisible();
+  });
+
+  it('edits the main keyword and expanded terms inline', async () => {
+    const existing = {
+      ...topic('topic-1', 'AI Agent'),
+      expandedTerms: ['AI agent', '智能体'],
+    };
+    installFetchMock({ topics: [existing] });
+    renderApp('/topics');
+
+    expect(await screen.findByText('AI agent')).toBeVisible();
+    expect(screen.queryAllByRole('button', { name: /删除扩展词/ })).toHaveLength(0);
+    fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
+    const keyword = screen.getByRole('textbox', { name: '主关键词' });
+    expect(keyword).toHaveValue('AI Agent');
+    fireEvent.change(keyword, { target: { value: 'Agent Workspace' } });
+    const firstTerm = screen.getByRole('textbox', { name: '扩展词 1' });
+    fireEvent.change(firstTerm, { target: { value: 'agent framework' } });
+    fireEvent.click(screen.getByRole('button', { name: '删除扩展词 智能体' }));
+    fireEvent.click(screen.getByRole('button', { name: '添加扩展词' }));
+
+    const addedTerm = screen.getByRole('textbox', { name: '扩展词 2' });
+    expect(addedTerm).toHaveFocus();
+    fireEvent.change(addedTerm, { target: { value: 'agent tools' } });
+    expect(screen.queryByRole('button', { name: '刷新 AI Agent' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '删除 AI Agent 关键词' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存修改 AI Agent' }));
+
+    await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
+      keyword: 'Agent Workspace',
+      expandedTerms: ['agent framework', 'agent tools'],
+    }));
+  });
+
+  it('saves an existing topic with all AI-generated expanded terms', async () => {
+    const expandedTerms = Array.from({ length: 28 }, (_, index) => `AI agent term ${index + 1}`);
+    const existing = {
+      ...topic('topic-1', 'AI Agent'),
+      expandedTerms,
+    };
+    installFetchMock({ topics: [existing] });
+    renderApp('/topics');
+
+    fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '主关键词' }), {
+      target: { value: 'Agent Workspace' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存修改 AI Agent' }));
+
+    await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
+      keyword: 'Agent Workspace',
+      expandedTerms,
+    }));
+  });
+
+  it('discards expanded term chip drafts', async () => {
+    const existing = {
+      ...topic('topic-1', 'AI Agent'),
+      expandedTerms: ['AI agent', '智能体'],
+    };
+    installFetchMock({ topics: [existing] });
+    renderApp('/topics');
+
+    fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '扩展词 1' }), {
+      target: { value: 'changed draft' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '删除扩展词 智能体' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消修改 AI Agent' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑 AI Agent 关键词' }));
+
+    expect(screen.getByRole('textbox', { name: '扩展词 1' })).toHaveValue('AI agent');
+    expect(screen.getByRole('textbox', { name: '扩展词 2' })).toHaveValue('智能体');
+    expect(requests.some(({ method }) => method === 'PATCH')).toBe(false);
   });
 
   it('shows immediate Topic creation progress before the API responds', async () => {

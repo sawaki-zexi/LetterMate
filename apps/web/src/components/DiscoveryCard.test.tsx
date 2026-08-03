@@ -9,6 +9,8 @@ const topicItem: FeedItem = {
   id: 'item-1',
   origin: 'topic',
   topicId: 'topic-1',
+  topicKeyword: 'gpt-5.7',
+  topicKeywordActive: true,
   kind: 'quality',
   title: 'Agent guide',
   summary: '完整介绍了实现方式。',
@@ -28,7 +30,7 @@ describe('DiscoveryCard', () => {
   afterEach(cleanup);
 
   it('renders Topic context, details, and safe source links without retired trust labels', () => {
-    render(<DiscoveryCard item={topicItem} topicKeyword="gpt-5.7" />);
+    render(<DiscoveryCard item={topicItem} />);
     expect(screen.getByText('来自「gpt-5.7」')).toBeVisible();
     expect(screen.getByTitle('gpt-5.7')).toHaveAttribute('aria-label', '来自「gpt-5.7」');
     expect(screen.getByText('精选')).toBeVisible();
@@ -54,10 +56,10 @@ describe('DiscoveryCard', () => {
     expect(screen.queryByText('趋势发现')).not.toBeInTheDocument();
   });
 
-  it('falls back to the generic Topic context without a keyword', () => {
-    render(<DiscoveryCard item={topicItem} />);
+  it('labels historical content when its keyword is inactive', () => {
+    render(<DiscoveryCard item={{ ...topicItem, topicKeywordActive: false }} />);
 
-    expect(screen.getByText('来自关注主题')).toBeVisible();
+    expect(screen.getByText('关键词已失效')).toBeVisible();
   });
 
   it('uses an h2 by default and supports an h3 inside grouped feeds', () => {

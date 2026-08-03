@@ -115,12 +115,24 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .topic-create label { color: #46535d; font-size: 13px; font-weight: 650; }
 .topic-create input { width: 100%; height: 40px; min-width: 0; padding: 0 11px; border: 1px solid #c8d0d5; border-radius: 5px; background: white; color: #24343d; }
 .topic-list { border-top: 1px solid var(--border); }
-.topic-row { min-height: 88px; display: grid; grid-template-columns: minmax(0, 1fr) 38px; gap: 14px; align-items: center; border-bottom: 1px solid var(--border); padding: 14px 4px; }
+.topic-row { min-height: 88px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; border-bottom: 1px solid var(--border); padding: 14px 4px; }
 .topic-row__main { min-width: 0; display: grid; gap: 9px; }
 .topic-row__title { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .topic-row h2 { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
 .topic-row--pending { color: var(--muted); }
 .topic-row__pending-icon { justify-self: center; color: #8b5a13; }
+.topic-row__actions { display: flex; gap: 6px; align-items: center; }
+.icon-button--danger { color: #b42318; }
+.icon-button--success { color: var(--accent); }
+.topic-row__keyword-input { width: min(320px, 100%); min-width: 120px; height: 27px; padding: 0 1px 2px; border: 0; border-bottom: 1px solid #8bb7b1; border-radius: 0; background: transparent; color: #122630; font-size: 15px; font-weight: 700; }
+.topic-row__keyword-input:focus { outline: 0; border-bottom-color: var(--accent); box-shadow: 0 2px 0 rgb(22 122 109 / 16%); }
+.dialog-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px; background: rgb(15 23 42 / 45%); }
+.confirm-dialog { width: min(420px, 100%); padding: 20px; border: 1px solid #d7dce2; border-radius: 8px; background: #fff; box-shadow: 0 16px 40px rgb(15 23 42 / 20%); }
+.confirm-dialog h3 { margin: 0 0 8px; font-size: 18px; }
+.confirm-dialog p { margin: 0 0 18px; }
+.confirm-dialog > div { display: flex; justify-content: flex-end; gap: 8px; }
+.button--danger { background: #b42318; border-color: #b42318; }
+.keyword-state--inactive { color: #8a3b12; font-weight: 600; }
 .topic-schedule { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--muted); font-size: 12px; }
 .topic-schedule svg { flex: 0 0 auto; }
 .run-state { display: inline-flex; align-items: center; min-height: 23px; padding: 0 7px; border-radius: 4px; font-size: 11px; font-weight: 700; background: #edf1f2; color: #52606b; }
@@ -128,7 +140,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .run-state--succeeded { background: #e2f2e9; color: #167149; }
 .run-state--failed { background: #f8e5e7; color: #a23b42; }
 .term-list { display: flex; flex-wrap: wrap; gap: 6px; }
-.term-list span { max-width: 100%; overflow-wrap: anywhere; border: 1px solid #d9dfe2; border-radius: 4px; background: white; padding: 3px 7px; color: #5d6972; font-size: 11px; }
+.term-list__item, .term-list__add { max-width: 100%; min-height: 24px; display: inline-flex; align-items: center; overflow: hidden; border: 1px solid #d9dfe2; border-radius: 4px; background: white; color: #5d6972; font-size: 11px; }
+.term-list__item { padding: 3px 7px; overflow-wrap: anywhere; }
+.term-list__item--editing { padding: 0; }
+.term-list__remove { align-self: stretch; width: 23px; min-height: 23px; display: grid; place-items: center; flex: 0 0 23px; border: 0; border-right: 1px solid #e3e8ea; background: transparent; color: #7b878f; cursor: pointer; }
+.term-list__remove:hover { background: #f7eded; color: #b42318; }
+.term-list__input { width: auto; max-width: min(240px, calc(100vw - 160px)); min-width: 36px; height: 23px; padding: 3px 7px 3px 4px; border: 0; border-radius: 0; background: transparent; color: inherit; font: inherit; }
+.term-list__input:focus { outline: 0; background: #f6faf9; box-shadow: none; }
+.term-list__add { gap: 4px; padding: 3px 7px; cursor: pointer; }
+.term-list__add:hover { border-color: #a8c9c4; background: #f6faf9; color: var(--accent); }
 .inline-error { display: flex; align-items: center; gap: 6px; color: var(--danger); font-size: 12px; margin: 0; }
 .source-status-section { margin-top: 34px; border-top: 1px solid var(--border); }
 .source-status-section > header { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); }

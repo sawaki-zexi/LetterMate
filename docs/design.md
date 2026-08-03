@@ -103,6 +103,8 @@ GitHub 没有在本项目中作为趋势榜单输入；它和 arXiv、RSS/Atom�
 
 `buildKeywordPolicy` 规范化 Unicode 宽度、大小写和空白，但保留数字版本段和实体边界。确定性别名只改变标点和间距，不创建语义近义词。`SourceRouter` 会丢弃不包含精确短语或必要标识符的 AI 查询，并补充包含完整短语的 release、update、documentation 等有限意图查询。
 
+Topic 首次运行在 `variantsInitialized=false` 时生成扩展词并将其初始化；此后 `expandedTerms` 是用户管理数据，即使为空也不会再次调用 AI 扩展。编辑主关键词或扩展词会保存完整的新集合并登记一次发现运行。
+
 候选必须在标题或正文中命中完整短语或确认变体。例如：
 
 - `gpt-5.7`、`GPT 5.7`、`gpt5.7` 可以表示同一形式标识；
@@ -141,9 +143,9 @@ AI 只能引用已验证候选池中的 URL。外部抓取在每次请求和重�
 
 ## 7. 数据与一致性
 
-- `Topic`：完整关键词、扩展词、运行状态、`queuedTrigger`、`nextRunAt`、6/12/24 小时周期和最新安全运行摘要。
-- `DiscoveryRun`：Topic 触发方式、状态、开始/结束时间和实际新增数。
-- `DiscoveryItem`：Topic 所有的最终中文内容、原始 URL 和来源元数据。
+- `Topic`：完整关键词、用户管理的扩展词、`variantsInitialized`、软删除时间、运行状态、`queuedTrigger`、`nextRunAt`、6/12/24 小时周期和最新安全运行摘要。
+- `DiscoveryRun`：Topic 触发方式、状态、开始/结束时间、运行时关键词/扩展词快照和实际新增数。
+- `DiscoveryItem`：Topic 所有的最终中文内容、原始 URL、来源元数据和发现时关键词快照。
 - `TrendMonitor`：用户唯一的趋势状态、持久化 `intervalHours`、`nextRunAt`、租约和待处理手动刷新；缺失记录的间隔默认按 4 小时创建。
 - `TrendRun`：趋势触发方式、状态、候选/录取/新增数和安全错误；手动刷新在入队前先创建持久化的 `queued` 运行。
 - `TrendSeed`：最小化来源、外部 ID、标题、URL、指纹和精准查询词。
@@ -170,6 +172,8 @@ Topic 和趋势完成事务都从实际插入数写入 `newItemCount`。运行�
 | --- | --- | --- |
 | `POST` | `/topics` | 创建完整关键词 Topic 并入队首次运行 |
 | `GET` | `/topics` | 返回 Topic 状态、调度和最新运行摘要 |
+| `PATCH` | `/topics/:id` | 修改主关键词和扩展词，并按新配置登记发现运行 |
+| `DELETE` | `/topics/:id` | 软删除 Topic 并停止调度，保留历史 Feed |
 | `POST` | `/topics/:id/refresh` | 登记 Topic 手动刷新，不改变自动周期 |
 | `GET` | `/trends/status` | 返回当前用户的安全 TrendMonitor/TrendRun 摘要 |
 | `POST` | `/trends/refresh` | 登记趋势手动刷新，返回 `202` |
@@ -189,6 +193,8 @@ Feed 参数：
 ## 10. Web 交互
 
 Feed 顶部提供已入库文章搜索框、来源 segmented control、分类 control、原生时间 `<select>` 和适用时的 Topic select。输入草稿与已提交搜索词分离，只有回车或点击搜索按钮才发送查询；清除按钮移除 `q` 并保留其他筛选。搜索失败保留输入上下文供重试，空结果显示专用状态。六个时间范围共用一个服务端查询，默认近 30 天。返回条目按“今天、昨天、近 3 天、近 7 天、本月更早、更早”互斥分组，空组不渲染。
+
+Topic 页面提供主关键词和扩展词的内联编辑，以及带确认对话框的删除操作。删除成功后 Topic 立即离开活动列表；Feed 仍用 `DiscoveryItem.topicKeyword` 展示历史归属，并在 Topic 已删除或当前关键词与快照不一致时显示“关键词已失效”。
 
 刷新协调范围：
 

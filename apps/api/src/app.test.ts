@@ -22,6 +22,18 @@ class RecordingQueue implements TopicQueue {
   async close() {}
 }
 
+class FailOnceTopicQueue extends RecordingQueue {
+  private failed = false;
+
+  override async enqueue(data: DiscoveryJobData) {
+    if (!this.failed) {
+      this.failed = true;
+      throw new Error('Redis unavailable');
+    }
+    await super.enqueue(data);
+  }
+}
+
 class RecordingTrendQueue implements TrendQueue {
   jobs: Array<Extract<TrendJobData, { trigger: 'manual' }>> = [];
 
@@ -161,6 +173,114 @@ describe('AI discovery API', () => {
       userId: 'user-a',
       trigger: 'manual',
     });
+  });
+
+  it('updates owned topic keywords and variants and enqueues discovery', async () => {
+    const topic = store.seedTopic('user-a', 'gpt-5.7');
+
+    const response = await request(app.getHttpServer())
+      .patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ keyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'] })
+      .expect(200);
+
+    expect(response.body).toMatchObject({ keyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'] });
+    expect(queue.jobs).toContainEqual({ topicId: topic.id, userId: 'user-a', trigger: 'manual' });
+  });
+
+  it('compensates a failed update enqueue so the topic can be refreshed again', async () => {
+    const failingQueue = new FailOnceTopicQueue();
+    const localApp = await createApiApp({
+      store, queue: failingQueue, trendQueue, aiConfigured: true, discoverySources,
+    });
+    const topic = store.seedTopic('user-a', 'gpt-5.7');
+
+    await request(localApp.getHttpServer()).patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ keyword: 'gpt-5.8', expandedTerms: [] })
+      .expect(500);
+    await request(localApp.getHttpServer()).get('/api/v1/topics')
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body[0]).toMatchObject({
+        runStatus: 'failed',
+        lastError: {
+          code: 'TOPIC_QUEUE_UNAVAILABLE',
+          message: '发现任务暂时无法入队，请稍后重试',
+        },
+      }));
+    await request(localApp.getHttpServer()).post(`/api/v1/topics/${topic.id}/refresh`)
+      .set('x-user-id', 'user-a')
+      .expect(202);
+    expect(failingQueue.jobs).toContainEqual({
+      topicId: topic.id, userId: 'user-a', trigger: 'manual',
+    });
+    await localApp.close();
+  });
+
+  it('soft deletes owned topics while retaining historical feed items', async () => {
+    const topic = store.seedTopic('user-a', 'gpt-5.7');
+    const item = store.seedItem(topic.id, 'quality');
+
+    await request(app.getHttpServer())
+      .delete(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(204);
+
+    await request(app.getHttpServer()).get('/api/v1/topics').set('x-user-id', 'user-a')
+      .expect(200, []);
+    await request(app.getHttpServer()).get(`/api/v1/items/${item.id}`).set('x-user-id', 'user-a')
+      .expect(200).expect(({ body }) => expect(body).toMatchObject({ topicKeywordActive: false }));
+  });
+
+  it('returns Topic keyword snapshots and lifecycle state in Feed responses', async () => {
+    const topic = store.seedTopic('user-a', 'AI Agent');
+    store.seedItem(topic.id, 'quality');
+
+    const active = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(active.body[0]).toMatchObject({
+      origin: 'topic',
+      topicKeyword: 'AI Agent',
+      topicKeywordActive: true,
+    });
+
+    await request(app.getHttpServer())
+      .patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ keyword: 'Agent Framework', expandedTerms: [] })
+      .expect(200);
+    const renamed = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(renamed.body[0]).toMatchObject({
+      topicKeyword: 'AI Agent',
+      topicKeywordActive: false,
+    });
+
+    await request(app.getHttpServer())
+      .delete(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(204);
+    const deleted = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(deleted.body[0]).toMatchObject({
+      topicKeyword: 'AI Agent',
+      topicKeywordActive: false,
+    });
+  });
+
+  it('hides topic update and deletion across ownership boundaries', async () => {
+    const topic = store.seedTopic('user-b', 'Private');
+    await request(app.getHttpServer()).patch(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a').send({ keyword: 'Changed', expandedTerms: [] }).expect(404);
+    await request(app.getHttpServer()).delete(`/api/v1/topics/${topic.id}`)
+      .set('x-user-id', 'user-a').expect(404);
   });
 
   it('isolates feed and item details by user', async () => {

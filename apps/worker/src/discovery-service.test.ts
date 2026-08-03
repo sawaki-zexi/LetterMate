@@ -26,6 +26,7 @@ const topicRow = {
   productiveRunStreak: 1,
   emptyRunStreak: 0,
   runStatus: 'succeeded' as const,
+  variantsInitialized: true,
   lastError: null,
 };
 
@@ -61,6 +62,7 @@ function createPrisma(existingUrls: string[] = []) {
     },
     discoveryRun: {
       create: vi.fn().mockResolvedValue({ id: 'run-1' }),
+      findUnique: vi.fn().mockResolvedValue({ keywordSnapshot: 'AI Agent' }),
       update: vi.fn().mockResolvedValue({ id: 'run-1' }),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
@@ -107,12 +109,16 @@ describe('PrismaDiscoveryRepository', () => {
 
     const runId = await repository.beginRun('topic-1', 'scheduled', startedAt);
 
-    expect(runId).toBe('run-1');
+    expect(runId).toMatchObject({
+      runId: 'run-1', keyword: 'AI Agent', expandedTerms: ['agent'], initialExpansion: false,
+    });
     expect(transaction.discoveryRun.create).toHaveBeenCalledWith({
       data: {
         id: expect.any(String),
         topicId: 'topic-1',
         trigger: 'scheduled',
+        keywordSnapshot: 'AI Agent',
+        expandedTermsSnapshot: ['agent'],
         status: 'running',
         startedAt,
       },
@@ -120,7 +126,7 @@ describe('PrismaDiscoveryRepository', () => {
     });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1',
+        id: 'topic-1', deletedAt: null,
         activeRunId: null,
         OR: [
           { runStatus: { not: 'running' } },
@@ -169,10 +175,12 @@ describe('PrismaDiscoveryRepository', () => {
       startedAt,
     );
 
-    expect(runId).toBe('run-1');
+    expect(runId).toMatchObject({
+      runId: 'run-1', keyword: 'AI Agent', expandedTerms: ['agent'], initialExpansion: false,
+    });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1',
+        id: 'topic-1', deletedAt: null,
         activeRunId: 'stale-run',
         OR: [
           { runStatus: { not: 'running' } },
@@ -195,6 +203,9 @@ describe('PrismaDiscoveryRepository', () => {
 
   it('upserts source-aware items and completes a scheduled run', async () => {
     const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, manualRefreshPending: false, variantsInitialized: false, deletedAt: null,
+    });
     const repository = new PrismaDiscoveryRepository(prisma);
 
     const result = await repository.saveSuccess({
@@ -202,6 +213,7 @@ describe('PrismaDiscoveryRepository', () => {
       topicId: 'topic-1',
       trigger: 'scheduled',
       expandedTerms: ['agent', 'agent'],
+      initializeVariants: true,
       items: [item],
       connectorSummary: {
         successfulConnectorIds: ['twitterapi-io'],
@@ -252,6 +264,8 @@ describe('PrismaDiscoveryRepository', () => {
         provenanceKind: 'api_record',
       }),
     });
+    expect(transaction.discoveryItem.upsert.mock.calls[0]?.[0].update)
+      .not.toHaveProperty('topicKeyword');
     expect(transaction.discoveryRun.update).toHaveBeenCalledWith({
       where: { id: 'run-1' },
       data: expect.objectContaining({
@@ -651,6 +665,76 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
       expect.any(Date),
     );
     expect(gateway.expandTopic).toHaveBeenCalledTimes(2);
+  });
+
+  it('performs the one-time expansion when an uninitialized topic is retried manually', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, variantsInitialized: false, activeRunId: null, runLeaseUntil: null,
+    });
+
+    const begun = await new PrismaDiscoveryRepository(prisma).beginRun(
+      'topic-1', 'manual', new Date('2026-07-27T09:00:00.000Z'),
+    );
+
+    expect(begun).toMatchObject({ initialExpansion: true });
+  });
+
+  it('does not overwrite user-managed variants when an initial run finishes', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, manualRefreshPending: true, variantsInitialized: true, deletedAt: null,
+    });
+
+    await new PrismaDiscoveryRepository(prisma).saveSuccess({
+      runId: 'run-1', topicId: 'topic-1', trigger: 'initial', expandedTerms: ['ai generated'],
+      initializeVariants: true, items: [], connectorSummary: {
+        successfulConnectorIds: ['rss'], skippedConnectorIds: [], failures: [],
+      }, candidateCount: 0, acceptedCount: 0, finishedAt, persistenceTimeoutMs: 12_345,
+    });
+
+    const topicUpdate = transaction.topic.update.mock.calls.at(-1)?.[0].data;
+    expect(topicUpdate).not.toHaveProperty('expandedTerms');
+    expect(topicUpdate).not.toHaveProperty('variantsInitialized');
+    expect(topicUpdate).toMatchObject({ runStatus: 'queued', queuedTrigger: 'manual' });
+  });
+
+  it('persists accepted items but does not reactivate a topic deleted during its run', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow, manualRefreshPending: false, variantsInitialized: true, deletedAt: finishedAt,
+    });
+
+    const result = await new PrismaDiscoveryRepository(prisma).saveSuccess({
+      runId: 'run-1', topicId: 'topic-1', trigger: 'manual', expandedTerms: [],
+      initializeVariants: false, items: [item], connectorSummary: {
+        successfulConnectorIds: ['rss'], skippedConnectorIds: [], failures: [],
+      }, candidateCount: 1, acceptedCount: 1, finishedAt, persistenceTimeoutMs: 12_345,
+    });
+
+    expect(result).toEqual({ newItemCount: 1, pendingManualRefresh: false });
+    expect(transaction.discoveryItem.upsert).toHaveBeenCalledOnce();
+    expect(transaction.topic.update.mock.calls.at(-1)?.[0].data).toMatchObject({
+      runStatus: 'failed', queuedTrigger: null, nextRunAt: null,
+    });
+  });
+
+  it('uses the frozen user-managed variants without asking AI to expand again', async () => {
+    const { service, repository, gateway, router } = createOrchestration();
+    repository.beginRun.mockResolvedValue({
+      runId: 'run-1',
+      keyword: 'AI Agent',
+      expandedTerms: [],
+      initialExpansion: false,
+    });
+
+    await service.run('topic-1', 'user-1', 'scheduled');
+
+    expect(gateway.expandTopic).not.toHaveBeenCalled();
+    expect(router.route).toHaveBeenCalledWith(expect.objectContaining({
+      keyword: 'AI Agent',
+      expanded: { terms: [], searchQueries: [] },
+    }));
   });
 
   it('fails safely when every selected connector fails', async () => {

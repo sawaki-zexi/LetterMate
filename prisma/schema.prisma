@@ -74,6 +74,8 @@ model Topic {
   normalizedKeyword     String
   expandedTerms         String[]        @default([])
   createdAt             DateTime        @default(now())
+  deletedAt             DateTime?
+  variantsInitialized   Boolean         @default(false)
   lastRunAt             DateTime?
   runStatus             RunStatus       @default(queued)
   queuedTrigger         DiscoveryTrigger?
@@ -89,7 +91,7 @@ model Topic {
   items                 DiscoveryItem[]
   runs                  DiscoveryRun[]
 
-  @@unique([userId, normalizedKeyword])
+  @@index([userId, deletedAt, createdAt])
   @@index([userId, createdAt])
   @@index([nextRunAt, runStatus])
   @@index([runStatus, runLeaseUntil])
@@ -113,6 +115,7 @@ model DiscoveryItem {
   authorHandle        String?
   externalId          String?
   provenanceKind      ProvenanceKind @default(ai_citation)
+  topicKeyword        String
   topic               Topic          @relation(fields: [topicId], references: [id], onDelete: Cascade)
 
   @@unique([topicId, canonicalPrimaryUrl])
@@ -131,6 +134,8 @@ model DiscoveryRun {
   acceptedCount    Int              @default(0)
   newItemCount     Int              @default(0)
   error            Json?
+  keywordSnapshot  String
+  expandedTermsSnapshot String[]        @default([])
   topic            Topic            @relation(fields: [topicId], references: [id], onDelete: Cascade)
 
   @@index([topicId, startedAt])

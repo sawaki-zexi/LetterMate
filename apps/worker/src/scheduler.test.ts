@@ -101,7 +101,7 @@ describe('PrismaTopicScheduleRepository', () => {
     ]);
     expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1',
+        id: 'topic-1', deletedAt: null,
         nextRunAt: dueAt,
         OR: [
           { runStatus: { not: 'running' } },
@@ -141,7 +141,7 @@ describe('PrismaTopicScheduleRepository', () => {
     }]);
     expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith({
       where: {
-        id: 'topic-initial',
+        id: 'topic-initial', deletedAt: null,
         runStatus: 'running',
         runLeaseUntil: leaseExpiredAt,
       },

@@ -30,21 +30,17 @@ export function DiscoveryCard({
   item,
   detailHref,
   headingLevel = 2,
-  topicKeyword,
 }: {
   item: FeedItem;
   detailHref?: string;
   headingLevel?: 2 | 3;
-  topicKeyword?: string;
 }) {
   const Heading = `h${headingLevel}` as const;
   const ClassificationIcon = item.kind === 'hot' ? Flame : Sparkles;
   const classification = discoveryKindLabels[item.kind];
   const discoveryContext = item.origin === 'trend'
     ? '来自全网趋势'
-    : topicKeyword
-      ? `来自「${topicKeyword}」`
-      : '来自关注主题';
+    : `来自「${item.topicKeyword}」`;
   const source = sourceTypeMeta[item.sourceType];
   const SourceIcon = source.icon;
   const author = [item.authorName, item.authorHandle ? `@${item.authorHandle}` : null]
@@ -59,11 +55,12 @@ export function DiscoveryCard({
         <div className="discovery-card__meta">
           <span
             className="origin-label"
-            title={item.origin === 'topic' ? topicKeyword : undefined}
+            title={item.origin === 'topic' ? item.topicKeyword : undefined}
             aria-label={discoveryContext}
           >
             {discoveryContext}
           </span>
+          {item.origin === 'topic' && !item.topicKeywordActive && <span className="keyword-state keyword-state--inactive">关键词已失效</span>}
           <span><SourceIcon size={14} />{item.platform}</span>
           <span>{source.label}</span>
           <span className="meta"><Clock3 size={14} />{new Date(item.publishedAt ?? item.discoveredAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
