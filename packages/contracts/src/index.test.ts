@@ -58,10 +58,19 @@ describe('AI discovery contracts', () => {
     });
   });
 
-  it('limits topic keyword updates to twenty nonempty terms of at most one hundred characters', () => {
+  it('accepts the complete set of terms and search queries generated for a topic', () => {
+    const expandedTerms = Array.from({ length: 32 }, (_, index) => `term-${index}`);
+
+    expect(topicUpdateInputSchema.parse({
+      keyword: 'gpt-5.7',
+      expandedTerms,
+    })).toEqual({ keyword: 'gpt-5.7', expandedTerms });
+  });
+
+  it('limits topic keyword updates to thirty-two nonempty terms of at most one hundred characters', () => {
     expect(() => topicUpdateInputSchema.parse({
       keyword: 'gpt-5.7',
-      expandedTerms: Array.from({ length: 21 }, (_, index) => `term-${index}`),
+      expandedTerms: Array.from({ length: 33 }, (_, index) => `term-${index}`),
     })).toThrow();
     expect(() => topicUpdateInputSchema.parse({
       keyword: 'gpt-5.7',

@@ -695,6 +695,27 @@ describe('discovery workspace', () => {
     }));
   });
 
+  it('saves an existing topic with all AI-generated expanded terms', async () => {
+    const expandedTerms = Array.from({ length: 28 }, (_, index) => `AI agent term ${index + 1}`);
+    const existing = {
+      ...topic('topic-1', 'AI Agent'),
+      expandedTerms,
+    };
+    installFetchMock({ topics: [existing] });
+    renderApp('/topics');
+
+    fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
+    fireEvent.change(screen.getByRole('textbox', { name: '主关键词' }), {
+      target: { value: 'Agent Workspace' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存修改 AI Agent' }));
+
+    await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
+      keyword: 'Agent Workspace',
+      expandedTerms,
+    }));
+  });
+
   it('discards expanded term chip drafts', async () => {
     const existing = {
       ...topic('topic-1', 'AI Agent'),

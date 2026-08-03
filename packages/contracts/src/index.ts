@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 export const discoveryQueueName = 'topic-discovery';
 export const trendQueueName = 'trend-discovery';
+export const maxTopicExpandedTerms = 32;
 
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
 export const runStatusSchema = z.enum(['queued', 'running', 'succeeded', 'failed']);
@@ -40,7 +41,7 @@ export const topicInputSchema = z.object({
 
 export const topicUpdateInputSchema = z.object({
   keyword: z.string().trim().min(1).max(100),
-  expandedTerms: z.array(z.string().trim().min(1).max(100)).max(20),
+  expandedTerms: z.array(z.string().trim().min(1).max(100)).max(maxTopicExpandedTerms),
 }).superRefine(({ expandedTerms }, context) => {
   const normalizedTerms = new Set<string>();
 
