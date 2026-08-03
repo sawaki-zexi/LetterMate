@@ -663,7 +663,7 @@ describe('discovery workspace', () => {
     expect(screen.getByText('待配置')).toBeVisible();
   });
 
-  it('edits expanded terms as removable chips', async () => {
+  it('edits the main keyword and expanded terms inline', async () => {
     const existing = {
       ...topic('topic-1', 'AI Agent'),
       expandedTerms: ['AI agent', '智能体'],
@@ -671,22 +671,27 @@ describe('discovery workspace', () => {
     installFetchMock({ topics: [existing] });
     renderApp('/topics');
 
+    expect(await screen.findByText('AI agent')).toBeVisible();
+    expect(screen.queryAllByRole('button', { name: /删除扩展词/ })).toHaveLength(0);
     fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
+    const keyword = screen.getByRole('textbox', { name: '主关键词' });
+    expect(keyword).toHaveValue('AI Agent');
+    fireEvent.change(keyword, { target: { value: 'Agent Workspace' } });
     const firstTerm = screen.getByRole('textbox', { name: '扩展词 1' });
     fireEvent.change(firstTerm, { target: { value: 'agent framework' } });
-    fireEvent.click(screen.getByRole('button', { name: '删除 智能体' }));
+    fireEvent.click(screen.getByRole('button', { name: '删除扩展词 智能体' }));
     fireEvent.click(screen.getByRole('button', { name: '添加扩展词' }));
 
     const addedTerm = screen.getByRole('textbox', { name: '扩展词 2' });
     expect(addedTerm).toHaveFocus();
-    expect(firstTerm.closest('.variant-chip')).toContainElement(
-      screen.getByRole('button', { name: '删除 agent framework' }),
-    );
-    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    fireEvent.change(addedTerm, { target: { value: 'agent tools' } });
+    expect(screen.queryByRole('button', { name: '刷新 AI Agent' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '删除 AI Agent 关键词' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存修改 AI Agent' }));
 
     await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
-      keyword: 'AI Agent',
-      expandedTerms: ['agent framework'],
+      keyword: 'Agent Workspace',
+      expandedTerms: ['agent framework', 'agent tools'],
     }));
   });
 
@@ -702,31 +707,13 @@ describe('discovery workspace', () => {
     fireEvent.change(screen.getByRole('textbox', { name: '扩展词 1' }), {
       target: { value: 'changed draft' },
     });
-    fireEvent.click(screen.getByRole('button', { name: '删除 智能体' }));
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    fireEvent.click(screen.getByRole('button', { name: '删除扩展词 智能体' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消修改 AI Agent' }));
     fireEvent.click(screen.getByRole('button', { name: '编辑 AI Agent 关键词' }));
 
     expect(screen.getByRole('textbox', { name: '扩展词 1' })).toHaveValue('AI agent');
     expect(screen.getByRole('textbox', { name: '扩展词 2' })).toHaveValue('智能体');
     expect(requests.some(({ method }) => method === 'PATCH')).toBe(false);
-  });
-
-  it('removes an expanded term directly from the Topic row', async () => {
-    const existing = {
-      ...topic('topic-1', 'AI Agent'),
-      expandedTerms: ['AI agent', '智能体'],
-    };
-    installFetchMock({ topics: [existing] });
-    renderApp('/topics');
-
-    fireEvent.click(await screen.findByRole('button', { name: '删除扩展词 智能体' }));
-
-    await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
-      keyword: 'AI Agent',
-      expandedTerms: ['AI agent'],
-    }));
-    expect(screen.queryByRole('textbox', { name: '扩展词 1' })).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByText('智能体')).not.toBeInTheDocument());
   });
 
   it('shows immediate Topic creation progress before the API responds', async () => {

@@ -8,6 +8,7 @@ import type {
 } from '@lettermate/contracts';
 import {
   AlertCircle,
+  Check,
   CheckCircle2,
   ChevronRight,
   CircleDashed,
@@ -19,7 +20,6 @@ import {
   Plus,
   Pencil,
   RefreshCw,
-  Save,
   Search,
   Trash2,
   X,
@@ -414,62 +414,48 @@ function TopicRow({
       setError(cause instanceof Error ? cause.message : '保存失败');
     } finally { setSaving(false); }
   };
-  const removeTerm = async (index: number) => {
-    if (saving) return;
-    setSaving(true); setError(null);
-    try {
-      await onUpdate({
-        keyword: topic.keyword,
-        expandedTerms: topic.expandedTerms.filter((_, itemIndex) => itemIndex !== index),
-      });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : '删除扩展词失败');
-    } finally { setSaving(false); }
-  };
-  if (editing) return (
-    <article className="topic-row topic-row--editing">
-      <div className="topic-editor">
-        <label>主关键词<input value={draftKeyword} maxLength={100} onChange={(event) => setDraftKeyword(event.target.value)} /></label>
-        <div className="variant-editor" aria-label="扩展词">
-          <div className="variant-editor__chips">
-            {draftTerms.map((term, index) => <div className="variant-chip" key={index}>
-              <input
-                autoFocus={index === draftTerms.length - 1 && !term}
-                aria-label={`扩展词 ${index + 1}`}
-                value={term}
-                maxLength={100}
-                size={Math.max(4, term.length)}
-                onChange={(event) => setDraftTerms((current) => current.map((value, itemIndex) => itemIndex === index ? event.target.value : value))}
-              />
-              <button className="variant-chip__remove" type="button" aria-label={`删除 ${term || `扩展词 ${index + 1}`}`} onClick={() => setDraftTerms((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={14} /></button>
-            </div>)}
-            <button className="text-button variant-editor__add" type="button" onClick={() => {
-              setDraftTerms((current) => [...current, '']);
-            }}><Plus size={16} />添加扩展词</button>
-          </div>
-        </div>
-        {error && <p className="inline-error"><AlertCircle size={15} />{error}</p>}
-        <div className="topic-editor__actions">
-          <button className="button" type="button" disabled={saving || !draftKeyword.trim()} onClick={() => void save()}><Save size={16} />保存</button>
-          <button className="text-button" type="button" disabled={saving} onClick={() => setEditing(false)}><X size={16} />取消</button>
-        </div>
-      </div>
-    </article>
-  );
   return (
     <article className="topic-row">
       <div className="topic-row__main">
-        <div className="topic-row__title"><h2>{topic.keyword}</h2><span className={`run-state run-state--${topic.runStatus}`}>{statusLabel[topic.runStatus]}</span></div>
+        <div className="topic-row__title">{editing
+          ? <input
+              className="topic-row__keyword-input"
+              aria-label="主关键词"
+              autoFocus
+              value={draftKeyword}
+              maxLength={100}
+              onChange={(event) => setDraftKeyword(event.target.value)}
+            />
+          : <h2>{topic.keyword}</h2>}
+          <span className={`run-state run-state--${topic.runStatus}`}>{statusLabel[topic.runStatus]}</span>
+        </div>
         <p className="topic-schedule"><Clock3 size={14} />{topic.nextRunAt
           ? `下次自动更新 ${new Date(topic.nextRunAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · 每 ${topic.scheduleIntervalHours} 小时`
           : `每 ${topic.scheduleIntervalHours} 小时 · 等待首次自动更新`}</p>
-        {topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term, index) => <span key={term}>
-          <button className="term-list__remove" type="button" disabled={saving} aria-label={`删除扩展词 ${term}`} onClick={() => void removeTerm(index)}><X size={12} /></button>
-          <span>{term}</span>
-        </span>)}</div>}
+        {editing
+          ? <div className="term-list" aria-label="扩展词">
+              {draftTerms.map((term, index) => <span className="term-list__item term-list__item--editing" key={index}>
+                <button className="term-list__remove" type="button" aria-label={`删除扩展词 ${term || index + 1}`} onClick={() => setDraftTerms((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={12} /></button>
+                <input
+                  className="term-list__input"
+                  aria-label={`扩展词 ${index + 1}`}
+                  autoFocus={index === draftTerms.length - 1 && !term}
+                  value={term}
+                  maxLength={100}
+                  size={Math.max(4, term.length)}
+                  onChange={(event) => setDraftTerms((current) => current.map((value, itemIndex) => itemIndex === index ? event.target.value : value))}
+                />
+              </span>)}
+              <button className="term-list__add" type="button" onClick={() => setDraftTerms((current) => [...current, ''])}><Plus size={12} />添加扩展词</button>
+            </div>
+          : topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term) => <span className="term-list__item" key={term}>{term}</span>)}</div>}
+        {error && <p className="inline-error"><AlertCircle size={15} />{error}</p>}
         {topic.lastError && <p className="inline-error"><AlertCircle size={15} />{topic.lastError.message}</p>}
       </div>
-      <div className="topic-row__actions"><button
+      <div className="topic-row__actions">{editing ? <>
+        <button className="icon-button icon-button--success" type="button" title="保存修改" aria-label={`保存修改 ${topic.keyword}`} disabled={saving || !draftKeyword.trim()} onClick={() => void save()}><Check size={17} /></button>
+        <button className="icon-button" type="button" title="取消修改" aria-label={`取消修改 ${topic.keyword}`} disabled={saving} onClick={() => { setError(null); setEditing(false); }}><X size={17} /></button>
+      </> : <><button
         className="icon-button refresh-button"
         title="重新搜索"
         aria-label={`刷新 ${topic.keyword}`}
@@ -478,7 +464,7 @@ function TopicRow({
         onClick={onRefresh}
       ><RefreshCw className={pending ? 'spin' : undefined} size={17} /></button>
       <button className="icon-button" title="编辑" aria-label={`编辑 ${topic.keyword} 关键词`} onClick={() => { setDraftKeyword(topic.keyword); setDraftTerms(topic.expandedTerms); setEditing(true); }}><Pencil size={17} /></button>
-      <button className="icon-button icon-button--danger" title="删除" aria-label={`删除 ${topic.keyword} 关键词`} onClick={() => setConfirmingDelete(true)}><Trash2 size={17} /></button></div>
+      <button className="icon-button icon-button--danger" title="删除" aria-label={`删除 ${topic.keyword} 关键词`} onClick={() => setConfirmingDelete(true)}><Trash2 size={17} /></button></>}</div>
       {confirmingDelete && <div className="dialog-backdrop"><div className="confirm-dialog" role="dialog" aria-modal="true" aria-label="删除关键词确认">
         <h3>删除“{topic.keyword}”？</h3><p>关键词将从列表移除，历史内容仍会保留并标记为失效。</p>
         {error && <p className="inline-error">{error}</p>}
