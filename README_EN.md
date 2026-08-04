@@ -12,7 +12,7 @@
   <img alt="Status: Alpha" src="https://img.shields.io/badge/status-alpha-E8A23A">
   <img alt="Node.js 24 or newer" src="https://img.shields.io/badge/Node.js-%3E%3D24-339933?logo=nodedotjs&logoColor=white">
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white">
-  <a href="./LICENSE"><img alt="GPL-3.0-only license" src="https://img.shields.io/badge/license-GPL--3.0--only-1F6F5F"></a>
+  <a href="./LICENSE"><img alt="GPL-3.0-or-later license" src="https://img.shields.io/badge/license-GPL--3.0--or--later-1F6F5F"></a>
 </p>
 
 ![LetterMate unified discovery Feed](./docs/assets/lettermate-dashboard.png)
@@ -254,4 +254,4 @@ Report bugs and feature ideas through [GitHub Issues](https://github.com/sawaki-
 
 ## License
 
-LetterMate is released under the [GNU General Public License v3.0 only](./LICENSE). Distribution of the project or modified versions must comply with the source-code and license obligations of GPL v3.
+LetterMate is released under the [GNU General Public License v3.0 or later](./LICENSE). You may redistribute and modify it under GPL v3 or any later version, subject to the source-code and license obligations of the selected version.

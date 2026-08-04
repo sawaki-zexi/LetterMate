@@ -12,7 +12,7 @@
   <img alt="Status: Alpha" src="https://img.shields.io/badge/status-alpha-E8A23A">
   <img alt="Node.js 24 or newer" src="https://img.shields.io/badge/Node.js-%3E%3D24-339933?logo=nodedotjs&logoColor=white">
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white">
-  <a href="./LICENSE"><img alt="GPL-3.0-only license" src="https://img.shields.io/badge/license-GPL--3.0--only-1F6F5F"></a>
+  <a href="./LICENSE"><img alt="GPL-3.0-or-later license" src="https://img.shields.io/badge/license-GPL--3.0--or--later-1F6F5F"></a>
 </p>
 
 ![LetterMate 统一发现 Feed](./docs/assets/lettermate-dashboard.png)
@@ -258,4 +258,4 @@ Bug 和功能建议可通过 [GitHub Issues](https://github.com/sawaki-zexi/Lett
 
 ## 许可证
 
-本项目采用 [GNU General Public License v3.0 only](./LICENSE) 发布。分发本项目或其修改版本时，请遵守 GPL v3 的源代码与许可证义务。
+本项目采用 [GNU General Public License v3.0 or later](./LICENSE) 发布。你可以依据 GPL v3 或任何后续版本分发和修改本项目，但须遵守所选版本的源代码与许可证义务。
