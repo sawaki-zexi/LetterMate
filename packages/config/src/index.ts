@@ -66,6 +66,13 @@ const baseConfigSchema = z.object({
   SEARCH_PROVIDER: optionalNonEmptyString,
   SEARCH_API_KEY: optionalNonEmptyString,
   SEARCH_API_BASE_URL: optionalUrl,
+  TAVILY_API_KEY: optionalNonEmptyString,
+  TAVILY_API_BASE_URL: optionalUrl,
+  BING_SEARCH_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  BING_SEARCH_BASE_URL: optionalUrl,
   DISCOVERY_RSS_FEED_URLS: rssFeedUrls,
   DISCOVERY_RUN_TIMEOUT_MS: z.coerce
     .number()

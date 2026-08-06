@@ -1,6 +1,7 @@
 import type { AppConfig } from '@lettermate/config';
 import { ContentFetcher } from './content-fetcher.js';
 import { ArxivConnector } from './connectors/arxiv.js';
+import { BingConnector } from './connectors/bing.js';
 import { BilibiliConnector } from './connectors/bilibili.js';
 import { BlueskyConnector } from './connectors/bluesky.js';
 import { GitHubConnector } from './connectors/github.js';
@@ -8,6 +9,7 @@ import { HackerNewsConnector } from './connectors/hacker-news.js';
 import { OpenRouterSearchConnector } from './connectors/openrouter-search.js';
 import { RedditConnector } from './connectors/reddit.js';
 import { RssConnector } from './connectors/rss.js';
+import { TavilyConnector } from './connectors/tavily.js';
 import { SearchProviderConnector } from './connectors/search-provider.js';
 import { TwitterApiIoConnector } from './connectors/twitterapi-io.js';
 import type { SourceConnector } from './connectors/types.js';
@@ -40,6 +42,14 @@ export function createSourceConnectors(
       provider: 'brave',
       apiKey: config.SEARCH_PROVIDER === 'brave' ? config.SEARCH_API_KEY : undefined,
       ...(config.SEARCH_API_BASE_URL ? { baseUrl: config.SEARCH_API_BASE_URL } : {}),
+    }, fetcher),
+    new TavilyConnector({
+      apiKey: config.TAVILY_API_KEY,
+      ...(config.TAVILY_API_BASE_URL ? { baseUrl: config.TAVILY_API_BASE_URL } : {}),
+    }, fetcher),
+    new BingConnector({
+      enabled: config.BING_SEARCH_ENABLED,
+      ...(config.BING_SEARCH_BASE_URL ? { baseUrl: config.BING_SEARCH_BASE_URL } : {}),
     }, fetcher),
     new YouTubeConnector({ apiKey: config.YOUTUBE_API_KEY }, fetcher),
     new RedditConnector({

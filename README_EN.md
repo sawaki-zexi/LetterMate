@@ -80,7 +80,7 @@ LetterMate does not expose trust scores, source rankings, evidence counts, inter
 | Feeds and communities | RSS/Atom, Hacker News, Reddit | RSS requires URLs; Reddit requires OAuth credentials |
 | Research and code | arXiv, GitHub | arXiv is keyless; a GitHub token is optional |
 | Video | YouTube, Bilibili | YouTube requires a key; Bilibili is keyless |
-| General search | Brave-compatible Search | Provider, key, and optional compatible endpoint |
+| General search | Brave-compatible Search, Tavily, China Bing | Brave/Tavily require keys; China Bing is keyless |
 
 Trend inputs include X Trends, Hacker News Top Stories, YouTube Most Popular, Hot posts from configured Reddit communities, Bilibili popular content, and Google Trends RSS. A trend input produces only a `TrendSeed`; it must still pass the main discovery and quality pipeline before reaching the Feed.
 
@@ -139,6 +139,18 @@ AI_API_KEY=your-openrouter-key
 
 The default model is `openrouter/auto`. Keep real secrets only in the untracked local `.env` file.
 
+Optional web sources can be enabled with:
+
+```env
+# Tavily uses the official JSON API and requires a Tavily key.
+TAVILY_API_KEY=tvly-your-key
+
+# China Bing uses the public cn.bing.com HTML search page and does not require a key.
+BING_SEARCH_ENABLED=true
+```
+
+Brave remains available through `SEARCH_PROVIDER=brave` and `SEARCH_API_KEY`. Restart the Worker after changing `.env`.
+
 ### 3. Start infrastructure and apply migrations
 
 ```powershell
@@ -175,6 +187,8 @@ See [`.env.example`](./.env.example) for the complete definition and non-sensiti
 | Optional sources | `TWITTERAPI_IO_API_KEY`, `GITHUB_TOKEN`, `YOUTUBE_API_KEY` | X, GitHub, and YouTube |
 | Reddit | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth |
 | General search | `SEARCH_PROVIDER`, `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search |
+| Tavily | `TAVILY_API_KEY`, `TAVILY_API_BASE_URL` | Tavily Search API; key required |
+| China Bing | `BING_SEARCH_ENABLED`, `BING_SEARCH_BASE_URL` | Public `cn.bing.com` HTML search; no key required |
 | Feeds | `DISCOVERY_RSS_FEED_URLS`, `TREND_GOOGLE_RSS_URLS` | Main discovery and trend RSS URLs |
 | Discovery scheduling | `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | Timeout, concurrency, and Topic scheduling |
 | Trend scheduling | `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | Trend switch and initial interval for a missing monitor |
@@ -228,7 +242,7 @@ npm test -- apps/worker/src/twitterapi-io.live.test.ts
 Implemented:
 
 - Persisted Topic and trend discovery pipelines.
-- 11 main discovery connectors and 6 trend inputs.
+- 14 main discovery connectors and 6 trend inputs.
 - Scheduling, lease recovery, idempotent refresh, and run summaries.
 - Unified Feed, time/origin filters, calendar grouping, and responsive UI.
 - Offline default automation and credential-gated live smoke-test entry points.

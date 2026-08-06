@@ -377,6 +377,18 @@ export function configuredDiscoverySources(
       status: status(config.SEARCH_PROVIDER === 'brave' && Boolean(config.SEARCH_API_KEY)),
     },
     {
+      id: 'search-tavily',
+      label: 'Tavily',
+      category: 'web',
+      status: status(Boolean(config.TAVILY_API_KEY)),
+    },
+    {
+      id: 'search-bing',
+      label: 'Bing (China)',
+      category: 'web',
+      status: status(config.BING_SEARCH_ENABLED),
+    },
+    {
       id: 'youtube',
       label: 'YouTube',
       category: 'video',

@@ -16,6 +16,8 @@ describe('worker connector runtime', () => {
       'arxiv',
       'github',
       'search-brave',
+      'search-tavily',
+      'search-bing',
       'youtube',
       'reddit',
       'bluesky',
@@ -26,6 +28,7 @@ describe('worker connector runtime', () => {
       'hacker-news',
       'arxiv',
       'github',
+      'search-bing',
       'bluesky',
       'bilibili',
     ]);
@@ -35,6 +38,7 @@ describe('worker connector runtime', () => {
     const connectors = createSourceConnectors(parseConfig({
       AI_API_KEY: 'openrouter-test-key',
       TWITTERAPI_IO_API_KEY: 'twitter-test-key',
+      TAVILY_API_KEY: 'tavily-test-key',
       SEARCH_PROVIDER: 'brave',
       SEARCH_API_KEY: 'search-test-key',
       YOUTUBE_API_KEY: 'youtube-test-key',
@@ -48,6 +52,8 @@ describe('worker connector runtime', () => {
 
     expect([...enabled]).toEqual(expect.arrayContaining([
       'twitterapi-io',
+      'search-tavily',
+      'search-bing',
       'rss',
       'search-brave',
       'youtube',

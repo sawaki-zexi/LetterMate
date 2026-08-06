@@ -13,6 +13,8 @@ export interface SourceRoutingInput {
 const connectorSourceTypes: Record<string, SourceType> = {
   'openrouter-search': 'web',
   'search-brave': 'web',
+  'search-tavily': 'web',
+  'search-bing': 'web',
   rss: 'feed',
   'twitterapi-io': 'social',
   bluesky: 'social',
@@ -25,6 +27,8 @@ const connectorSourceTypes: Record<string, SourceType> = {
 };
 
 const technicalConnectors = [
+  'search-tavily',
+  'search-bing',
   'openrouter-search',
   'search-brave',
   'rss',
@@ -36,6 +40,8 @@ const technicalConnectors = [
 ];
 
 const productConnectors = [
+  'search-tavily',
+  'search-bing',
   'openrouter-search',
   'search-brave',
   'rss',
@@ -48,6 +54,9 @@ const productConnectors = [
 
 const balancedConnectors = [
   'openrouter-search',
+  'search-brave',
+  'search-tavily',
+  'search-bing',
   'rss',
   'hacker-news',
   'github',

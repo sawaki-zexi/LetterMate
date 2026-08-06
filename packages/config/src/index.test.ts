@@ -117,6 +117,10 @@ describe('configuration', () => {
         SEARCH_PROVIDER: 'search-provider',
         SEARCH_API_KEY: 'search-key',
         SEARCH_API_BASE_URL: 'https://search.example.com/v1',
+        TAVILY_API_KEY: 'tavily-key',
+        TAVILY_API_BASE_URL: 'https://tavily.example.com/search',
+        BING_SEARCH_ENABLED: 'false',
+        BING_SEARCH_BASE_URL: 'https://cn.bing.com/search',
       }),
     ).toMatchObject({
       TWITTERAPI_IO_API_KEY: 'x-key',
@@ -127,6 +131,10 @@ describe('configuration', () => {
       SEARCH_PROVIDER: 'search-provider',
       SEARCH_API_KEY: 'search-key',
       SEARCH_API_BASE_URL: 'https://search.example.com/v1',
+      TAVILY_API_KEY: 'tavily-key',
+      TAVILY_API_BASE_URL: 'https://tavily.example.com/search',
+      BING_SEARCH_ENABLED: false,
+      BING_SEARCH_BASE_URL: 'https://cn.bing.com/search',
     });
   });
 

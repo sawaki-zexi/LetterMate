@@ -82,7 +82,7 @@ LetterMate 不向用户展示可信分数、来源排名、证据数量、内部
 | Feed 与社区 | RSS/Atom、Hacker News、Reddit | RSS 需要 URL；Reddit 需要 OAuth 凭据 |
 | 研究与代码 | arXiv、GitHub | arXiv 无 Key；GitHub Token 可选 |
 | 视频 | YouTube、Bilibili | YouTube 需要 Key；Bilibili 无 Key |
-| 通用搜索 | Brave-compatible Search | Provider、Key 和可选兼容端点 |
+| 通用搜索 | Brave-compatible Search、Tavily、国内 Bing | Brave/Tavily 需要 Key；国内 Bing 无 Key |
 
 趋势输入包括 X Trends、Hacker News Top Stories、YouTube Most Popular、指定 Reddit 社区 Hot、Bilibili 热门和 Google Trends RSS。趋势输入只提供 `TrendSeed`；进入 Feed 前仍必须经过主发现和质量管线。
 
@@ -141,6 +141,18 @@ AI_API_KEY=your-openrouter-key
 
 默认模型为 `openrouter/auto`。真实密钥只能保存在未跟踪的本地 `.env` 中。
 
+可选网页搜索源：
+
+```env
+# Tavily 使用官方 JSON API，需要 Tavily Key
+TAVILY_API_KEY=tvly-your-key
+
+# 国内 Bing 使用公开的 cn.bing.com 网页搜索，不需要 Key
+BING_SEARCH_ENABLED=true
+```
+
+Brave 仍通过 `SEARCH_PROVIDER=brave` 和 `SEARCH_API_KEY` 配置。修改 `.env` 后需要重启 Worker。
+
 ### 3. 启动基础设施并迁移数据库
 
 ```powershell
@@ -177,6 +189,8 @@ npm run dev -w @lettermate/worker
 | 可选来源 | `TWITTERAPI_IO_API_KEY`, `GITHUB_TOKEN`, `YOUTUBE_API_KEY` | X、GitHub 和 YouTube |
 | Reddit | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth |
 | 通用搜索 | `SEARCH_PROVIDER`, `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search |
+| Tavily | `TAVILY_API_KEY`, `TAVILY_API_BASE_URL` | Tavily Search API；需要 Key |
+| 国内 Bing | `BING_SEARCH_ENABLED`, `BING_SEARCH_BASE_URL` | 公开的 `cn.bing.com` 网页搜索；不需要 Key |
 | Feed | `DISCOVERY_RSS_FEED_URLS`, `TREND_GOOGLE_RSS_URLS` | 主发现与趋势 RSS URL |
 | 发现调度 | `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | 超时、并发和 Topic 调度 |
 | 趋势调度 | `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | 趋势开关与缺失 Monitor 的初始周期 |
@@ -232,7 +246,7 @@ npm test -- apps/worker/src/twitterapi-io.live.test.ts
 已实现：
 
 - Topic 与趋势两条持久化发现管线。
-- 11 个主发现连接器和 6 个趋势输入。
+- 14 个主发现连接器和 6 个趋势输入。
 - 调度、租约恢复、幂等刷新和运行摘要。
 - 统一 Feed、已入库文章搜索、时间/来源筛选、日期分组和响应式界面。
 - 默认离线自动化测试与凭据型 live smoke test 入口。
