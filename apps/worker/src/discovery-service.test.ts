@@ -19,6 +19,7 @@ const topicRow = {
   keyword: 'AI Agent',
   normalizedKeyword: 'ai agent',
   expandedTerms: ['agent'],
+  keywordProfile: 'unknown' as const,
   createdAt: new Date('2026-07-24T07:00:00.000Z'),
   lastRunAt: new Date('2026-07-27T07:00:00.000Z'),
   nextRunAt: new Date('2026-07-27T19:00:00.000Z'),
@@ -110,7 +111,8 @@ describe('PrismaDiscoveryRepository', () => {
     const runId = await repository.beginRun('topic-1', 'scheduled', startedAt);
 
     expect(runId).toMatchObject({
-      runId: 'run-1', keyword: 'AI Agent', expandedTerms: ['agent'], initialExpansion: false,
+      runId: 'run-1', keyword: 'AI Agent', keywordProfile: { kind: 'domain' },
+      expandedTerms: ['agent'], initialExpansion: false,
     });
     expect(transaction.discoveryRun.create).toHaveBeenCalledWith({
       data: {
@@ -119,6 +121,7 @@ describe('PrismaDiscoveryRepository', () => {
         trigger: 'scheduled',
         keywordSnapshot: 'AI Agent',
         expandedTermsSnapshot: ['agent'],
+        keywordProfileSnapshot: 'domain',
         status: 'running',
         startedAt,
       },
@@ -126,7 +129,7 @@ describe('PrismaDiscoveryRepository', () => {
     });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1', deletedAt: null,
+        id: 'topic-1', deletedAt: null, pausedAt: null,
         activeRunId: null,
         OR: [
           { runStatus: { not: 'running' } },
@@ -138,6 +141,7 @@ describe('PrismaDiscoveryRepository', () => {
         runStatus: 'running',
         activeRunId: expect.any(String),
         runLeaseUntil: new Date('2026-07-27T09:20:00.000Z'),
+        keywordProfile: 'domain',
         lastError: expect.anything(),
       }),
     });
@@ -154,6 +158,23 @@ describe('PrismaDiscoveryRepository', () => {
     );
 
     expect(runId).toBeNull();
+    expect(transaction.discoveryRun.create).not.toHaveBeenCalled();
+  });
+
+  it('does not begin a run for a paused topic', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue(null);
+
+    const begun = await new PrismaDiscoveryRepository(prisma).beginRun(
+      'topic-1',
+      'scheduled',
+      new Date('2026-07-27T09:00:00.000Z'),
+    );
+
+    expect(begun).toBeNull();
+    expect(transaction.topic.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'topic-1', deletedAt: null, pausedAt: null },
+    }));
     expect(transaction.discoveryRun.create).not.toHaveBeenCalled();
   });
 
@@ -176,11 +197,12 @@ describe('PrismaDiscoveryRepository', () => {
     );
 
     expect(runId).toMatchObject({
-      runId: 'run-1', keyword: 'AI Agent', expandedTerms: ['agent'], initialExpansion: false,
+      runId: 'run-1', keyword: 'AI Agent', keywordProfile: { kind: 'domain' },
+      expandedTerms: ['agent'], initialExpansion: false,
     });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1', deletedAt: null,
+        id: 'topic-1', deletedAt: null, pausedAt: null,
         activeRunId: 'stale-run',
         OR: [
           { runStatus: { not: 'running' } },
@@ -502,6 +524,7 @@ function createOrchestration(keyword = 'AI Agent') {
   const router = {
     route: vi.fn((input: {
       keyword: string;
+      keywordProfile?: { kind: 'entity' | 'domain' | 'unknown' };
       expanded: { terms: string[]; searchQueries: string[] };
       windowStart: string;
       windowEnd: string;
@@ -561,6 +584,7 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     });
     expect(router.route).toHaveBeenCalledWith({
       keyword: 'AI Agent',
+      keywordProfile: { kind: 'domain' },
       expanded: {
         terms: ['intelligent agent'],
         searchQueries: ['AI agent release', '智能体 发布'],
@@ -717,6 +741,37 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     expect(transaction.topic.update.mock.calls.at(-1)?.[0].data).toMatchObject({
       runStatus: 'failed', queuedTrigger: null, nextRunAt: null,
     });
+  });
+
+  it('lets an active run finish without rescheduling a topic paused during the run', async () => {
+    const { prisma, transaction } = createPrisma();
+    transaction.topic.findFirst.mockResolvedValue({
+      ...topicRow,
+      manualRefreshPending: false,
+      variantsInitialized: true,
+      deletedAt: null,
+      pausedAt: finishedAt,
+    });
+
+    const result = await new PrismaDiscoveryRepository(prisma).saveSuccess({
+      runId: 'run-1', topicId: 'topic-1', trigger: 'scheduled', expandedTerms: [],
+      initializeVariants: false, items: [item], connectorSummary: {
+        successfulConnectorIds: ['rss'], skippedConnectorIds: [], failures: [],
+      }, candidateCount: 1, acceptedCount: 1, finishedAt, persistenceTimeoutMs: 12_345,
+      schedule: {
+        nextRunAt: new Date('2026-07-28T10:00:00.000Z'),
+        scheduleIntervalHours: 24,
+        productiveRunStreak: 0,
+        emptyRunStreak: 0,
+      },
+    });
+
+    expect(result).toEqual({ newItemCount: 1, pendingManualRefresh: false });
+    const topicUpdate = transaction.topic.update.mock.calls.at(-1)?.[0].data;
+    expect(topicUpdate).toMatchObject({
+      runStatus: 'succeeded', queuedTrigger: null, nextRunAt: null,
+    });
+    expect(topicUpdate.scheduleIntervalHours).toBeUndefined();
   });
 
   it('uses the frozen user-managed variants without asking AI to expand again', async () => {

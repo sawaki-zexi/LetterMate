@@ -1,6 +1,6 @@
 import type { FeedOrigin } from '@lettermate/contracts';
 
-export type FeedSourceSelection = 'all' | 'trend' | `topic:${string}`;
+export type FeedSourceSelection = 'all' | 'trend' | 'creator' | `topic:${string}`;
 
 export interface FeedSourceFilter {
   origin: FeedOrigin;
@@ -12,7 +12,7 @@ export function topicSourceSelection(topicId: string): FeedSourceSelection {
 }
 
 export function feedFilterForSource(selection: FeedSourceSelection): FeedSourceFilter {
-  if (selection === 'all' || selection === 'trend') {
+  if (selection === 'all' || selection === 'trend' || selection === 'creator') {
     return { origin: selection };
   }
 

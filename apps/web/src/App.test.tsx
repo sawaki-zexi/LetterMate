@@ -5,8 +5,13 @@ import { readFileSync } from 'node:fs';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
+  Creator,
+  CreatorItem,
+  CreatorIdentityCandidate,
+  CreatorPlatformStatus,
   DiscoverySourceStatus,
   FeedItem,
+  InterestMemory,
   RunSummary,
   Topic,
   TrendStatus,
@@ -42,6 +47,7 @@ function topic(id: string, keyword: string, lastRun: RunSummary | null = null): 
     keyword,
     expandedTerms: [`${keyword} news`],
     createdAt: new Date(now.getTime() - 86_400_000).toISOString(),
+    pausedAt: null,
     lastRunAt: lastRun?.startedAt ?? null,
     nextRunAt: new Date(now.getTime() + 43_200_000).toISOString(),
     scheduleIntervalHours: 12,
@@ -53,7 +59,7 @@ function topic(id: string, keyword: string, lastRun: RunSummary | null = null): 
 
 function feedItem(
   id: string,
-  origin: FeedItem['origin'],
+  origin: Extract<FeedItem['origin'], 'topic' | 'trend'>,
   ageInDays = 0,
   topicId = 'topic-1',
 ): FeedItem {
@@ -72,10 +78,15 @@ function feedItem(
     authorHandle: 'project',
     externalId: id,
     provenanceKind: 'api_record' as const,
+    contentKey: `https://example.com/${id}`,
+    feedback: null,
   };
   return origin === 'topic'
-    ? { ...common, origin, topicId, topicKeyword: 'gpt-5.7', topicKeywordActive: true }
-    : { ...common, origin, topicId: null };
+    ? {
+        ...common, origin, topicId, topicKeyword: 'gpt-5.7', topicKeywordActive: true,
+        origins: [{ origin: 'topic', topicId, topicKeyword: 'gpt-5.7', topicKeywordActive: true }],
+      }
+    : { ...common, origin, topicId: null, origins: [{ origin: 'trend' }] };
 }
 
 const initialTrendStatus: TrendStatus = {
@@ -89,6 +100,10 @@ const initialTrendStatus: TrendStatus = {
 const requests: Array<{ url: string; method: string; body?: unknown }> = [];
 
 interface FetchMockOptions {
+  creatorCandidates?: CreatorIdentityCandidate[];
+  creatorItems?: CreatorItem[];
+  creatorPlatforms?: CreatorPlatformStatus[];
+  creators?: Creator[];
   topics?: Topic[];
   topicsResponse?: Promise<Topic[]>;
   feed?: FeedItem[];
@@ -103,11 +118,17 @@ interface FetchMockOptions {
   trendCompletionCount?: number;
   trendStatusFailures?: number;
   feedRefetchFailures?: number;
+  feedbackFailure?: boolean;
   topicCompletionAfterPolls?: number;
   trendStatus?: TrendStatus;
+  interests?: InterestMemory;
 }
 
 function installFetchMock({
+  creatorCandidates = [],
+  creatorItems = [],
+  creatorPlatforms = [{ id: 'rss', label: 'RSS/Atom', status: 'enabled' }],
+  creators: initialCreators = [],
   topics: initialTopics = [],
   topicsResponse,
   feed = [],
@@ -122,10 +143,15 @@ function installFetchMock({
   trendCompletionCount = 0,
   trendStatusFailures: initialTrendStatusFailures = 0,
   feedRefetchFailures: initialFeedRefetchFailures = 0,
+  feedbackFailure = false,
   topicCompletionAfterPolls = 1,
   trendStatus: configuredTrendStatus = initialTrendStatus,
+  interests: initialInterests = {
+    personalizationEnabled: true, resetAt: null, recent: [], longTerm: [], reduced: [],
+  },
 }: FetchMockOptions = {}) {
   const refreshedTopicIds = new Set<string>();
+  let currentCreators = initialCreators;
   let currentTopics = initialTopics;
   const topicRefreshGenerations = new Map<string, number>();
   let trendRefreshStarted = false;
@@ -140,6 +166,66 @@ function installFetchMock({
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     requests.push({ url, method, body });
 
+    if (url.endsWith('/interests/settings') && method === 'PUT') {
+      initialInterests = { ...initialInterests, personalizationEnabled: body.personalizationEnabled };
+      return Response.json(initialInterests);
+    }
+    const forgottenInterest = url.match(/\/interests\/([^/]+)$/);
+    if (forgottenInterest && method === 'DELETE') {
+      const id = decodeURIComponent(forgottenInterest[1] ?? '');
+      initialInterests = {
+        ...initialInterests,
+        recent: initialInterests.recent.filter((theme) => theme.id !== id),
+        longTerm: initialInterests.longTerm.filter((theme) => theme.id !== id),
+        reduced: initialInterests.reduced.filter((theme) => theme.id !== id),
+      };
+      return Response.json(initialInterests);
+    }
+    if (url.endsWith('/interests') && method === 'DELETE') {
+      initialInterests = { ...initialInterests, resetAt: now.toISOString(), recent: [], longTerm: [], reduced: [] };
+      return Response.json(initialInterests);
+    }
+    if (url.endsWith('/interests')) return Response.json(initialInterests);
+
+    if (url.endsWith('/creators/resolve') && method === 'POST') {
+      return Response.json({ candidates: creatorCandidates });
+    }
+    if (url.endsWith('/creator-platforms')) return Response.json(creatorPlatforms);
+    if (/\/creators\/[^/]+\/items$/.test(url)) return Response.json(creatorItems);
+    if (url.endsWith('/creators') && method === 'POST') {
+      const selected = creatorCandidates.filter((candidate) => (
+        body.resolutionTokens?.includes(candidate.resolutionToken)
+      ));
+      const candidate = selected[0];
+      const creator: Creator = {
+        id: 'creator-1', userId: 'user-a', platform: 'rss', displayName: candidate?.displayName ?? 'example.com',
+        profileUrl: candidate?.profileUrl ?? body.url,
+        feedUrl: candidate?.feedUrl ?? body.url,
+        createdAt: now.toISOString(), pausedAt: null,
+        lastRunAt: null, nextRunAt: null, runStatus: 'queued', lastError: null, lastRun: null,
+      };
+      currentCreators = [creator, ...currentCreators];
+      return Response.json(body.resolutionTokens ? [creator] : creator, { status: 202 });
+    }
+    const creatorMatch = url.match(/\/creators\/([^/]+)$/);
+    if (creatorMatch && method === 'DELETE') {
+      currentCreators = currentCreators.filter((creator) => creator.id !== decodeURIComponent(creatorMatch[1] ?? ''));
+      return new Response(null, { status: 204 });
+    }
+    const creatorRefreshMatch = url.match(/\/creators\/([^/]+)\/refresh$/);
+    if (creatorRefreshMatch && method === 'POST') {
+      const id = decodeURIComponent(creatorRefreshMatch[1] ?? '');
+      return Response.json(currentCreators.find((creator) => creator.id === id)!);
+    }
+    const creatorUpdateMatch = url.match(/\/creators\/([^/]+)$/);
+    if (creatorUpdateMatch && method === 'PATCH') {
+      const id = decodeURIComponent(creatorUpdateMatch[1] ?? '');
+      const updated = { ...currentCreators.find((creator) => creator.id === id)!, pausedAt: body.paused ? now.toISOString() : null };
+      currentCreators = currentCreators.map((creator) => creator.id === id ? updated : creator);
+      return Response.json(updated);
+    }
+    if (url.endsWith('/creators')) return Response.json(currentCreators);
+
     if (url.endsWith('/topics') && method === 'POST') {
       if (createFailure) {
         return Response.json({ code: 'CREATE_FAILED', message: 'Create failed', traceId: 'test' }, { status: 503 });
@@ -151,6 +237,22 @@ function installFetchMock({
       const topicId = decodeURIComponent(topicUpdateMatch[1] ?? '');
       const existing = currentTopics.find((candidate) => candidate.id === topicId)!;
       const updated = { ...existing, ...(body as { keyword: string; expandedTerms: string[] }) };
+      currentTopics = currentTopics.map((candidate) => candidate.id === topicId ? updated : candidate);
+      return Response.json(updated);
+    }
+    const topicLifecycleMatch = url.match(/\/topics\/([^/]+)\/(pause|resume)$/);
+    if (topicLifecycleMatch && method === 'POST') {
+      const topicId = decodeURIComponent(topicLifecycleMatch[1] ?? '');
+      const action = topicLifecycleMatch[2];
+      const existing = currentTopics.find((candidate) => candidate.id === topicId)!;
+      const updated = action === 'pause'
+        ? { ...existing, pausedAt: now.toISOString(), nextRunAt: null }
+        : {
+            ...existing,
+            pausedAt: null,
+            runStatus: 'queued' as const,
+            lastRun: runSummary(`resume-${topicId}`, 'queued'),
+          };
       currentTopics = currentTopics.map((candidate) => candidate.id === topicId ? updated : candidate);
       return Response.json(updated);
     }
@@ -189,6 +291,18 @@ function installFetchMock({
         : configuredTrendStatus);
     }
     if (url.endsWith('/discovery-sources')) return Response.json(sources);
+    const feedbackMatch = url.match(/\/feedback\/(.+)$/);
+    if (feedbackMatch && method === 'PUT') {
+      if (feedbackFailure) {
+        return Response.json({
+          code: 'FEEDBACK_UNAVAILABLE', message: '反馈暂时无法保存', traceId: 'test',
+        }, { status: 503 });
+      }
+      return Response.json({
+        contentKey: decodeURIComponent(feedbackMatch[1] ?? ''),
+        value: body.value,
+      });
+    }
     if (/\/items\/[^/?]+$/.test(url)) return Response.json(item!);
     if (url.includes('/feed')) {
       feedRequestCount += 1;
@@ -330,7 +444,7 @@ describe('discovery workspace', () => {
     const source = await screen.findByRole('combobox', { name: '来源' });
     await within(source).findByRole('option', { name: 'AI Agent' });
     expect(within(source).getAllByRole('option').map((option) => option.textContent)).toEqual([
-      '全部来源', '全网趋势', 'AI Agent',
+      '全部来源', '全网趋势', '关注博主', 'AI Agent',
     ]);
 
     fireEvent.change(source, { target: { value: 'topic:topic-1' } });
@@ -473,7 +587,7 @@ describe('discovery workspace', () => {
     await screen.findByText('暂无发现内容');
     const source = screen.getByRole('combobox', { name: '来源' });
     expect(within(source).getAllByRole('option').map((option) => option.textContent)).toEqual([
-      '全部来源', '全网趋势',
+      '全部来源', '全网趋势', '关注博主',
     ]);
   });
 
@@ -734,7 +848,7 @@ describe('discovery workspace', () => {
     expect(requests.filter(({ url, method }) => url.includes('/topics/') && method === 'POST')).toHaveLength(2);
   });
 
-  it('submits one keyword and keeps schedule, expanded terms, errors, and source status', async () => {
+  it('submits one keyword and keeps schedule, errors, and source status', async () => {
     const created = topic('topic-created', 'AI Agent', runSummary('initial', 'queued'));
     const existing = {
       ...topic('topic-1', 'TypeScript'),
@@ -750,20 +864,211 @@ describe('discovery workspace', () => {
     });
     renderApp('/topics');
 
-    fireEvent.change(screen.getByLabelText('主题关键词'), { target: { value: 'AI Agent' } });
-    fireEvent.click(screen.getByRole('button', { name: '创建主题' }));
+    fireEvent.change(screen.getByLabelText('监控关键词'), { target: { value: 'AI Agent' } });
+    fireEvent.click(screen.getByRole('button', { name: '开始监控' }));
     await waitFor(() => expect(requests.find(({ url, method }) => (
       url.endsWith('/topics') && method === 'POST'
     ))?.body).toEqual({ keyword: 'AI Agent' }));
     expect((await screen.findAllByText(/每 12 小时/)).length).toBeGreaterThan(0);
-    expect(screen.getByText('TypeScript news')).toBeVisible();
     expect(screen.getByText('尚未配置 OpenRouter Key')).toBeVisible();
     expect(await screen.findByText('Hacker News')).toBeVisible();
     expect(screen.getByText('已启用')).toBeVisible();
-    expect(screen.getByText('待配置')).toBeVisible();
+    expect(screen.getByText('未配置')).toBeVisible();
+    expect(screen.getByText('1 个已启用 · 1 个未配置')).toBeVisible();
   });
 
-  it('edits the main keyword and expanded terms inline', async () => {
+  it('sets, clears, and switches persisted feedback on a Feed card', async () => {
+    installFetchMock({ feed: [feedItem('today', 'topic')] });
+    renderApp('/');
+
+    const interested = await screen.findByRole('button', { name: '感兴趣' });
+    const less = screen.getByRole('button', { name: '减少推荐' });
+    fireEvent.click(interested);
+    await waitFor(() => expect(interested).toHaveAttribute('aria-pressed', 'true'));
+    fireEvent.click(interested);
+    await waitFor(() => expect(interested).toHaveAttribute('aria-pressed', 'false'));
+    fireEvent.click(less);
+    await waitFor(() => expect(less).toHaveAttribute('aria-pressed', 'true'));
+
+    expect(requests.filter(({ url }) => url.includes('/feedback/')).map(({ body }) => body))
+      .toEqual([{ value: 'interested' }, { value: null }, { value: 'less' }]);
+  });
+
+  it('keeps prior feedback when persistence fails', async () => {
+    installFetchMock({
+      feed: [{ ...feedItem('today', 'topic'), feedback: 'interested' }],
+      feedbackFailure: true,
+    });
+    renderApp('/');
+
+    const interested = await screen.findByRole('button', { name: '感兴趣' });
+    const less = screen.getByRole('button', { name: '减少推荐' });
+    fireEvent.click(less);
+    expect(await screen.findByRole('alert')).toHaveTextContent('反馈暂时无法保存');
+    expect(interested).toHaveAttribute('aria-pressed', 'true');
+    expect(less).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('follows an RSS creator and shows lifecycle controls', async () => {
+    installFetchMock({
+      creatorCandidates: [{
+        resolutionToken: 'r'.repeat(32),
+        platform: 'rss',
+        displayName: 'Example Engineering',
+        handle: 'Example Team',
+        avatarUrl: null,
+        bio: 'Engineering updates',
+        verified: null,
+        profileUrl: 'https://example.com/',
+        feedUrl: 'https://example.com/feed.xml',
+      }],
+    });
+    renderApp('/creators');
+
+    expect(await screen.findByText('还没有关注博主')).toBeVisible();
+    expect(await screen.findByText('RSS/Atom')).toBeVisible();
+    expect(screen.getByText('可用')).toBeVisible();
+    fireEvent.change(screen.getByLabelText('博主或主页'), { target: { value: 'https://example.com/' } });
+    fireEvent.click(screen.getByRole('button', { name: '查找' }));
+    expect(await screen.findByText('Example Engineering')).toBeVisible();
+    expect(screen.getByLabelText('选择 Example Engineering RSS/Atom')).toBeChecked();
+    expect(requests.find(({ url, method }) => url.endsWith('/creators/resolve') && method === 'POST')?.body)
+      .toEqual({ input: 'https://example.com/' });
+    fireEvent.click(screen.getByRole('button', { name: '关注 1' }));
+    expect(await screen.findByRole('heading', { name: 'Example Engineering' })).toBeVisible();
+    expect(requests.find(({ url, method }) => url.endsWith('/creators') && method === 'POST')?.body)
+      .toEqual({ resolutionTokens: ['r'.repeat(32)] });
+    expect(screen.getByLabelText('暂停关注 Example Engineering')).toBeEnabled();
+    expect(screen.getByLabelText('查看 Example Engineering 的内容')).toHaveAttribute('href', '/creators/creator-1');
+    fireEvent.click(screen.getByLabelText('暂停关注 Example Engineering'));
+    await waitFor(() => expect(screen.getByLabelText('恢复关注 Example Engineering')).toBeEnabled());
+  });
+
+  it('shows every valid creator item and preserves repost and reply context', async () => {
+    const creator: Creator = {
+      id: 'creator-1', userId: 'user-a', platform: 'x', displayName: 'Example Engineering',
+      profileUrl: 'https://x.com/example', feedUrl: null, createdAt: now.toISOString(),
+      pausedAt: null, lastRunAt: now.toISOString(), nextRunAt: null, runStatus: 'succeeded',
+      lastError: null, lastRun: null,
+    };
+    const common: Omit<CreatorItem, 'id' | 'title' | 'contentType' | 'feedEligible'> = {
+      creatorId: creator.id,
+      kind: 'quality',
+      summary: '中文摘要',
+      reason: '与关注方向相关',
+      sourceUrls: ['https://x.com/example/status/1'],
+      publishedAt: now.toISOString(),
+      discoveredAt: now.toISOString(),
+      sourceType: 'social',
+      platform: 'X',
+      authorName: 'Example Engineering',
+      authorHandle: 'example',
+      externalId: '1',
+      provenanceKind: 'api_record',
+      originalAuthorName: null,
+      originalAuthorHandle: null,
+      originalContentId: null,
+      originalContentUrl: null,
+      parentContentId: null,
+      parentContentUrl: null,
+      parentContentText: null,
+    };
+    installFetchMock({
+      creators: [creator],
+      creatorItems: [{
+        ...common,
+        id: 'creator-item-repost',
+        title: '值得保留的转发',
+        contentType: 'repost',
+        feedEligible: false,
+        originalAuthorName: 'Original Author',
+        originalAuthorHandle: 'original',
+        originalContentId: 'original-1',
+        originalContentUrl: 'https://x.com/original/status/1',
+      }, {
+        ...common,
+        id: 'creator-item-reply',
+        title: '带上下文的回复',
+        contentType: 'reply',
+        feedEligible: true,
+        parentContentId: 'parent-1',
+        parentContentUrl: 'https://x.com/parent/status/1',
+        parentContentText: '这是需要保留的原帖内容。',
+      }],
+    });
+
+    renderApp('/creators/creator-1');
+
+    expect(await screen.findByRole('heading', { name: 'Example Engineering' })).toBeVisible();
+    expect(screen.getByText('值得保留的转发')).toBeVisible();
+    expect(screen.getByText('带上下文的回复')).toBeVisible();
+    expect(screen.getByText('仅博主档案')).toBeVisible();
+    expect(screen.getByText('已进入发现')).toBeVisible();
+    expect(screen.getByText('Original Author · @original')).toBeVisible();
+    expect(screen.getByText('这是需要保留的原帖内容。')).toBeVisible();
+    expect(requests).toContainEqual(expect.objectContaining({
+      url: '/api/v1/creators/creator-1/items',
+      method: 'GET',
+    }));
+  });
+
+  it('accepts a creator name and keeps an empty resolution distinct from creation', async () => {
+    installFetchMock();
+    renderApp('/creators');
+
+    fireEvent.change(await screen.findByLabelText('博主或主页'), {
+      target: { value: 'Karpathy' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '查找' }));
+
+    expect(await screen.findByText('未找到匹配账号')).toBeVisible();
+    expect(requests).toContainEqual(expect.objectContaining({
+      url: '/api/v1/creators/resolve',
+      method: 'POST',
+      body: { input: 'Karpathy' },
+    }));
+    expect(requests.some(({ url, method }) => url.endsWith('/creators') && method === 'POST'))
+      .toBe(false);
+  });
+
+  it('labels Bilibili creator candidates and platform capability correctly', async () => {
+    installFetchMock({
+      creatorPlatforms: [
+        { id: 'rss', label: 'RSS/Atom', status: 'enabled' },
+        { id: 'x', label: 'X', status: 'enabled' },
+        { id: 'bilibili', label: 'Bilibili', status: 'enabled' },
+      ],
+      creatorCandidates: [{
+        resolutionToken: 'b'.repeat(32),
+        platform: 'bilibili',
+        displayName: '影视飓风',
+        handle: 'UID 946974',
+        avatarUrl: 'https://i0.hdslb.com/avatar.jpg',
+        bio: '无限进步',
+        verified: true,
+        profileUrl: 'https://space.bilibili.com/946974',
+        feedUrl: null,
+      }],
+    });
+    renderApp('/creators');
+
+    fireEvent.change(await screen.findByLabelText('博主或主页'), {
+      target: { value: 'https://space.bilibili.com/946974' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '查找' }));
+
+    expect(await screen.findByText('影视飓风')).toBeVisible();
+    expect(screen.getByLabelText('选择 影视飓风 Bilibili')).toBeChecked();
+    expect(screen.getByText('UID 946974')).toBeVisible();
+    expect(screen.getAllByText('Bilibili').length).toBeGreaterThanOrEqual(2);
+    const avatar = document.querySelector<HTMLImageElement>('img[src="https://i0.hdslb.com/avatar.jpg"]');
+    expect(avatar).toHaveAttribute('referrerpolicy', 'no-referrer');
+    fireEvent.error(avatar!);
+    expect(document.querySelector('img[src="https://i0.hdslb.com/avatar.jpg"]')).not.toBeInTheDocument();
+    expect(document.querySelector('.creator-candidate__avatar')).toBeInTheDocument();
+  });
+
+  it('edits only the main keyword and lets the worker regenerate variants', async () => {
     const existing = {
       ...topic('topic-1', 'AI Agent'),
       expandedTerms: ['AI agent', '智能体'],
@@ -771,70 +1076,42 @@ describe('discovery workspace', () => {
     installFetchMock({ topics: [existing] });
     renderApp('/topics');
 
-    expect(await screen.findByText('AI agent')).toBeVisible();
-    expect(screen.queryAllByRole('button', { name: /删除扩展词/ })).toHaveLength(0);
     fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
     const keyword = screen.getByRole('textbox', { name: '主关键词' });
     expect(keyword).toHaveValue('AI Agent');
     fireEvent.change(keyword, { target: { value: 'Agent Workspace' } });
-    const firstTerm = screen.getByRole('textbox', { name: '扩展词 1' });
-    fireEvent.change(firstTerm, { target: { value: 'agent framework' } });
-    fireEvent.click(screen.getByRole('button', { name: '删除扩展词 智能体' }));
-    fireEvent.click(screen.getByRole('button', { name: '添加扩展词' }));
-
-    const addedTerm = screen.getByRole('textbox', { name: '扩展词 2' });
-    expect(addedTerm).toHaveFocus();
-    fireEvent.change(addedTerm, { target: { value: 'agent tools' } });
     expect(screen.queryByRole('button', { name: '刷新 AI Agent' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '删除 AI Agent 关键词' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '保存修改 AI Agent' }));
 
     await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
       keyword: 'Agent Workspace',
-      expandedTerms: ['agent framework', 'agent tools'],
+      expandedTerms: [],
     }));
   });
 
-  it('saves an existing topic with all AI-generated expanded terms', async () => {
-    const expandedTerms = Array.from({ length: 28 }, (_, index) => `AI agent term ${index + 1}`);
-    const existing = {
-      ...topic('topic-1', 'AI Agent'),
-      expandedTerms,
-    };
-    installFetchMock({ topics: [existing] });
+  it('pauses and resumes a keyword monitor from its row', async () => {
+    installFetchMock({ topics: [topic('topic-1', 'AI Agent')] });
     renderApp('/topics');
 
-    fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
-    fireEvent.change(screen.getByRole('textbox', { name: '主关键词' }), {
-      target: { value: 'Agent Workspace' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: '保存修改 AI Agent' }));
-
-    await waitFor(() => expect(requests.find(({ method }) => method === 'PATCH')?.body).toEqual({
-      keyword: 'Agent Workspace',
-      expandedTerms,
+    fireEvent.click(await screen.findByRole('button', {
+      name: '暂停 AI Agent 关键词监控',
     }));
-  });
 
-  it('discards expanded term chip drafts', async () => {
-    const existing = {
-      ...topic('topic-1', 'AI Agent'),
-      expandedTerms: ['AI agent', '智能体'],
-    };
-    installFetchMock({ topics: [existing] });
-    renderApp('/topics');
+    await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({
+      url: '/api/v1/topics/topic-1/pause',
+      method: 'POST',
+    })));
+    expect(await screen.findByText('已暂停自动更新')).toBeVisible();
+    expect(screen.getByRole('button', { name: '刷新 AI Agent' })).toBeDisabled();
 
-    fireEvent.click(await screen.findByRole('button', { name: '编辑 AI Agent 关键词' }));
-    fireEvent.change(screen.getByRole('textbox', { name: '扩展词 1' }), {
-      target: { value: 'changed draft' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: '删除扩展词 智能体' }));
-    fireEvent.click(screen.getByRole('button', { name: '取消修改 AI Agent' }));
-    fireEvent.click(screen.getByRole('button', { name: '编辑 AI Agent 关键词' }));
+    fireEvent.click(screen.getByRole('button', { name: '恢复 AI Agent 关键词监控' }));
 
-    expect(screen.getByRole('textbox', { name: '扩展词 1' })).toHaveValue('AI agent');
-    expect(screen.getByRole('textbox', { name: '扩展词 2' })).toHaveValue('智能体');
-    expect(requests.some(({ method }) => method === 'PATCH')).toBe(false);
+    await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({
+      url: '/api/v1/topics/topic-1/resume',
+      method: 'POST',
+    })));
+    expect(await screen.findByRole('button', { name: '暂停 AI Agent 关键词监控' })).toBeVisible();
   });
 
   it('shows immediate Topic creation progress before the API responds', async () => {
@@ -842,10 +1119,10 @@ describe('discovery workspace', () => {
     const createdResponse = new Promise<Topic>((resolve) => { resolveCreated = resolve; });
     installFetchMock({ createdResponse });
     renderApp('/topics');
-    await screen.findByText('尚未创建主题');
+    await screen.findByText('尚未创建关键词监控');
 
-    fireEvent.change(screen.getByLabelText('主题关键词'), { target: { value: 'Rust' } });
-    fireEvent.click(screen.getByRole('button', { name: '创建主题' }));
+    fireEvent.change(screen.getByLabelText('监控关键词'), { target: { value: 'Rust' } });
+    fireEvent.click(screen.getByRole('button', { name: '开始监控' }));
 
     const pending = screen.getByRole('status', { name: /Rust/ });
     expect(pending).toBeVisible();
@@ -858,22 +1135,55 @@ describe('discovery workspace', () => {
   it('removes failed creation progress and restores the submitted keyword', async () => {
     installFetchMock({ createFailure: true });
     renderApp('/topics');
-    await screen.findByText('尚未创建主题');
+    await screen.findByText('尚未创建关键词监控');
 
-    const input = screen.getByLabelText('主题关键词');
+    const input = screen.getByLabelText('监控关键词');
     fireEvent.change(input, { target: { value: 'Rust' } });
-    fireEvent.click(screen.getByRole('button', { name: '创建主题' }));
+    fireEvent.click(screen.getByRole('button', { name: '开始监控' }));
 
     await waitFor(() => expect(screen.queryByRole('status', { name: /Rust/ })).not.toBeInTheDocument());
     expect(input).toHaveValue('Rust');
     expect(screen.getByText('Create failed')).toBeVisible();
   });
 
+  it('shows and controls interest memory without exposing scores', async () => {
+    installFetchMock({
+      interests: {
+        personalizationEnabled: true,
+        resetAt: null,
+        recent: [{
+          id: 'tag-agents', name: 'AI Agents', kind: 'topic',
+          sources: ['keyword', 'feedback'], updatedAt: now.toISOString(),
+        }],
+        longTerm: [],
+        reduced: [],
+      },
+    });
+    renderApp('/interests');
+
+    expect(await screen.findByText('AI Agents')).toBeVisible();
+    expect(screen.queryByText(/分数|权重|置信度/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: '个性化排序' }));
+    await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({
+      url: '/api/v1/interests/settings', method: 'PUT',
+      body: { personalizationEnabled: false },
+    })));
+
+    fireEvent.click(screen.getByRole('button', { name: '忘记兴趣主题 AI Agents' }));
+    await waitFor(() => expect(screen.queryByText('AI Agents')).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '清空历史' }));
+    expect(screen.getByRole('dialog', { name: '清空兴趣历史确认' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '确认清空' }));
+    await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({
+      url: '/api/v1/interests', method: 'DELETE',
+    })));
+  });
+
   it('defines stable refresh dimensions and a static reduced-motion state', () => {
     const css = readFileSync('apps/web/src/styles.css', 'utf8');
     expect(css).toMatch(/\.refresh-button\s*\{[^}]*width:\s*38px;[^}]*height:\s*38px;/s);
     expect(css).toMatch(/\.pull-indicator\s*\{[^}]*height:\s*32px;/s);
-    expect(css).toMatch(/\.origin-label\s*\{[^}]*max-width:\s*220px;[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
+    expect(css).toMatch(/\.origin-label\s*\{[^}]*max-width:\s*360px;[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
     expect(css).not.toContain('.segmented--origin');
     expect(css).not.toContain('.origin-label--trend');
     expect(css).toContain('@keyframes refresh-spin');

@@ -37,13 +37,9 @@ export class GitHubConnector implements SourceConnector {
     searchUrl.searchParams.set('sort', 'updated'); searchUrl.searchParams.set('order', 'desc');
     searchUrl.searchParams.set('per_page', String(Math.min(this.repositoryBudget, 100)));
     const repositories = this.parse(searchSchema, await this.request(searchUrl, signal)).items.slice(0, this.repositoryBudget);
-    const candidates: ConnectorResult['candidates'] = repositories.map((repo) => ({
-      connectorId: this.id, sourceType: this.sourceType, platform: 'GitHub', externalId: repo.node_id,
-      url: repo.html_url, title: repo.full_name, content: repo.description?.trim() || null, excerpt: null,
-      authorName: null, authorHandle: repo.owner.login, publishedAt: iso(repo.pushed_at), language: null,
-      engagement: { stars: repo.stargazers_count },
-      proof: { kind: 'api_record' as const, connectorId: this.id, externalId: repo.node_id },
-    }));
+    // Repository search identifies projects to inspect. The repository landing page
+    // is not itself a substantive update, so only release records become candidates.
+    const candidates: ConnectorResult['candidates'] = [];
     let requestCount = 1;
     for (const repo of repositories) {
       if (candidates.length >= plan.maxCandidates) break;

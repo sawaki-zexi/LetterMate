@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FeedItem } from '@lettermate/contracts';
 import { DiscoveryCard } from './DiscoveryCard.js';
 import '../test-setup.js';
@@ -24,6 +24,11 @@ const topicItem: FeedItem = {
   authorHandle: 'project',
   externalId: '100',
   provenanceKind: 'api_record',
+  contentKey: 'https://x.com/project/status/100',
+  feedback: null,
+  origins: [{
+    origin: 'topic', topicId: 'topic-1', topicKeyword: 'gpt-5.7', topicKeywordActive: true,
+  }],
 };
 
 describe('DiscoveryCard', () => {
@@ -32,7 +37,7 @@ describe('DiscoveryCard', () => {
   it('renders Topic context, details, and safe source links without retired trust labels', () => {
     render(<DiscoveryCard item={topicItem} />);
     expect(screen.getByText('来自「gpt-5.7」')).toBeVisible();
-    expect(screen.getByTitle('gpt-5.7')).toHaveAttribute('aria-label', '来自「gpt-5.7」');
+    expect(screen.getByTitle('来自「gpt-5.7」')).toHaveAttribute('aria-label', '来自「gpt-5.7」');
     expect(screen.getByText('精选')).toBeVisible();
     expect(screen.queryByText('关键词追踪')).not.toBeInTheDocument();
     expect(screen.queryByText('优质')).not.toBeInTheDocument();
@@ -48,7 +53,10 @@ describe('DiscoveryCard', () => {
   });
 
   it('labels Radar items as global trend discoveries', () => {
-    const trendItem: FeedItem = { ...topicItem, id: 'radar-1', origin: 'trend', topicId: null };
+    const trendItem: FeedItem = {
+      ...topicItem, id: 'radar-1', origin: 'trend', topicId: null,
+      origins: [{ origin: 'trend' }],
+    };
     render(<DiscoveryCard item={trendItem} />);
 
     expect(screen.getByText('来自全网趋势')).toBeVisible();
@@ -57,9 +65,43 @@ describe('DiscoveryCard', () => {
   });
 
   it('labels historical content when its keyword is inactive', () => {
-    render(<DiscoveryCard item={{ ...topicItem, topicKeywordActive: false }} />);
+    render(<DiscoveryCard item={{
+      ...topicItem,
+      topicKeywordActive: false,
+      origins: [{
+        origin: 'topic', topicId: 'topic-1', topicKeyword: 'gpt-5.7', topicKeywordActive: false,
+      }],
+    }} />);
 
     expect(screen.getByText('关键词已失效')).toBeVisible();
+  });
+
+  it('shows a public recommendation explanation without ranking internals', () => {
+    render(<DiscoveryCard item={{
+      ...topicItem,
+      recommendation: {
+        lane: 'subscription', reason: 'followed_topic', isExploration: false,
+      },
+    }} />);
+
+    expect(screen.getByText('关注关键词')).toBeVisible();
+    expect(screen.queryByText(/score|权重|置信度|tag-/i)).not.toBeInTheDocument();
+  });
+
+  it('shows every merged discovery and distinguishes creator reposts', () => {
+    render(<DiscoveryCard item={{
+      ...topicItem,
+      origins: [
+        ...topicItem.origins,
+        { origin: 'trend' },
+        {
+          origin: 'creator', creatorId: 'creator-1', creatorName: 'Project Maintainer',
+          platform: 'X', contentType: 'repost',
+        },
+      ],
+    }} />);
+
+    expect(screen.getByText('来自「gpt-5.7」、全网趋势、「Project Maintainer」转发')).toBeVisible();
   });
 
   it('uses an h2 by default and supports an h3 inside grouped feeds', () => {
@@ -69,5 +111,22 @@ describe('DiscoveryCard', () => {
     rerender(<DiscoveryCard item={topicItem} headingLevel={3} />);
     expect(screen.getByRole('heading', { level: 3, name: topicItem.title })).toBeVisible();
     expect(screen.queryByRole('heading', { level: 2, name: topicItem.title })).not.toBeInTheDocument();
+  });
+
+  it('renders persisted feedback state and emits switch or clear actions', () => {
+    const onFeedback = vi.fn();
+    render(<DiscoveryCard
+      item={{ ...topicItem, feedback: 'interested' }}
+      onFeedback={onFeedback}
+    />);
+
+    const interested = screen.getByRole('button', { name: '感兴趣' });
+    const less = screen.getByRole('button', { name: '减少推荐' });
+    expect(interested).toHaveAttribute('aria-pressed', 'true');
+    expect(less).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(interested);
+    fireEvent.click(less);
+    expect(onFeedback).toHaveBeenNthCalledWith(1, null);
+    expect(onFeedback).toHaveBeenNthCalledWith(2, 'less');
   });
 });

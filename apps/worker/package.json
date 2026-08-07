@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "build": "tsc -b tsconfig.json",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "backfill:interest-tags": "tsx src/interest-tag-backfill.ts"
   },
   "dependencies": {
     "@lettermate/config": "*",

@@ -1,4 +1,9 @@
-import type { FeedItem, SourceType } from '@lettermate/contracts';
+import type {
+  FeedItem,
+  FeedbackValue,
+  FeedOriginDetail,
+  SourceType,
+} from '@lettermate/contracts';
 import {
   Clock3,
   Code2,
@@ -9,6 +14,8 @@ import {
   MessageCircle,
   Rss,
   Sparkles,
+  ThumbsDown,
+  ThumbsUp,
   Users,
   Video,
   type LucideIcon,
@@ -26,21 +33,43 @@ const sourceTypeMeta: Record<SourceType, { label: string; icon: LucideIcon }> = 
   paper: { label: '论文', icon: FileText },
 };
 
+const recommendationLabels = {
+  followed_topic: '关注关键词',
+  followed_creator: '关注博主',
+  related_interest: '符合兴趣',
+  recent_hot: '近期热点',
+  exploration: '拓展发现',
+} as const;
+
+function originLabel(origin: FeedOriginDetail): string {
+  if (origin.origin === 'topic') return `「${origin.topicKeyword}」`;
+  if (origin.origin === 'trend') return '全网趋势';
+  const action = origin.contentType === 'repost'
+    ? '转发'
+    : origin.contentType === 'reply' ? '回复' : '';
+  return `「${origin.creatorName}」${action}`;
+}
+
 export function DiscoveryCard({
   item,
   detailHref,
   headingLevel = 2,
+  feedbackPending = false,
+  onFeedback,
 }: {
   item: FeedItem;
   detailHref?: string;
   headingLevel?: 2 | 3;
+  feedbackPending?: boolean;
+  onFeedback?: (value: FeedbackValue | null) => void;
 }) {
   const Heading = `h${headingLevel}` as const;
   const ClassificationIcon = item.kind === 'hot' ? Flame : Sparkles;
   const classification = discoveryKindLabels[item.kind];
-  const discoveryContext = item.origin === 'trend'
-    ? '来自全网趋势'
-    : `来自「${item.topicKeyword}」`;
+  const discoveryContext = `来自${item.origins.map(originLabel).join('、')}`;
+  const hasInactiveTopic = item.origins.some((origin) => (
+    origin.origin === 'topic' && !origin.topicKeywordActive
+  ));
   const source = sourceTypeMeta[item.sourceType];
   const SourceIcon = source.icon;
   const author = [item.authorName, item.authorHandle ? `@${item.authorHandle}` : null]
@@ -52,15 +81,22 @@ export function DiscoveryCard({
         <span className={`classification classification--${item.kind}`}>
           <ClassificationIcon size={15} />{classification}
         </span>
+        {item.recommendation && (
+          <span className={`recommendation-context recommendation-context--${item.recommendation.lane}`}>
+            {recommendationLabels[item.recommendation.reason]}
+          </span>
+        )}
         <div className="discovery-card__meta">
           <span
             className="origin-label"
-            title={item.origin === 'topic' ? item.topicKeyword : undefined}
+            title={discoveryContext}
             aria-label={discoveryContext}
           >
             {discoveryContext}
           </span>
-          {item.origin === 'topic' && !item.topicKeywordActive && <span className="keyword-state keyword-state--inactive">关键词已失效</span>}
+          {hasInactiveTopic && (
+            <span className="keyword-state keyword-state--inactive">关键词已失效</span>
+          )}
           <span><SourceIcon size={14} />{item.platform}</span>
           <span>{source.label}</span>
           <span className="meta"><Clock3 size={14} />{new Date(item.publishedAt ?? item.discoveredAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
@@ -78,6 +114,28 @@ export function DiscoveryCard({
             </a>
           ))}
         </div>
+        {onFeedback && (
+          <div className="feedback-actions" aria-label="内容反馈">
+            <button
+              className="feedback-button"
+              type="button"
+              aria-pressed={item.feedback === 'interested'}
+              disabled={feedbackPending}
+              onClick={() => onFeedback(item.feedback === 'interested' ? null : 'interested')}
+            >
+              <ThumbsUp size={15} />感兴趣
+            </button>
+            <button
+              className="feedback-button"
+              type="button"
+              aria-pressed={item.feedback === 'less'}
+              disabled={feedbackPending}
+              onClick={() => onFeedback(item.feedback === 'less' ? null : 'less')}
+            >
+              <ThumbsDown size={15} />减少推荐
+            </button>
+          </div>
+        )}
       </div>
     </article>
   );

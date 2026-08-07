@@ -9,12 +9,15 @@ import { randomUUID } from 'node:crypto';
 export interface TopicQueue {
   enqueue(data: DiscoveryJobData): Promise<void>;
   close(): Promise<void>;
+  healthCheck?(): Promise<void>;
 }
+
+type RedisConnection = Pick<Redis, 'quit'> & Partial<Pick<Redis, 'ping'>>;
 
 export class BullTopicQueue implements TopicQueue {
   constructor(
     private readonly queue: Pick<Queue<DiscoveryJobData>, 'add' | 'close'>,
-    private readonly redis: Pick<Redis, 'quit'>,
+    private readonly redis: RedisConnection,
   ) {}
 
   async enqueue(data: DiscoveryJobData): Promise<void> {
@@ -32,6 +35,11 @@ export class BullTopicQueue implements TopicQueue {
   async close(): Promise<void> {
     await this.queue.close();
     await this.redis.quit();
+  }
+
+  async healthCheck(): Promise<void> {
+    if (!this.redis.ping) throw new Error('Redis health probe is unavailable');
+    await this.redis.ping();
   }
 }
 

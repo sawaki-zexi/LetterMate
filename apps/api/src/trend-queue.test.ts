@@ -41,6 +41,16 @@ describe('BullTrendQueue', () => {
     expect(redis.quit).toHaveBeenCalledOnce();
   });
 
+  it('probes Redis through the owned connection', async () => {
+    const queue = { add: vi.fn(), close: vi.fn() };
+    const redis = { quit: vi.fn(), ping: vi.fn().mockResolvedValue('PONG') };
+    const trendQueue = new BullTrendQueue(queue as never, redis as never);
+
+    await trendQueue.healthCheck();
+
+    expect(redis.ping).toHaveBeenCalledOnce();
+  });
+
   it('produces a BullMQ-safe deterministic id for arbitrary authenticated ids', () => {
     const first = manualTrendJobId('tenant:run/a');
 

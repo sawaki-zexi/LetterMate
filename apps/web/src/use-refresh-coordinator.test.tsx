@@ -53,6 +53,7 @@ function topic(id: string, lastRun: RunSummary | null = null): Topic {
     keyword: id,
     expandedTerms: [],
     createdAt: '2026-07-01T00:00:00.000Z',
+    pausedAt: null,
     lastRunAt: lastRun?.startedAt ?? null,
     nextRunAt: null,
     scheduleIntervalHours: 12,

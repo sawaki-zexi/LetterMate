@@ -1,5 +1,6 @@
 import { type DiscoveryJobData, type DiscoveryTrigger } from '@lettermate/contracts';
 import type { PrismaClient } from '@prisma/client';
+import { RuntimeDependencyError, toSafeRuntimeFailure } from './runtime-health.js';
 
 export interface TopicScheduleState {
   scheduleIntervalHours: 6 | 12 | 24;
@@ -78,6 +79,7 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
     const dueTopics = await this.prisma.topic.findMany({
       where: {
         deletedAt: null,
+        pausedAt: null,
         OR: [
           {
             nextRunAt: { lte: now },
@@ -114,12 +116,14 @@ export class PrismaTopicScheduleRepository implements TopicScheduleRepository {
           ? {
               id: topic.id,
               deletedAt: null,
+              pausedAt: null,
               runStatus: 'running',
               runLeaseUntil: topic.runLeaseUntil,
             }
           : {
               id: topic.id,
               deletedAt: null,
+              pausedAt: null,
               nextRunAt: topic.nextRunAt,
               OR: [
                 { runStatus: { not: 'running' } },
@@ -182,22 +186,35 @@ export class TopicScheduleService {
 
   async scan(now = new Date()): Promise<number> {
     const claimUntil = new Date(now.getTime() + this.options.claimLeaseMs);
-    const topics = await this.repository.claimDueTopics(
-      now,
-      claimUntil,
-      this.options.limit,
-    );
-    await Promise.all(topics.map((topic) => this.queue.add(
-      'scheduled-refresh',
-      { topicId: topic.topicId, userId: topic.userId, trigger: 'scheduled' },
-      {
-        jobId: scheduledJobId(topic.topicId, topic.dueAt),
-        attempts: 3,
-        backoff: { type: 'custom' },
-        removeOnComplete: true,
-        removeOnFail: true,
-      },
-    )));
+    let topics: ClaimedTopic[];
+    try {
+      topics = await this.repository.claimDueTopics(now, claimUntil, this.options.limit);
+    } catch (error) {
+      throw new RuntimeDependencyError(
+        'TOPIC_SCHEDULER_DATABASE_UNAVAILABLE',
+        'database',
+        error instanceof Error ? 'Topic scheduler could not claim due topics' : undefined,
+      );
+    }
+    try {
+      await Promise.all(topics.map((topic) => this.queue.add(
+        'scheduled-refresh',
+        { topicId: topic.topicId, userId: topic.userId, trigger: 'scheduled' },
+        {
+          jobId: scheduledJobId(topic.topicId, topic.dueAt),
+          attempts: 3,
+          backoff: { type: 'custom' },
+          removeOnComplete: true,
+          removeOnFail: true,
+        },
+      )));
+    } catch {
+      throw new RuntimeDependencyError(
+        'TOPIC_SCHEDULER_REDIS_UNAVAILABLE',
+        'redis',
+        'Topic scheduler could not enqueue claimed topics',
+      );
+    }
     return topics.length;
   }
 }
@@ -217,8 +234,12 @@ export function startTopicScheduler(
     const run = Promise.resolve()
       .then(() => service.scan())
       .then(() => undefined)
-      .catch(() => {
-        logger.error('Topic scheduler scan failed');
+      .catch((error: unknown) => {
+        logger.error(JSON.stringify(toSafeRuntimeFailure(
+          error,
+          'TOPIC_SCHEDULER_SCAN_FAILED',
+          'database',
+        )));
       });
     const tracked = run.finally(() => {
       if (inFlight === tracked) inFlight = null;

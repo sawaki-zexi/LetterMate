@@ -230,6 +230,7 @@ Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend`、`kind=hot|
 | `npm run test:e2e` | Playwright 桌面、平板和移动端流程 |
 | `npm run db:migrate` | 创建本地 Prisma 开发迁移 |
 | `npm run db:deploy` | 应用已提交迁移 |
+| `npm run backfill:interest-tags -w @lettermate/worker` | 为近期合格内容回填版本化兴趣标签；需要 `AI_API_KEY` |
 
 默认测试不访问外部服务。Live smoke test 需要显式开关和对应 Key：
 
@@ -246,6 +247,7 @@ npm test -- apps/worker/src/twitterapi-io.live.test.ts
 已实现：
 
 - Topic 与趋势两条持久化发现管线。
+- 可审计兴趣事件、版本化内容标签、短期/长期/负向规则画像和不改变 Feed 顺序的 shadow scoring。
 - 14 个主发现连接器和 6 个趋势输入。
 - 调度、租约恢复、幂等刷新和运行摘要。
 - 统一 Feed、已入库文章搜索、时间/来源筛选、日期分组和响应式界面。

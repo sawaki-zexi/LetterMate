@@ -1,4 +1,7 @@
 export * from './discovery.js';
+export * from './feed.js';
+export * from './keyword-profile.js';
+export * from './personalization.js';
 export * from './quality.js';
 export * from './source.js';
 export * from './url.js';

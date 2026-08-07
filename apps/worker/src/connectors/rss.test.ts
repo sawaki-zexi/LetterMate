@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ContentFetcher } from '../content-fetcher.js';
 import { buildKeywordPolicy } from '../keyword-policy.js';
 import type { SourceQueryPlan } from './types.js';
 import { RssConnector } from './rss.js';
@@ -28,16 +29,21 @@ const atomFeed = `<?xml version="1.0"?>
 <updated>2026-07-24T09:00:00Z</updated><author><name>Research Lab</name></author>
 <summary><![CDATA[<p>Abstract with <em>methods</em>.</p>]]></summary></entry></feed>`;
 
+const publicResolver = async () => ['93.184.216.34'];
+const xmlResponse = (body: string) => new Response(body, {
+  status: 200,
+  headers: { 'content-type': 'application/rss+xml' },
+});
 const makeConnector = (feedUrls: string[], fetcher: typeof fetch) => new RssConnector(
   { feedUrls, maxEntriesPerFeed: 5 },
-  fetcher,
+  new ContentFetcher({ resolveHostname: publicResolver }, fetcher),
 );
 
 describe('RssConnector', () => {
   it('normalizes RSS 2.0 and Atom entries with feed-entry proofs', async () => {
     const fetcher = vi.fn()
-      .mockResolvedValueOnce(new Response(rssFeed, { status: 200 }))
-      .mockResolvedValueOnce(new Response(atomFeed, { status: 200 }));
+      .mockResolvedValueOnce(xmlResponse(rssFeed))
+      .mockResolvedValueOnce(xmlResponse(atomFeed));
     const connector = makeConnector(
       ['https://example.com/feed.xml', 'https://example.org/atom.xml'],
       fetcher as typeof fetch,
@@ -89,11 +95,24 @@ describe('RssConnector', () => {
   ])('returns a safe invalid-response error for %s', async (_label, body) => {
     const connector = makeConnector(
       ['https://example.com/feed.xml'],
-      vi.fn().mockResolvedValue(new Response(body, { status: 200 })) as unknown as typeof fetch,
+      vi.fn().mockResolvedValue(xmlResponse(body)) as unknown as typeof fetch,
     );
 
     await expect(connector.search(plan, new AbortController().signal)).rejects.toMatchObject({
       code: 'CONNECTOR_RESPONSE_INVALID', retryable: false,
     });
+  });
+
+  it('rejects private feed targets before issuing a request', async () => {
+    const request = vi.fn();
+    const connector = new RssConnector(
+      { feedUrls: ['http://internal.example/feed.xml'] },
+      new ContentFetcher({ resolveHostname: async () => ['127.0.0.1'] }, request as typeof fetch),
+    );
+
+    await expect(connector.search(plan, new AbortController().signal)).rejects.toMatchObject({
+      code: 'CONNECTOR_RESPONSE_INVALID', retryable: false,
+    });
+    expect(request).not.toHaveBeenCalled();
   });
 });

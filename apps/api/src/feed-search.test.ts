@@ -28,6 +28,8 @@ const feedItem = (
   authorHandle: null,
   externalId: null,
   provenanceKind: 'fetched_page' as const,
+  contentKey: `https://example.com/${id}`,
+  feedback: null,
   };
   return origin === 'topic'
     ? {
@@ -36,8 +38,12 @@ const feedItem = (
         topicId: 'topic-1',
         topicKeyword: 'AI Agent',
         topicKeywordActive: true,
+        origins: [{
+          origin: 'topic' as const, topicId: 'topic-1',
+          topicKeyword: 'AI Agent', topicKeywordActive: true,
+        }],
       }
-    : { ...base, origin, topicId: null };
+    : { ...base, origin, topicId: null, origins: [{ origin: 'trend' as const }] };
 };
 
 describe('persisted Feed search', () => {

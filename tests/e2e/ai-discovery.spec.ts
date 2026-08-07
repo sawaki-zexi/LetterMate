@@ -4,7 +4,60 @@ import { randomUUID } from 'node:crypto';
 
 const forbiddenPublicLanguage = /可信|已核实|证据数量|已确认|待核实|已驳回|证据链|来源排名|评分|\b(?:trust|trusted|trustworthy|verified|confirmed|unverified|rejected|rank|ranking|score|scoring|rating)\b|\b(?:pending verification|evidence (?:chain|count)|source (?:rank|ranking))\b/iu;
 
-test('edits managed topic terms and preserves inactive feed history after deletion', async ({ page }, testInfo) => {
+test('controls interest memory and keeps the four-way navigation stable', async ({ page }, testInfo) => {
+  const userId = `e2e-interests-${testInfo.project.name}-${randomUUID()}`;
+  await page.route('**/api/v1/**', async (route) => route.continue({
+    headers: { ...route.request().headers(), 'x-user-id': userId },
+  }));
+
+  await page.goto('/interests');
+  const toggle = page.getByRole('checkbox', { name: '个性化排序' });
+  await expect(toggle).toBeChecked();
+  const pauseResponse = page.waitForResponse((response) => (
+    response.request().method() === 'PUT'
+    && new URL(response.url()).pathname === '/api/v1/interests/settings'
+  ));
+  await toggle.click();
+  expect((await pauseResponse).ok()).toBe(true);
+  await expect(toggle).not.toBeChecked();
+  await page.reload();
+  await expect(page.getByRole('checkbox', { name: '个性化排序' })).not.toBeChecked();
+
+  await page.getByRole('button', { name: '清空历史' }).click();
+  await expect(page.getByRole('dialog', { name: '清空兴趣历史确认' })).toBeVisible();
+  const clearResponse = page.waitForResponse((response) => (
+    response.request().method() === 'DELETE'
+    && new URL(response.url()).pathname === '/api/v1/interests'
+  ));
+  await page.getByRole('button', { name: '确认清空' }).click();
+  expect((await clearResponse).ok()).toBe(true);
+  await expect(page.getByRole('dialog', { name: '清空兴趣历史确认' })).toHaveCount(0);
+
+  if (testInfo.project.name === 'mobile' || testInfo.project.name === 'compact-mobile') {
+    const navItems = page.locator('.bottom-nav a');
+    await expect(navItems).toHaveCount(4);
+    const boxes = await navItems.evaluateAll((links) => links.map((link) => {
+      const box = link.getBoundingClientRect();
+      return { left: box.left, right: box.right, width: box.width };
+    }));
+    expect(boxes.every((box) => box.width > 0)).toBe(true);
+    expect(boxes.every((box, index) => index === 0 || box.left >= boxes[index - 1]!.right - 0.5))
+      .toBe(true);
+  }
+  expect(await page.evaluate(() => (
+    document.documentElement.scrollWidth > document.documentElement.clientWidth
+  ))).toBe(false);
+  await expect(page.locator('body')).not.toContainText(forbiddenPublicLanguage);
+
+  if (testInfo.project.name === 'desktop' || testInfo.project.name === 'compact-mobile') {
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-interests.png`),
+      fullPage: true,
+    });
+  }
+});
+
+test('edits a keyword monitor and preserves inactive feed history after deletion', async ({ page }, testInfo) => {
   const keyword = `history-${randomUUID().slice(0, 8)}`;
   const updatedKeyword = `${keyword}-updated`;
   const userId = `e2e-management-${testInfo.project.name}-${randomUUID()}`;
@@ -14,8 +67,8 @@ test('edits managed topic terms and preserves inactive feed history after deleti
   }));
 
   await page.goto('/topics');
-  await page.getByLabel('主题关键词').fill(keyword);
-  await page.getByRole('button', { name: '创建主题' }).click();
+  await page.getByLabel('监控关键词').fill(keyword);
+  await page.getByRole('button', { name: '开始监控' }).click();
   await expect(page.getByRole('heading', { name: keyword })).toBeVisible();
   await expect.poll(async () => {
     const response = await page.request.get('/api/v1/topics', { headers: requestHeaders });
@@ -30,13 +83,6 @@ test('edits managed topic terms and preserves inactive feed history after deleti
   await page.reload();
   await page.getByRole('button', { name: `编辑 ${keyword} 关键词` }).click();
   await page.getByLabel('主关键词').fill(updatedKeyword);
-  await page.getByLabel('扩展词 1').fill(`${updatedKeyword} release`);
-  await page.getByRole('button', { name: '添加扩展词' }).click();
-  const addedTerm = page.getByRole('textbox', {
-    name: `扩展词 ${createdTopic.expandedTerms.length + 1}`,
-    exact: true,
-  });
-  await addedTerm.fill(`${updatedKeyword} docs`);
   const updateResponse = page.waitForResponse((response) => (
     response.request().method() === 'PATCH'
       && new URL(response.url()).pathname === `/api/v1/topics/${createdTopic.id}`
@@ -44,14 +90,36 @@ test('edits managed topic terms and preserves inactive feed history after deleti
   await page.getByRole('button', { name: '保存' }).click();
   expect((await updateResponse).ok()).toBe(true);
   await expect(page.getByRole('heading', { name: updatedKeyword })).toBeVisible();
-  await expect(page.getByLabel('AI 扩展词').getByText(`${updatedKeyword} release`)).toBeVisible();
-  await expect(page.getByLabel('AI 扩展词').getByText(`${updatedKeyword} docs`)).toBeVisible();
+
+  const pauseResponse = page.waitForResponse((response) => (
+    response.request().method() === 'POST'
+      && new URL(response.url()).pathname === `/api/v1/topics/${createdTopic.id}/pause`
+  ));
+  await page.getByRole('button', { name: `暂停 ${updatedKeyword} 关键词监控` }).click();
+  expect((await pauseResponse).ok()).toBe(true);
+  await expect(page.getByText('已暂停自动更新')).toBeVisible();
+  await expect(page.getByRole('button', { name: `刷新 ${updatedKeyword}` })).toBeDisabled();
+
+  const resumeResponse = page.waitForResponse((response) => (
+    response.request().method() === 'POST'
+      && new URL(response.url()).pathname === `/api/v1/topics/${createdTopic.id}/resume`
+  ));
+  await page.getByRole('button', { name: `恢复 ${updatedKeyword} 关键词监控` }).click();
+  expect((await resumeResponse).ok()).toBe(true);
+  await expect(page.getByRole('button', {
+    name: `暂停 ${updatedKeyword} 关键词监控`,
+  })).toBeVisible();
+  await expect.poll(async () => {
+    const response = await page.request.get('/api/v1/topics', { headers: requestHeaders });
+    const topics = await response.json() as Topic[];
+    return topics[0]?.runStatus;
+  }).toBe('succeeded');
 
   await page.getByRole('link', { name: '发现' }).last().click();
   await expect(page.locator('.origin-label', { hasText: `来自「${keyword}」` }).first()).toBeVisible();
   await expect(page.getByText('关键词已失效').first()).toBeVisible();
 
-  await page.getByRole('link', { name: '主题' }).last().click();
+  await page.getByRole('link', { name: '关键词监控' }).last().click();
   await page.getByRole('button', { name: `删除 ${updatedKeyword} 关键词` }).click();
   await expect(page.getByRole('dialog', { name: '删除关键词确认' })).toBeVisible();
   const deleteResponse = page.waitForResponse((response) => (
@@ -89,12 +157,12 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   });
 
   await page.goto('/topics');
-  await page.getByLabel('主题关键词').fill(keyword);
+  await page.getByLabel('监控关键词').fill(keyword);
   const createTopicResponse = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return response.request().method() === 'POST' && url.pathname === '/api/v1/topics';
   });
-  await page.getByRole('button', { name: '创建主题' }).click();
+  await page.getByRole('button', { name: '开始监控' }).click();
   expect((await createTopicResponse).ok()).toBe(true);
   const enqueuedTopicsResponse = await page.request.get('/api/v1/topics', { headers: requestHeaders });
   expect(enqueuedTopicsResponse.ok()).toBe(true);
@@ -108,10 +176,6 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
     return topics[0]?.runStatus;
   }).toBe('succeeded');
   await page.reload();
-  const expandedTerms = page.getByLabel('AI 扩展词');
-  await expect(expandedTerms.getByText('gpt-5.7', { exact: true })).toBeVisible();
-  await expect(expandedTerms.getByText('gpt 5.7', { exact: true })).toBeVisible();
-  await expect(expandedTerms.getByText('gpt5.7', { exact: true })).toBeVisible();
   await expect(page.getByText(/每 12 小时/).first()).toBeVisible();
   await expect(page.getByText('Hacker News').first()).toBeVisible();
 
@@ -270,6 +334,34 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
   await expect(page.getByRole('heading', { name: 'gpt-5.7 官方更新说明' })).toBeVisible();
   await expect(page.locator('.origin-label', { hasText: '来自全网趋势' }).first()).toBeVisible();
 
+  const firstCard = page.locator('.discovery-card').first();
+  const feedbackTitle = await firstCard.getByRole('heading').innerText();
+  const feedbackCard = () => page.locator('.discovery-card').filter({
+    has: page.getByRole('heading', { name: feedbackTitle, exact: true }),
+  });
+  const interestedButton = feedbackCard().getByRole('button', { name: '感兴趣' });
+  const interestedResponse = page.waitForResponse((response) => (
+    response.request().method() === 'PUT'
+      && new URL(response.url()).pathname.startsWith('/api/v1/feedback/')
+  ));
+  await interestedButton.click();
+  expect((await interestedResponse).ok()).toBe(true);
+  await expect(interestedButton).toHaveAttribute('aria-pressed', 'true');
+  await page.reload();
+  await expect(feedbackCard().getByRole('button', { name: '感兴趣' }))
+    .toHaveAttribute('aria-pressed', 'true');
+
+  const lessResponse = page.waitForResponse((response) => (
+    response.request().method() === 'PUT'
+      && new URL(response.url()).pathname.startsWith('/api/v1/feedback/')
+  ));
+  await feedbackCard().getByRole('button', { name: '减少推荐' }).click();
+  expect((await lessResponse).ok()).toBe(true);
+  await expect(feedbackCard().getByRole('button', { name: '感兴趣' }))
+    .toHaveAttribute('aria-pressed', 'false');
+  await expect(feedbackCard().getByRole('button', { name: '减少推荐' }))
+    .toHaveAttribute('aria-pressed', 'true');
+
   if (testInfo.project.name === 'mobile' || testInfo.project.name === 'compact-mobile') {
     await page.evaluate(() => window.scrollTo(0, 0));
     const pageContainer = page.locator('main.page');
@@ -287,7 +379,7 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
       changedTouches: [{ identifier: 1, clientX: 160, clientY: 180 }],
     });
     await expect(refreshButton).toHaveAttribute('aria-busy', 'true');
-    await expect(completion).toHaveAttribute('data-notification-id', '2');
+    await expect(completion).toHaveAttribute('data-notification-id', '1');
     await expect(completion).toHaveText('刷新完成，暂无新增内容');
     await expect(refreshButton).toHaveAttribute('aria-busy', 'false');
   }

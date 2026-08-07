@@ -1,5 +1,6 @@
 import { type TrendJobData } from '@lettermate/contracts';
 import type { PrismaClient } from '@prisma/client';
+import { RuntimeDependencyError, toSafeRuntimeFailure } from './runtime-health.js';
 
 export interface ClaimedTrendMonitor {
   monitorId: string;
@@ -201,7 +202,16 @@ export class TrendScheduleService {
 
   async scan(now = new Date()): Promise<number> {
     const claimUntil = new Date(now.getTime() + this.options.claimLeaseMs);
-    const monitors = await this.repository.claimDueMonitors(now, claimUntil, this.options.limit);
+    let monitors: ClaimedTrendMonitor[];
+    try {
+      monitors = await this.repository.claimDueMonitors(now, claimUntil, this.options.limit);
+    } catch (error) {
+      throw new RuntimeDependencyError(
+        'TREND_SCHEDULER_DATABASE_UNAVAILABLE',
+        'database',
+        error instanceof Error ? 'Trend scheduler could not claim due monitors' : undefined,
+      );
+    }
     const results = await Promise.all(monitors.map(async (monitor) => {
       try {
         await this.queue.add(
@@ -227,9 +237,13 @@ export class TrendScheduleService {
         } catch {
           // The conditional reservation remains recoverable after its lease expires.
         }
-        this.options.logger.error(released
-          ? 'Trend scheduler enqueue failed; claim released'
-          : 'Trend scheduler enqueue failed; claim release was not applied');
+        this.options.logger.error(JSON.stringify({
+          code: 'TREND_SCHEDULER_REDIS_UNAVAILABLE',
+          dependency: 'redis',
+          message: released
+            ? 'Trend scheduler enqueue failed; claim released'
+            : 'Trend scheduler enqueue failed; claim release was not applied',
+        }));
         return false;
       }
     }));
@@ -254,8 +268,12 @@ export function startTrendScheduler(
     const run = Promise.resolve()
       .then(() => service.scan())
       .then(() => undefined)
-      .catch(() => {
-        logger.error('Trend scheduler scan failed');
+      .catch((error: unknown) => {
+        logger.error(JSON.stringify(toSafeRuntimeFailure(
+          error,
+          'TREND_SCHEDULER_SCAN_FAILED',
+          'database',
+        )));
       });
     const tracked = run.finally(() => {
       if (inFlight === tracked) inFlight = null;

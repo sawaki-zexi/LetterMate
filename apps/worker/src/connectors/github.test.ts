@@ -21,7 +21,7 @@ const releases = [{
 }];
 
 describe('GitHubConnector', () => {
-  it('works anonymously and normalizes repository and release records', async () => {
+  it('uses repository search as a seed and emits substantive releases only', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(searchResult), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify(releases), { status: 200 }));
@@ -36,16 +36,14 @@ describe('GitHubConnector', () => {
     expect((fetcher.mock.calls[0]![1] as RequestInit).headers).not.toHaveProperty('authorization');
     expect(result).toMatchObject({ requestCount: 2, candidates: [
       expect.objectContaining({
-        connectorId: 'github', sourceType: 'code', platform: 'GitHub', externalId: 'repo-node',
-        url: 'https://github.com/org/agent', authorHandle: 'org', engagement: { stars: 123 },
-        proof: { kind: 'api_record', connectorId: 'github', externalId: 'repo-node' },
-      }),
-      expect.objectContaining({
         externalId: 'release-node', url: 'https://github.com/org/agent/releases/tag/v2',
         title: 'Version 2', content: 'Checkpoint recovery and migration notes.', authorHandle: 'maintainer',
         proof: { kind: 'api_record', connectorId: 'github', externalId: 'release-node' },
       }),
     ] });
+    expect(result.candidates).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ url: 'https://github.com/org/agent' }),
+    ]));
   });
 
   it('adds an optional bearer token without exposing it in rate-limit errors', async () => {

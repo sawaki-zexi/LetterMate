@@ -13,6 +13,10 @@ describe('feed source selection', () => {
     expect(feedFilterForSource('trend')).toEqual({ origin: 'trend' });
   });
 
+  it("maps creator to the creator origin filter", () => {
+    expect(feedFilterForSource('creator')).toEqual({ origin: 'creator' });
+  });
+
   it("encodes a topic source selection", () => {
     expect(topicSourceSelection('topic-1')).toBe('topic:topic-1');
   });

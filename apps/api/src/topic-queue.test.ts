@@ -25,4 +25,14 @@ describe('BullTopicQueue', () => {
     const secondId = queue.add.mock.calls[1]![2].jobId;
     expect(firstId).not.toBe(secondId);
   });
+
+  it('probes Redis without exposing connection details', async () => {
+    const queue = { add: vi.fn(), close: vi.fn() };
+    const redis = { quit: vi.fn(), ping: vi.fn().mockResolvedValue('PONG') };
+    const topicQueue = new BullTopicQueue(queue as never, redis as never);
+
+    await topicQueue.healthCheck();
+
+    expect(redis.ping).toHaveBeenCalledOnce();
+  });
 });

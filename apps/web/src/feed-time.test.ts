@@ -26,6 +26,11 @@ function item(
     authorHandle: null,
     externalId: null,
     provenanceKind: 'fetched_page',
+    contentKey: 'https://example.com/source',
+    feedback: null,
+    origins: [{
+      origin: 'topic', topicId: 'topic-1', topicKeyword: 'gpt-5.7', topicKeywordActive: true,
+    }],
   };
 }
 

@@ -44,12 +44,18 @@ const searchResponseSchema = z.object({
 }).passthrough();
 
 const threadResponseSchema = z.object({
-  replies: z.array(z.unknown()),
+  replies: z.array(z.unknown()).optional(),
+  tweets: z.array(z.unknown()).optional(),
   has_next_page: z.boolean().optional(),
   hasNextPage: z.boolean().optional(),
   next_cursor: z.string().optional().nullable(),
   nextCursor: z.string().optional().nullable(),
-}).passthrough();
+}).passthrough()
+  .refine((response) => response.tweets !== undefined || response.replies !== undefined)
+  .transform((response) => ({
+    ...response,
+    replies: response.tweets ?? response.replies ?? [],
+  }));
 
 type RawTweet = z.infer<typeof tweetSchema>;
 type SearchResponse = z.infer<typeof searchResponseSchema>;

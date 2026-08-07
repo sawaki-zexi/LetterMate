@@ -50,7 +50,7 @@ const searchResponse = (tweets: unknown[], nextCursor?: string) => new Response(
 
 const threadResponse = (replies: unknown[], nextCursor?: string) => new Response(
   JSON.stringify({
-    replies,
+    tweets: replies,
     has_next_page: nextCursor !== undefined,
     next_cursor: nextCursor,
     status: 'success',

@@ -1,10 +1,12 @@
 import type { SourceType } from '@lettermate/contracts';
+import { classifyKeywordProfile, type KeywordProfile } from '@lettermate/domain';
 import type { ExpandedTopic } from './ai-gateway.js';
 import type { SourceQueryPlan } from './connectors/types.js';
 import { buildKeywordPolicy, filterQueriesForPolicy } from './keyword-policy.js';
 
 export interface SourceRoutingInput {
   keyword: string;
+  keywordProfile?: KeywordProfile;
   expanded: ExpandedTopic;
   windowStart: string;
   windowEnd: string;
@@ -21,18 +23,20 @@ const connectorSourceTypes: Record<string, SourceType> = {
   youtube: 'video',
   bilibili: 'video',
   'hacker-news': 'community',
+  'stack-overflow': 'community',
   reddit: 'community',
   github: 'code',
   arxiv: 'paper',
 };
 
 const technicalConnectors = [
-  'search-tavily',
-  'search-bing',
   'openrouter-search',
   'search-brave',
+  'search-tavily',
+  'search-bing',
   'rss',
   'hacker-news',
+  'stack-overflow',
   'arxiv',
   'github',
   'twitterapi-io',
@@ -40,10 +44,10 @@ const technicalConnectors = [
 ];
 
 const productConnectors = [
-  'search-tavily',
-  'search-bing',
   'openrouter-search',
   'search-brave',
+  'search-tavily',
+  'search-bing',
   'rss',
   'twitterapi-io',
   'bluesky',
@@ -59,6 +63,7 @@ const balancedConnectors = [
   'search-bing',
   'rss',
   'hacker-news',
+  'stack-overflow',
   'github',
   'twitterapi-io',
   'bluesky',
@@ -86,9 +91,12 @@ const unique = (values: readonly string[], limit: number): string[] => {
 export class SourceRouter {
   route(input: SourceRoutingInput): SourceQueryPlan {
     const matchPolicy = buildKeywordPolicy(input.keyword);
+    const keywordProfile = input.keywordProfile ?? classifyKeywordProfile(input.keyword);
     const routeText = [input.keyword, ...input.expanded.terms, ...input.expanded.searchQueries]
       .join(' ');
-    const connectorIds = productSignal.test(routeText)
+    const connectorIds = keywordProfile.kind === 'domain'
+      ? technicalConnectors
+      : productSignal.test(routeText)
       ? productConnectors
       : technicalSignal.test(routeText)
         ? technicalConnectors
@@ -106,11 +114,18 @@ export class SourceRouter {
       matchPolicy,
     ).slice(0, 1);
     const quotedPhrase = `"${matchPolicy.exactPhrase}"`;
+    const intentTerms = keywordProfile.kind === 'domain'
+      ? ['release', 'research', 'tools', 'industry changes']
+      : [
+          'release announcement',
+          'availability access',
+          'pricing',
+          'capability benchmark',
+          'major issue regression',
+          'changelog official',
+        ];
     const intentQueries = matchPolicy.exactPhrase.length === 0 ? [] : [
-      `${quotedPhrase} release`,
-      `${quotedPhrase} announcement`,
-      `${quotedPhrase} changelog`,
-      `${quotedPhrase} official`,
+      ...intentTerms.map((term) => `${quotedPhrase} ${term}`),
       ...(connectorIds.includes('github') ? [`${quotedPhrase} github release`] : []),
       ...(connectorIds.includes('arxiv') ? [`${quotedPhrase} paper`] : []),
       ...(connectorIds.includes('youtube') ? [`${quotedPhrase} official video`] : []),
@@ -121,6 +136,7 @@ export class SourceRouter {
     return {
       keyword: input.keyword,
       matchPolicy,
+      keywordProfile,
       expandedTerms: unique(input.expanded.terms, 8),
       queries: queries.length > 0 ? queries : [input.keyword],
       sourceTypes,

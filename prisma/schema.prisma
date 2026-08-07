@@ -25,6 +25,12 @@ enum DiscoveryTrigger {
   scheduled
 }
 
+enum KeywordProfileKind {
+  entity
+  domain
+  unknown
+}
+
 enum SourceType {
   web
   feed
@@ -42,6 +48,52 @@ enum ProvenanceKind {
   fetched_page
 }
 
+enum CreatorPlatform {
+  rss
+  x
+  bilibili
+}
+
+enum CreatorContentType {
+  original
+  repost
+  reply
+}
+
+enum FeedbackValue {
+  interested
+  less
+}
+
+enum InterestEventType {
+  topic_state
+  creator_state
+  feedback_state
+}
+
+enum InterestTagKind {
+  topic
+  entity
+  content_type
+}
+
+enum InterestTagStatus {
+  active
+  retired
+}
+
+enum RecommendationSurface {
+  feed
+  digest
+}
+
+enum RecommendationLane {
+  subscription
+  interest
+  trend
+  exploration
+}
+
 model User {
   id           String       @id @default(uuid())
   email        String       @unique
@@ -54,6 +106,16 @@ model User {
   trendRuns    TrendRun[]
   trendSeeds   TrendSeed[]
   radarItems   RadarItem[]
+  creators     CreatorSubscription[]
+  creatorRuns  CreatorRun[]
+  creatorItems CreatorItem[]
+  feedback     ContentFeedback[]
+  interestEvents InterestEvent[]
+  interestProfiles UserInterestProfile[]
+  interestProfileVersions InterestProfileVersion[]
+  recommendationDecisions RecommendationDecision[]
+  interestMemorySettings InterestMemorySettings?
+  forgottenInterestTags ForgottenInterestTag[]
 }
 
 model Session {
@@ -73,8 +135,10 @@ model Topic {
   keyword               String
   normalizedKeyword     String
   expandedTerms         String[]        @default([])
+  keywordProfile        KeywordProfileKind @default(unknown)
   createdAt             DateTime        @default(now())
   deletedAt             DateTime?
+  pausedAt              DateTime?
   variantsInitialized   Boolean         @default(false)
   lastRunAt             DateTime?
   runStatus             RunStatus       @default(queued)
@@ -94,6 +158,7 @@ model Topic {
   @@index([userId, deletedAt, createdAt])
   @@index([userId, createdAt])
   @@index([nextRunAt, runStatus])
+  @@index([pausedAt, nextRunAt])
   @@index([runStatus, runLeaseUntil])
 }
 
@@ -136,6 +201,7 @@ model DiscoveryRun {
   error            Json?
   keywordSnapshot  String
   expandedTermsSnapshot String[]        @default([])
+  keywordProfileSnapshot KeywordProfileKind @default(unknown)
   topic            Topic            @relation(fields: [topicId], references: [id], onDelete: Cascade)
 
   @@index([topicId, startedAt])
@@ -228,4 +294,236 @@ model RadarItem {
   @@unique([userId, canonicalPrimaryUrl])
   @@index([userId, publishedAt, discoveredAt])
   @@index([runId, discoveredAt])
+}
+
+model CreatorSubscription {
+  id              String          @id @default(uuid())
+  userId          String
+  platform        CreatorPlatform
+  accountKey      String
+  displayName     String
+  profileUrl      String
+  feedUrl         String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  pausedAt        DateTime?
+  cancelledAt     DateTime?
+  runStatus       RunStatus       @default(queued)
+  lastRunAt       DateTime?
+  nextRunAt       DateTime?
+  activeRunId     String?
+  runLeaseUntil   DateTime?
+  lastError       Json?
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  runs            CreatorRun[]
+  items           CreatorItem[]
+
+  @@unique([userId, platform, accountKey])
+  @@index([userId, pausedAt, nextRunAt])
+  @@index([runStatus, runLeaseUntil])
+}
+
+model CreatorRun {
+  id              String              @id @default(uuid())
+  userId          String
+  creatorId       String
+  trigger         DiscoveryTrigger
+  status          RunStatus           @default(queued)
+  startedAt       DateTime            @default(now())
+  finishedAt      DateTime?
+  candidateCount  Int                 @default(0)
+  acceptedCount   Int                 @default(0)
+  newItemCount    Int                 @default(0)
+  error           Json?
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creator         CreatorSubscription @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, startedAt])
+  @@index([creatorId, startedAt])
+  @@unique([id, userId])
+}
+
+model CreatorItem {
+  id                  String              @id @default(uuid())
+  userId              String
+  creatorId           String
+  kind                DiscoveryKind
+  title               String
+  summary             String
+  reason              String
+  sourceUrls          String[]
+  canonicalPrimaryUrl String
+  publishedAt         DateTime?
+  discoveredAt        DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+  sourceType          SourceType          @default(feed)
+  platform            String              @default("RSS/Atom")
+  authorName          String?
+  authorHandle        String?
+  externalId          String?
+  provenanceKind      ProvenanceKind      @default(feed_entry)
+  feedEligible        Boolean             @default(true)
+  contentType         CreatorContentType  @default(original)
+  originalAuthorName  String?
+  originalAuthorHandle String?
+  originalContentId   String?
+  originalContentUrl  String?
+  parentContentId     String?
+  parentContentUrl    String?
+  parentContentText   String?
+  user                User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creator             CreatorSubscription @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, canonicalPrimaryUrl])
+  @@index([userId, publishedAt, discoveredAt])
+  @@index([creatorId, publishedAt, discoveredAt])
+}
+
+model ContentFeedback {
+  id         String        @id @default(uuid())
+  userId     String
+  contentKey String
+  value      FeedbackValue
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, contentKey])
+  @@index([userId, updatedAt])
+}
+
+model InterestTag {
+  id              String            @id @default(uuid())
+  slug            String
+  displayName     String
+  parentId        String?
+  kind            InterestTagKind
+  status          InterestTagStatus @default(active)
+  taxonomyVersion String
+  createdAt       DateTime          @default(now())
+  parent          InterestTag?      @relation("InterestTagHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children        InterestTag[]     @relation("InterestTagHierarchy")
+  contentTags     ContentInterestTag[]
+  userProfiles    UserInterestProfile[]
+  forgottenBy     ForgottenInterestTag[]
+
+  @@unique([slug, taxonomyVersion])
+  @@index([parentId])
+  @@index([taxonomyVersion, status])
+}
+
+model ContentInterestTag {
+  contentKey       String
+  tagId            String
+  confidence       Float
+  extractorVersion String
+  createdAt        DateTime    @default(now())
+  tag              InterestTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([contentKey, tagId, extractorVersion])
+  @@index([contentKey, extractorVersion])
+  @@index([tagId, createdAt])
+}
+
+model InterestEvent {
+  id           String            @id @default(uuid())
+  userId       String
+  eventType    InterestEventType
+  sourceRef    String
+  activeKey    String?
+  payload      Json
+  occurredAt   DateTime
+  recordedAt   DateTime          @default(now())
+  supersededAt DateTime?
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, eventType, activeKey])
+  @@index([userId, occurredAt])
+  @@index([userId, eventType, sourceRef, occurredAt])
+}
+
+model UserInterestProfile {
+  userId            String
+  tagId             String
+  shortScore        Float
+  longScore         Float
+  negativeScore     Float
+  evidenceUpdatedAt DateTime
+  computedAt        DateTime
+  profileVersion    String
+  sourceKinds       String[]                 @default([])
+  user              User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tag               InterestTag            @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  version            InterestProfileVersion @relation(fields: [userId, profileVersion], references: [userId, version], onDelete: Cascade)
+
+  @@id([userId, tagId])
+  @@index([userId, shortScore])
+  @@index([userId, longScore])
+  @@index([userId, negativeScore])
+}
+
+model InterestProfileVersion {
+  userId         String
+  version        String
+  throughEventId String?
+  computedAt     DateTime
+  policyVersion  String
+  user           User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profiles       UserInterestProfile[]
+  decisions      RecommendationDecision[]
+
+  @@id([userId, version])
+  @@index([userId, computedAt])
+}
+
+model RecommendationDecision {
+  id               String                    @id @default(uuid())
+  userId           String
+  surface          RecommendationSurface
+  requestKey       String
+  profileVersion   String
+  rankingVersion   String
+  candidateVersion String
+  asOf             DateTime
+  createdAt        DateTime                  @default(now())
+  user             User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profile          InterestProfileVersion    @relation(fields: [userId, profileVersion], references: [userId, version], onDelete: Cascade)
+  items            RecommendationDecisionItem[]
+
+  @@unique([userId, surface, requestKey])
+  @@index([userId, createdAt])
+  @@index([userId, profileVersion])
+}
+
+model RecommendationDecisionItem {
+  decisionId   String
+  contentKey   String
+  position     Int
+  lane         RecommendationLane
+  isExploration Boolean
+  reasonCodes  String[]
+  decision     RecommendationDecision @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+
+  @@id([decisionId, contentKey])
+  @@unique([decisionId, position])
+  @@index([contentKey])
+}
+
+model InterestMemorySettings {
+  userId                 String   @id
+  personalizationEnabled Boolean  @default(true)
+  resetAt                DateTime?
+  updatedAt              DateTime @updatedAt
+  user                   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ForgottenInterestTag {
+  userId    String
+  tagId     String
+  createdAt DateTime    @default(now())
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tag       InterestTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([userId, tagId])
+  @@index([userId, createdAt])
 }

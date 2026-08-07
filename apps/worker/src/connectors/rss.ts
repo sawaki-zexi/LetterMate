@@ -1,4 +1,5 @@
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import { ContentFetchError, ContentFetcher } from '../content-fetcher.js';
 import { ConnectorError, type ConnectorResult, type SourceConnector, type SourceQueryPlan } from './types.js';
 
 type XmlObject = Record<string, unknown>;
@@ -11,6 +12,8 @@ export interface RssConnectorConfig {
 const parser = new XMLParser({
   attributeNamePrefix: '@_',
   ignoreAttributes: false,
+  parseTagValue: false,
+  processEntities: false,
   trimValues: true,
 });
 
@@ -76,7 +79,9 @@ export class RssConnector implements SourceConnector {
 
   constructor(
     config: RssConnectorConfig,
-    private readonly fetcher: typeof fetch = fetch,
+    private readonly textFetcher: Pick<ContentFetcher, 'fetchRawText'> = new ContentFetcher({
+      maxBytes: 512_000,
+    }),
   ) {
     this.feedUrls = config.feedUrls.map((url) => toHttpUrl(url, 'Feed URL'));
     this.maxEntriesPerFeed = config.maxEntriesPerFeed ?? 20;
@@ -106,19 +111,30 @@ export class RssConnector implements SourceConnector {
   }
 
   private async fetchFeed(feedUrl: string, signal: AbortSignal): Promise<string> {
-    let response: Response;
     try {
-      response = await this.fetcher(feedUrl, { signal });
-    } catch {
+      const response = await this.textFetcher.fetchRawText(feedUrl, {
+        acceptedContentTypes: [
+          'application/rss+xml',
+          'application/atom+xml',
+          'application/xml',
+          'text/xml',
+        ],
+        signal,
+      });
+      return response.text;
+    } catch (error) {
+      if (signal.aborted || (error instanceof ContentFetchError && error.code === 'CONTENT_FETCH_ABORTED')) {
+        throw new ConnectorError('CONNECTOR_ABORTED', 'RSS feed request was aborted', true);
+      }
+      if (error instanceof ContentFetchError && [
+        'UNSAFE_SOURCE_URL',
+        'UNSUPPORTED_CONTENT_TYPE',
+        'CONTENT_TOO_LARGE',
+        'TOO_MANY_REDIRECTS',
+      ].includes(error.code)) {
+        throw new ConnectorError('CONNECTOR_RESPONSE_INVALID', 'RSS feed returned an invalid response', false);
+      }
       throw new ConnectorError('CONNECTOR_UPSTREAM_UNAVAILABLE', 'RSS feed is temporarily unavailable', true);
-    }
-    if (!response.ok) {
-      throw new ConnectorError('CONNECTOR_UPSTREAM_UNAVAILABLE', 'RSS feed is temporarily unavailable', true);
-    }
-    try {
-      return await response.text();
-    } catch {
-      throw new ConnectorError('CONNECTOR_RESPONSE_INVALID', 'RSS feed returned an invalid response', false);
     }
   }
 

@@ -20,6 +20,7 @@ import {
   filterQueriesForPolicy,
 } from './keyword-policy.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
+import type { ContentInterestTagger } from './content-interest-tagger.js';
 import type { TrendCollectionSummary, TrendSeedCandidate, TrendWindow } from './trends/types.js';
 
 const HOUR_MS = 60 * 60 * 1_000;
@@ -644,6 +645,7 @@ export interface TrendDiscoveryServiceOptions {
   maxSeeds?: number;
   trendRequestBudget?: number;
   connectorCandidateBudget?: number;
+  interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>;
 }
 
 export class TrendDiscoveryService {
@@ -789,6 +791,7 @@ export class TrendDiscoveryService {
         candidateCount: unseen.length, acceptedCount: accepted.length,
         items, finishedAt: this.now(),
       });
+      await this.options.interestTagger?.tagCandidates(items, controller.signal);
       return { followUpManualRunId: result.followUpManualRunId };
     } catch (error) {
       const failure = controller.signal.aborted

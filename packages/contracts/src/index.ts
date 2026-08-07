@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 export const discoveryQueueName = 'topic-discovery';
 export const trendQueueName = 'trend-discovery';
+export const creatorQueueName = 'creator-discovery';
 export const maxTopicExpandedTerms = 32;
 
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
@@ -17,7 +18,15 @@ export const sourceTypeSchema = z.enum([
 ]);
 export const discoveryTriggerSchema = z.enum(['initial', 'manual', 'scheduled']);
 export const feedRangeSchema = z.enum(['1d', '3d', '7d', '30d', '90d', 'all']);
-export const feedOriginSchema = z.enum(['all', 'topic', 'trend']);
+export const feedOriginSchema = z.enum(['all', 'topic', 'trend', 'creator']);
+export const feedbackValueSchema = z.enum(['interested', 'less']);
+export const interestEventTypeSchema = z.enum([
+  'topic_state',
+  'creator_state',
+  'feedback_state',
+]);
+export const interestTagKindSchema = z.enum(['topic', 'entity', 'content_type']);
+export const interestTagStatusSchema = z.enum(['active', 'retired']);
 export const httpUrlSchema = z.url().refine((url) => /^https?:\/\//i.test(url), {
   message: 'URL must use HTTP or HTTPS',
 });
@@ -27,6 +36,44 @@ export const provenanceKindSchema = z.enum([
   'feed_entry',
   'fetched_page',
 ]);
+
+export const creatorPlatformSchema = z.enum(['rss', 'x', 'bilibili']);
+export const creatorContentTypeSchema = z.enum(['original', 'repost', 'reply']);
+export const creatorLegacyInputSchema = z.strictObject({
+  url: httpUrlSchema,
+});
+export const creatorResolutionInputSchema = z.strictObject({
+  input: z.string().trim().min(1).max(500),
+});
+export const creatorConfirmationInputSchema = z.strictObject({
+  resolutionTokens: z.array(z.string().trim().min(16).max(10_000)).min(1).max(10),
+});
+export const creatorInputSchema = z.union([
+  creatorLegacyInputSchema,
+  creatorConfirmationInputSchema,
+]);
+export const creatorIdentityCandidateSchema = z.strictObject({
+  resolutionToken: z.string().trim().min(16).max(10_000),
+  platform: creatorPlatformSchema,
+  displayName: z.string().trim().min(1).max(200),
+  handle: z.string().trim().min(1).max(200).nullable(),
+  avatarUrl: httpUrlSchema.nullable(),
+  bio: z.string().trim().min(1).max(1_000).nullable(),
+  verified: z.boolean().nullable(),
+  profileUrl: httpUrlSchema,
+  feedUrl: httpUrlSchema.nullable(),
+});
+export const creatorResolutionResultSchema = z.strictObject({
+  candidates: z.array(creatorIdentityCandidateSchema).max(25),
+});
+export const creatorPlatformStatusSchema = z.strictObject({
+  id: creatorPlatformSchema,
+  label: z.string().trim().min(1).max(100),
+  status: z.enum(['enabled', 'not_configured']),
+});
+export const creatorUpdateInputSchema = z.object({
+  paused: z.boolean(),
+});
 
 export const discoverySourceStatusSchema = z.object({
   id: z.string().trim().min(1),
@@ -50,7 +97,7 @@ export const feedQuerySchema = z.strictObject({
   origin: feedOriginSchema.default('all'),
   q: feedSearchTextSchema,
 }).superRefine((filter, context) => {
-  if (filter.topicId && filter.origin === 'trend') {
+  if (filter.topicId && (filter.origin === 'trend' || filter.origin === 'creator')) {
     context.addIssue({
       code: 'custom',
       path: ['origin'],
@@ -61,10 +108,11 @@ export const feedQuerySchema = z.strictObject({
 
 export const topicUpdateInputSchema = z.object({
   keyword: z.string().trim().min(1).max(100),
-  expandedTerms: z.array(z.string().trim().min(1).max(100)).max(maxTopicExpandedTerms),
+  /** @deprecated Internal query variants are regenerated from the keyword. */
+  expandedTerms: z.array(z.string().trim().min(1).max(100)).max(maxTopicExpandedTerms).optional(),
 }).superRefine(({ expandedTerms }, context) => {
+  if (expandedTerms === undefined) return;
   const normalizedTerms = new Set<string>();
-
   expandedTerms.forEach((term, index) => {
     const normalizedTerm = term.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
     if (normalizedTerms.has(normalizedTerm)) {
@@ -123,6 +171,7 @@ export const topicSchema = z.object({
   keyword: z.string().min(1).max(100),
   expandedTerms: z.array(z.string().min(1)),
   createdAt: z.iso.datetime(),
+  pausedAt: z.iso.datetime().nullable().default(null),
   lastRunAt: z.iso.datetime().nullable(),
   nextRunAt: z.iso.datetime().nullable(),
   scheduleIntervalHours: z.union([z.literal(6), z.literal(12), z.literal(24)]),
@@ -165,21 +214,189 @@ export const discoveryItemSchema = discoveryCandidateSchema.extend({
   discoveredAt: z.iso.datetime(),
 });
 
+export const creatorItemSchema = discoveryCandidateSchema.extend({
+  id: z.string().min(1),
+  creatorId: z.string().min(1),
+  discoveredAt: z.iso.datetime(),
+  feedEligible: z.boolean(),
+  contentType: creatorContentTypeSchema,
+  originalAuthorName: z.string().trim().min(1).nullable(),
+  originalAuthorHandle: z.string().trim().min(1).nullable(),
+  originalContentId: z.string().trim().min(1).nullable(),
+  originalContentUrl: httpUrlSchema.nullable(),
+  parentContentId: z.string().trim().min(1).nullable(),
+  parentContentUrl: httpUrlSchema.nullable(),
+  parentContentText: z.string().trim().min(1).max(5_000).nullable(),
+});
+
+export const topicFeedOriginSchema = z.strictObject({
+  origin: z.literal('topic'),
+  topicId: z.string().min(1),
+  topicKeyword: z.string().trim().min(1).max(100),
+  topicKeywordActive: z.boolean(),
+});
+
+export const trendFeedOriginSchema = z.strictObject({
+  origin: z.literal('trend'),
+});
+
+export const creatorFeedOriginSchema = z.strictObject({
+  origin: z.literal('creator'),
+  creatorId: z.string().min(1),
+  creatorName: z.string().trim().min(1),
+  platform: z.string().trim().min(1),
+  contentType: creatorContentTypeSchema,
+});
+
+export const feedOriginDetailSchema = z.discriminatedUnion('origin', [
+  topicFeedOriginSchema,
+  trendFeedOriginSchema,
+  creatorFeedOriginSchema,
+]);
+
+export const recommendationLaneSchema = z.enum([
+  'subscription', 'interest', 'trend', 'exploration',
+]);
+export const recommendationReasonSchema = z.enum([
+  'followed_topic',
+  'followed_creator',
+  'related_interest',
+  'recent_hot',
+  'exploration',
+]);
+export const feedRecommendationSchema = z.strictObject({
+  lane: recommendationLaneSchema,
+  reason: recommendationReasonSchema,
+  isExploration: z.boolean(),
+});
+
+const feedMergeFields = {
+  contentKey: httpUrlSchema,
+  origins: z.array(feedOriginDetailSchema).min(1).max(50),
+  feedback: feedbackValueSchema.nullable(),
+  recommendation: feedRecommendationSchema.optional(),
+};
+
+export const feedbackInputSchema = z.strictObject({
+  value: feedbackValueSchema.nullable(),
+});
+
+export const contentFeedbackSchema = z.strictObject({
+  contentKey: httpUrlSchema,
+  value: feedbackValueSchema.nullable(),
+});
+
+export const topicInterestEventPayloadSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  state: z.enum(['active', 'paused', 'deleted']),
+  topicId: z.string().min(1),
+  keyword: z.string().trim().min(1).max(100),
+  normalizedKeyword: z.string().trim().min(1).max(100),
+});
+
+export const creatorInterestEventPayloadSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  state: z.enum(['active', 'paused', 'cancelled']),
+  creatorId: z.string().min(1),
+  platform: creatorPlatformSchema,
+  accountKey: z.string().trim().min(1).max(2_000),
+  displayName: z.string().trim().min(1).max(200),
+});
+
+export const feedbackInterestEventPayloadSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  state: feedbackValueSchema.nullable(),
+  contentKey: httpUrlSchema,
+});
+
+const interestEventBaseShape = {
+  id: z.string().min(1),
+  userId: z.string().min(1),
+  sourceRef: z.string().min(1),
+  occurredAt: z.iso.datetime(),
+  recordedAt: z.iso.datetime(),
+  supersededAt: z.iso.datetime().nullable(),
+};
+
+export const interestEventSchema = z.discriminatedUnion('eventType', [
+  z.strictObject({
+    ...interestEventBaseShape,
+    eventType: z.literal('topic_state'),
+    payload: topicInterestEventPayloadSchema,
+  }),
+  z.strictObject({
+    ...interestEventBaseShape,
+    eventType: z.literal('creator_state'),
+    payload: creatorInterestEventPayloadSchema,
+  }),
+  z.strictObject({
+    ...interestEventBaseShape,
+    eventType: z.literal('feedback_state'),
+    payload: feedbackInterestEventPayloadSchema,
+  }),
+]);
+
+export const interestTagSuggestionSchema = z.strictObject({
+  slug: z.string().trim().min(1).max(100)
+    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  displayName: z.string().trim().min(1).max(100),
+  kind: interestTagKindSchema,
+  confidence: z.number().min(0).max(1),
+});
+
+export const interestTagExtractionSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  tags: z.array(interestTagSuggestionSchema).min(1).max(5),
+});
+
+export const interestThemeSourceSchema = z.enum(['keyword', 'creator', 'feedback']);
+export const interestMemoryThemeSchema = z.strictObject({
+  id: z.string().min(1),
+  name: z.string().trim().min(1).max(100),
+  kind: interestTagKindSchema,
+  sources: z.array(interestThemeSourceSchema).min(1).max(3),
+  updatedAt: z.iso.datetime(),
+});
+export const interestMemorySchema = z.strictObject({
+  personalizationEnabled: z.boolean(),
+  resetAt: z.iso.datetime().nullable(),
+  recent: z.array(interestMemoryThemeSchema).max(100),
+  longTerm: z.array(interestMemoryThemeSchema).max(100),
+  reduced: z.array(interestMemoryThemeSchema).max(100),
+});
+export const interestMemorySettingsInputSchema = z.strictObject({
+  personalizationEnabled: z.boolean(),
+});
+
 export const topicFeedItemSchema = discoveryItemSchema.extend({
   origin: z.literal('topic'),
   topicId: z.string().min(1),
   topicKeyword: z.string().trim().min(1).max(100),
   topicKeywordActive: z.boolean(),
+  ...feedMergeFields,
 }).strict();
 
 export const trendFeedItemSchema = discoveryItemSchema.omit({ topicId: true }).extend({
   origin: z.literal('trend'),
   topicId: z.null(),
+  ...feedMergeFields,
+}).strict();
+
+export const creatorFeedItemSchema = discoveryCandidateSchema.extend({
+  id: z.string().min(1),
+  topicId: z.null(),
+  origin: z.literal('creator'),
+  creatorId: z.string().min(1),
+  creatorName: z.string().trim().min(1),
+  discoveredAt: z.iso.datetime(),
+  feedEligible: z.literal(true),
+  ...feedMergeFields,
 }).strict();
 
 export const feedItemSchema = z.discriminatedUnion('origin', [
   topicFeedItemSchema,
   trendFeedItemSchema,
+  creatorFeedItemSchema,
 ]);
 
 export const discoveryJobDataSchema = z.object({
@@ -201,11 +418,44 @@ export const trendJobDataSchema = z.discriminatedUnion('trigger', [
   }),
 ]);
 
+export const creatorJobDataSchema = z.object({
+  creatorId: z.string().min(1),
+  userId: z.string().min(1),
+  trigger: z.enum(['manual', 'scheduled']),
+});
+
+export const creatorSchema = z.object({
+  id: z.string().min(1),
+  userId: z.string().min(1),
+  platform: creatorPlatformSchema,
+  displayName: z.string().trim().min(1),
+  profileUrl: httpUrlSchema,
+  feedUrl: httpUrlSchema.nullable(),
+  createdAt: z.iso.datetime(),
+  pausedAt: z.iso.datetime().nullable(),
+  lastRunAt: z.iso.datetime().nullable(),
+  nextRunAt: z.iso.datetime().nullable(),
+  runStatus: runStatusSchema,
+  lastError: safeErrorSchema.nullable(),
+  lastRun: runSummarySchema.nullable(),
+});
+
 export const apiErrorSchema = z.object({
   code: z.string().min(1),
   message: z.string().min(1),
   fieldErrors: z.record(z.string(), z.array(z.string())).optional(),
   traceId: z.string().min(1),
+});
+
+export const healthDependencySchema = z.strictObject({
+  status: z.enum(['ok', 'error', 'not_configured']),
+  code: z.string().min(1).optional(),
+});
+
+export const readinessSchema = z.strictObject({
+  status: z.enum(['ok', 'degraded']),
+  timestamp: z.iso.datetime(),
+  dependencies: z.record(z.string().min(1), healthDependencySchema),
 });
 
 export type TopicInput = z.infer<typeof topicInputSchema>;
@@ -214,16 +464,45 @@ export type Topic = z.infer<typeof topicSchema>;
 export type DiscoveryCandidate = z.infer<typeof discoveryCandidateSchema>;
 export type DiscoveryResult = z.infer<typeof discoveryResultSchema>;
 export type DiscoveryItem = z.infer<typeof discoveryItemSchema>;
+export type Creator = z.infer<typeof creatorSchema>;
+export type CreatorInput = z.infer<typeof creatorInputSchema>;
+export type CreatorConfirmationInput = z.infer<typeof creatorConfirmationInputSchema>;
+export type CreatorIdentityCandidate = z.infer<typeof creatorIdentityCandidateSchema>;
+export type CreatorLegacyInput = z.infer<typeof creatorLegacyInputSchema>;
+export type CreatorPlatformStatus = z.infer<typeof creatorPlatformStatusSchema>;
+export type CreatorResolutionInput = z.infer<typeof creatorResolutionInputSchema>;
+export type CreatorResolutionResult = z.infer<typeof creatorResolutionResultSchema>;
+export type CreatorUpdateInput = z.infer<typeof creatorUpdateInputSchema>;
+export type CreatorItem = z.infer<typeof creatorItemSchema>;
+export type CreatorContentType = z.infer<typeof creatorContentTypeSchema>;
+export type CreatorJobData = z.infer<typeof creatorJobDataSchema>;
 export type DiscoveryKind = z.infer<typeof discoveryKindSchema>;
 export type DiscoveryJobData = z.infer<typeof discoveryJobDataSchema>;
 export type DiscoverySourceStatus = z.infer<typeof discoverySourceStatusSchema>;
 export type DiscoveryTrigger = z.infer<typeof discoveryTriggerSchema>;
 export type FeedItem = z.infer<typeof feedItemSchema>;
+export type FeedbackInput = z.infer<typeof feedbackInputSchema>;
+export type FeedbackValue = z.infer<typeof feedbackValueSchema>;
+export type ContentFeedback = z.infer<typeof contentFeedbackSchema>;
+export type InterestEvent = z.infer<typeof interestEventSchema>;
+export type InterestEventType = z.infer<typeof interestEventTypeSchema>;
+export type InterestTagExtraction = z.infer<typeof interestTagExtractionSchema>;
+export type InterestTagKind = z.infer<typeof interestTagKindSchema>;
+export type InterestTagSuggestion = z.infer<typeof interestTagSuggestionSchema>;
+export type FeedRecommendation = z.infer<typeof feedRecommendationSchema>;
+export type InterestMemory = z.infer<typeof interestMemorySchema>;
+export type InterestMemoryTheme = z.infer<typeof interestMemoryThemeSchema>;
+export type InterestMemorySettingsInput = z.infer<typeof interestMemorySettingsInputSchema>;
+export type RecommendationLane = z.infer<typeof recommendationLaneSchema>;
+export type RecommendationReason = z.infer<typeof recommendationReasonSchema>;
 export type FeedOrigin = z.infer<typeof feedOriginSchema>;
+export type FeedOriginDetail = z.infer<typeof feedOriginDetailSchema>;
 export type FeedQuery = z.infer<typeof feedQuerySchema>;
 export type FeedQueryInput = z.input<typeof feedQuerySchema>;
 export type FeedRange = z.infer<typeof feedRangeSchema>;
+export type HealthDependency = z.infer<typeof healthDependencySchema>;
 export type ProvenanceKind = z.infer<typeof provenanceKindSchema>;
+export type Readiness = z.infer<typeof readinessSchema>;
 export type RunSummary = z.infer<typeof runSummarySchema>;
 export type SafeError = z.infer<typeof safeErrorSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;
@@ -231,4 +510,5 @@ export type SourceType = z.infer<typeof sourceTypeSchema>;
 export type TopicFeedItem = z.infer<typeof topicFeedItemSchema>;
 export type TrendFeedItem = z.infer<typeof trendFeedItemSchema>;
 export type TrendJobData = z.infer<typeof trendJobDataSchema>;
+export type CreatorFeedItem = z.infer<typeof creatorFeedItemSchema>;
 export type TrendStatus = z.infer<typeof trendStatusSchema>;

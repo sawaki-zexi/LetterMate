@@ -1,4 +1,8 @@
 import {
+  creatorFeedItemSchema,
+  contentFeedbackSchema,
+  creatorItemSchema,
+  creatorSchema,
   discoveryItemSchema,
   topicFeedItemSchema,
   trendFeedItemSchema,
@@ -6,11 +10,18 @@ import {
   runSummarySchema,
   safeErrorSchema,
   topicSchema,
+  type Creator,
+  type CreatorFeedItem,
+  type CreatorItem,
+  type ContentFeedback,
   type DiscoveryCandidate,
   type DiscoveryItem,
   type DiscoveryKind,
   type FeedItem,
+  type FeedRecommendation,
+  type FeedbackValue,
   type FeedOrigin,
+  type InterestEvent,
   type RunSummary,
   type RunStatus,
   type SafeError,
@@ -18,7 +29,7 @@ import {
   type TrendFeedItem,
   type TrendStatus,
 } from '@lettermate/contracts';
-import { canonicalizeUrl, normalizeKeyword } from '@lettermate/domain';
+import { canonicalizeUrl, mergeFeedItems, normalizeKeyword } from '@lettermate/domain';
 import {
   Prisma,
   type DiscoveryRun as PrismaDiscoveryRun,
@@ -27,6 +38,9 @@ import {
   type Topic as PrismaTopic,
   type TrendMonitor as PrismaTrendMonitor,
   type TrendRun as PrismaTrendRun,
+  type CreatorSubscription as PrismaCreatorSubscription,
+  type CreatorRun as PrismaCreatorRun,
+  type CreatorItem as PrismaCreatorItem,
 } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
@@ -37,6 +51,12 @@ import {
   sortRankedFeed,
   type RankedId,
 } from './feed-search.js';
+import {
+  appendInterestEvent,
+  appendMemoryInterestEvent,
+  mapInterestEvent,
+} from './interest-events.js';
+import type { PersonalizationMemory, PersonalizedSlate } from './personalization-memory.js';
 
 export class TopicAlreadyExistsError extends Error {
   constructor() {
@@ -45,9 +65,27 @@ export class TopicAlreadyExistsError extends Error {
   }
 }
 
+export class CreatorAlreadyExistsError extends Error {
+  constructor() {
+    super('Creator already exists');
+    this.name = 'CreatorAlreadyExistsError';
+  }
+}
+
 export interface TopicStore {
+  createCreator(userId: string, input: CreatorCreateInput): Promise<Creator>;
+  createCreators(userId: string, inputs: CreatorCreateInput[]): Promise<Creator[]>;
+  listCreators(userId: string): Promise<Creator[]>;
+  findCreator(userId: string, id: string): Promise<Creator | null>;
+  updateCreator(userId: string, id: string, input: CreatorUpdate): Promise<Creator | null>;
+  deleteCreator(userId: string, id: string): Promise<boolean>;
+  queueCreatorRefresh(userId: string, id: string): Promise<CreatorQueueResult | null>;
+  compensateCreatorRefresh(userId: string, id: string): Promise<boolean>;
+  listCreatorItems(userId: string, id: string): Promise<CreatorItem[] | null>;
   createTopic(userId: string, keyword: string, normalizedKeyword: string): Promise<Topic>;
   updateTopic(userId: string, id: string, input: TopicUpdate): Promise<QueueRefreshResult | null>;
+  pauseTopic(userId: string, id: string): Promise<Topic | null>;
+  resumeTopic(userId: string, id: string): Promise<QueueRefreshResult | null>;
   deleteTopic(userId: string, id: string): Promise<boolean>;
   compensateTopicRefresh(userId: string, id: string): Promise<boolean>;
   listTopics(userId: string): Promise<Topic[]>;
@@ -57,6 +95,12 @@ export interface TopicStore {
     userId: string,
     filter: FeedStoreFilter,
   ): Promise<FeedItem[]>;
+  setFeedback(
+    userId: string,
+    contentKey: string,
+    value: FeedbackValue | null,
+  ): Promise<ContentFeedback | null>;
+  listInterestEvents(userId: string): Promise<InterestEvent[]>;
   findItem(userId: string, id: string): Promise<FeedItem | null>;
   getTrendStatus(userId: string, intervalHours: number, now?: Date): Promise<TrendStatus>;
   queueTrendRefresh(
@@ -69,12 +113,31 @@ export interface TopicStore {
     registration: TrendRefreshRegistration,
   ): Promise<boolean>;
   close(): Promise<void>;
+  healthCheck?(): Promise<void>;
 }
 
 export interface TopicUpdate {
   keyword: string;
   normalizedKeyword: string;
-  expandedTerms: string[];
+  /** @deprecated Query variants are regenerated after a keyword change. */
+  expandedTerms?: string[] | undefined;
+}
+
+export interface CreatorCreateInput {
+  platform: 'rss' | 'x' | 'bilibili';
+  accountKey: string;
+  displayName: string;
+  profileUrl: string;
+  feedUrl: string | null;
+}
+
+export interface CreatorUpdate {
+  paused: boolean;
+}
+
+export interface CreatorQueueResult {
+  creator: Creator;
+  shouldEnqueue: boolean;
 }
 
 export interface FeedStoreFilter {
@@ -120,7 +183,9 @@ const latestRunInclude = {
   runs: { orderBy: [{ startedAt: 'desc' as const }, { id: 'desc' as const }], take: 1 },
 };
 
-function mapRunSummary(run: PrismaDiscoveryRun | PrismaTrendRun | undefined): RunSummary | null {
+function mapRunSummary(
+  run: PrismaDiscoveryRun | PrismaTrendRun | PrismaCreatorRun | undefined,
+): RunSummary | null {
   if (!run) return null;
   const unfinished = run.status === 'queued' || run.status === 'running';
   return runSummarySchema.parse({
@@ -141,6 +206,7 @@ function mapTopic(topic: TopicWithRuns): Topic {
     keyword: topic.keyword,
     expandedTerms: topic.expandedTerms,
     createdAt: topic.createdAt.toISOString(),
+    pausedAt: topic.pausedAt?.toISOString() ?? null,
     lastRunAt: topic.lastRunAt?.toISOString() ?? null,
     nextRunAt: topic.nextRunAt?.toISOString() ?? null,
     scheduleIntervalHours: topic.scheduleIntervalHours,
@@ -171,11 +237,20 @@ function mapItem(item: PrismaDiscoveryItem): DiscoveryItem {
 }
 
 function mapTopicFeedItem(item: PrismaDiscoveryItem & { topic?: { deletedAt: Date | null; keyword: string } }): FeedItem {
+  const topicKeywordActive = item.topic?.deletedAt === null && item.topic.keyword === item.topicKeyword;
   return topicFeedItemSchema.parse({
     ...mapItem(item),
     origin: 'topic',
     topicKeyword: item.topicKeyword,
-    topicKeywordActive: item.topic?.deletedAt === null && item.topic.keyword === item.topicKeyword,
+    topicKeywordActive,
+    contentKey: item.canonicalPrimaryUrl,
+    feedback: null,
+    origins: [{
+      origin: 'topic',
+      topicId: item.topicId,
+      topicKeyword: item.topicKeyword,
+      topicKeywordActive,
+    }],
   });
 }
 
@@ -197,6 +272,9 @@ function mapRadarFeedItem(item: PrismaRadarItem): FeedItem {
     authorHandle: item.authorHandle,
     externalId: item.externalId,
     provenanceKind: item.provenanceKind,
+    contentKey: item.canonicalPrimaryUrl,
+    feedback: null,
+    origins: [{ origin: 'trend' }],
   });
 }
 
@@ -221,7 +299,47 @@ function sortFeed(items: FeedItem[]): FeedItem[] {
 }
 
 export class PrismaTopicStore implements TopicStore {
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly personalization?: PersonalizationMemory,
+  ) {}
+
+  private async personalizeFeed(userId: string, items: FeedItem[]): Promise<FeedItem[]> {
+    if (!this.personalization || items.length === 0) return items;
+    try {
+      const selection = await this.personalization.select({
+        userId,
+        surface: 'feed',
+        candidates: items,
+        asOf: new Date(),
+      });
+      if (!selection.personalizationEnabled) return items;
+      const itemByKey = new Map(items.map((item) => [item.contentKey, item]));
+      const personalized = selection.ranked.flatMap((ranked) => {
+        const item = itemByKey.get(ranked.contentKey);
+        if (!item) return [];
+        itemByKey.delete(ranked.contentKey);
+        return [{ ...item, recommendation: publicRecommendation(ranked) }];
+      });
+      return [...personalized, ...itemByKey.values()];
+    } catch {
+      return items;
+    }
+  }
+
+  private async attachFeedback(userId: string, items: FeedItem[]): Promise<FeedItem[]> {
+    if (items.length === 0) return items;
+    const contentKeys = [...new Set(items.map((item) => canonicalizeUrl(item.contentKey)))];
+    const rows = await this.prisma.contentFeedback.findMany({
+      where: { userId, contentKey: { in: contentKeys } },
+      select: { contentKey: true, value: true },
+    });
+    const feedbackByKey = new Map(rows.map((row) => [row.contentKey, row.value]));
+    return items.map((item) => ({
+      ...item,
+      feedback: feedbackByKey.get(canonicalizeUrl(item.contentKey)) ?? null,
+    }));
+  }
 
   async createTopic(
     userId: string,
@@ -229,26 +347,41 @@ export class PrismaTopicStore implements TopicStore {
     normalizedKeyword: string,
   ): Promise<Topic> {
     try {
-      const topic = await this.prisma.topic.create({
-        data: {
-          keyword,
-          normalizedKeyword,
-          queuedTrigger: 'initial',
-          user: {
-            connectOrCreate: {
-              where: { id: userId },
-              create: {
-                id: userId,
-                email: `${userId}@example.local`,
-                passwordHash: 'local-prototype-no-login-credential',
-                timezone: 'Asia/Shanghai',
+      return await this.prisma.$transaction(async (transaction) => {
+        const topic = await transaction.topic.create({
+          data: {
+            keyword,
+            normalizedKeyword,
+            queuedTrigger: 'initial',
+            user: {
+              connectOrCreate: {
+                where: { id: userId },
+                create: {
+                  id: userId,
+                  email: `${userId}@example.local`,
+                  passwordHash: 'local-prototype-no-login-credential',
+                  timezone: 'Asia/Shanghai',
+                },
               },
             },
           },
-        },
-        include: latestRunInclude,
+          include: latestRunInclude,
+        });
+        await appendInterestEvent(transaction, {
+          userId,
+          eventType: 'topic_state',
+          sourceRef: topic.id,
+          payload: {
+            schemaVersion: 1,
+            state: 'active',
+            topicId: topic.id,
+            keyword: topic.keyword,
+            normalizedKeyword: topic.normalizedKeyword,
+          },
+          occurredAt: topic.createdAt,
+        });
+        return mapTopic(topic);
       });
-      return mapTopic(topic);
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -260,6 +393,7 @@ export class PrismaTopicStore implements TopicStore {
     }
   }
 
+
   async listTopics(userId: string): Promise<Topic[]> {
     const topics = await this.prisma.topic.findMany({
       where: { userId, deletedAt: null },
@@ -267,6 +401,216 @@ export class PrismaTopicStore implements TopicStore {
       include: latestRunInclude,
     });
     return topics.map(mapTopic);
+  }
+
+  async createCreator(userId: string, input: CreatorCreateInput): Promise<Creator> {
+    return (await this.createCreators(userId, [input]))[0]!;
+  }
+
+  async createCreators(userId: string, inputs: CreatorCreateInput[]): Promise<Creator[]> {
+    if (inputs.length === 0) return [];
+    const inputKeys = new Set(inputs.map((input) => `${input.platform}:${input.accountKey}`));
+    if (inputKeys.size !== inputs.length) throw new CreatorAlreadyExistsError();
+    try {
+      return await this.prisma.$transaction(async (transaction) => {
+        await transaction.user.upsert({
+          where: { id: userId },
+          update: {},
+          create: {
+            id: userId,
+            email: `${userId}@example.local`,
+            passwordHash: 'local-prototype-no-login-credential',
+            timezone: 'Asia/Shanghai',
+          },
+        });
+        const creators: Creator[] = [];
+        for (const input of inputs) {
+          const existing = await transaction.creatorSubscription.findUnique({
+            where: {
+              userId_platform_accountKey: {
+                userId, platform: input.platform, accountKey: input.accountKey,
+              },
+            },
+            include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+          });
+          if (existing && !existing.cancelledAt) throw new CreatorAlreadyExistsError();
+          const creator = existing
+            ? await transaction.creatorSubscription.update({
+              where: { id: existing.id },
+              data: {
+                displayName: input.displayName,
+                profileUrl: input.profileUrl,
+                feedUrl: input.feedUrl,
+                cancelledAt: null,
+                pausedAt: null,
+                nextRunAt: null,
+                runStatus: 'queued',
+                lastError: Prisma.DbNull,
+              },
+              include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+            })
+            : await transaction.creatorSubscription.create({
+              data: {
+                userId,
+                platform: input.platform,
+                accountKey: input.accountKey,
+                displayName: input.displayName,
+                profileUrl: input.profileUrl,
+                feedUrl: input.feedUrl,
+                nextRunAt: null,
+              },
+              include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+            });
+          await appendInterestEvent(transaction, {
+            userId,
+            eventType: 'creator_state',
+            sourceRef: creator.id,
+            payload: {
+              schemaVersion: 1,
+              state: 'active',
+              creatorId: creator.id,
+              platform: creator.platform,
+              accountKey: creator.accountKey,
+              displayName: creator.displayName,
+            },
+            occurredAt: new Date(),
+          });
+          creators.push(mapCreator(creator));
+        }
+        return creators;
+      });
+    } catch (error) {
+      if (error instanceof CreatorAlreadyExistsError) throw error;
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new CreatorAlreadyExistsError();
+      }
+      throw error;
+    }
+  }
+
+  async listCreators(userId: string): Promise<Creator[]> {
+    const creators = await this.prisma.creatorSubscription.findMany({
+      where: { userId, cancelledAt: null },
+      orderBy: { createdAt: 'desc' },
+      include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+    });
+    return creators.map(mapCreator);
+  }
+
+  async findCreator(userId: string, id: string): Promise<Creator | null> {
+    const creator = await this.prisma.creatorSubscription.findFirst({
+      where: { id, userId, cancelledAt: null },
+      include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+    });
+    return creator ? mapCreator(creator) : null;
+  }
+
+  async updateCreator(userId: string, id: string, input: CreatorUpdate): Promise<Creator | null> {
+    return this.prisma.$transaction(async (transaction) => {
+      const current = await transaction.creatorSubscription.findFirst({
+        where: { id, userId, cancelledAt: null },
+        include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+      });
+      if (!current) return null;
+      const alreadyInState = input.paused ? current.pausedAt !== null : current.pausedAt === null;
+      if (alreadyInState) return mapCreator(current);
+      const occurredAt = new Date();
+      const updated = await transaction.creatorSubscription.update({
+        where: { id },
+        data: input.paused
+          ? { pausedAt: occurredAt, nextRunAt: null }
+          : { pausedAt: null, nextRunAt: null, runStatus: 'succeeded', lastError: Prisma.DbNull },
+        include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+      });
+      await appendInterestEvent(transaction, {
+        userId,
+        eventType: 'creator_state',
+        sourceRef: updated.id,
+        payload: {
+          schemaVersion: 1,
+          state: input.paused ? 'paused' : 'active',
+          creatorId: updated.id,
+          platform: updated.platform,
+          accountKey: updated.accountKey,
+          displayName: updated.displayName,
+        },
+        occurredAt,
+      });
+      return mapCreator(updated);
+    });
+  }
+
+  async deleteCreator(userId: string, id: string): Promise<boolean> {
+    return this.prisma.$transaction(async (transaction) => {
+      const current = await transaction.creatorSubscription.findFirst({
+        where: { id, userId, cancelledAt: null },
+      });
+      if (!current) return false;
+      const occurredAt = new Date();
+      await transaction.creatorSubscription.update({
+        where: { id },
+        data: { cancelledAt: occurredAt, pausedAt: occurredAt, nextRunAt: null },
+      });
+      await appendInterestEvent(transaction, {
+        userId,
+        eventType: 'creator_state',
+        sourceRef: current.id,
+        payload: {
+          schemaVersion: 1,
+          state: 'cancelled',
+          creatorId: current.id,
+          platform: current.platform,
+          accountKey: current.accountKey,
+          displayName: current.displayName,
+        },
+        occurredAt,
+      });
+      return true;
+    });
+  }
+
+  async queueCreatorRefresh(userId: string, id: string): Promise<CreatorQueueResult | null> {
+    return this.prisma.$transaction(async (transaction) => {
+      let creator = await transaction.creatorSubscription.findFirst({
+        where: { id, userId, cancelledAt: null },
+        include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+      });
+      if (!creator) return null;
+      if (creator.pausedAt) return { creator: mapCreator(creator), shouldEnqueue: false };
+      if (creator.runStatus === 'running' || creator.runStatus === 'queued') {
+        return { creator: mapCreator(creator), shouldEnqueue: false };
+      }
+      const updated = await transaction.creatorSubscription.updateMany({
+        where: { id, userId, cancelledAt: null, runStatus: { in: ['succeeded', 'failed'] } },
+        data: { runStatus: 'queued', lastError: Prisma.DbNull },
+      });
+      creator = await transaction.creatorSubscription.findFirstOrThrow({
+        where: { id, userId, cancelledAt: null },
+        include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
+      });
+      return { creator: mapCreator(creator), shouldEnqueue: updated.count === 1 };
+    });
+  }
+
+  async compensateCreatorRefresh(userId: string, id: string): Promise<boolean> {
+    const result = await this.prisma.creatorSubscription.updateMany({
+      where: { id, userId, cancelledAt: null, runStatus: 'queued' },
+      data: { runStatus: 'failed', lastError: { code: 'CREATOR_QUEUE_UNAVAILABLE', message: '博主任务暂时无法入队，请稍后重试' } },
+    });
+    return result.count === 1;
+  }
+
+  async listCreatorItems(userId: string, id: string): Promise<CreatorItem[] | null> {
+    const creator = await this.prisma.creatorSubscription.findFirst({
+      where: { id, userId },
+      select: { id: true },
+    });
+    if (!creator) return null;
+    const items = await this.prisma.creatorItem.findMany({
+      where: { userId, creatorId: id },
+      orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
+    });
+    return items.map(mapCreatorItem);
   }
 
   async findTopic(userId: string, id: string): Promise<Topic | null> {
@@ -279,19 +623,37 @@ export class PrismaTopicStore implements TopicStore {
 
   async updateTopic(userId: string, id: string, input: TopicUpdate): Promise<QueueRefreshResult | null> {
     try {
-      const updated = await this.prisma.topic.updateMany({
-        where: { id, userId, deletedAt: null },
-        data: {
-          keyword: input.keyword,
-          normalizedKeyword: input.normalizedKeyword,
-          expandedTerms: input.expandedTerms,
-          variantsInitialized: true,
-          nextRunAt: null,
-          productiveRunStreak: 0,
-          emptyRunStreak: 0,
-        },
+      const updated = await this.prisma.$transaction(async (transaction) => {
+        const result = await transaction.topic.updateMany({
+          where: { id, userId, deletedAt: null },
+          data: {
+            keyword: input.keyword,
+            normalizedKeyword: input.normalizedKeyword,
+            expandedTerms: [],
+            keywordProfile: 'unknown',
+            variantsInitialized: false,
+            nextRunAt: null,
+            productiveRunStreak: 0,
+            emptyRunStreak: 0,
+          },
+        });
+        if (result.count !== 1) return false;
+        await appendInterestEvent(transaction, {
+          userId,
+          eventType: 'topic_state',
+          sourceRef: id,
+          payload: {
+            schemaVersion: 1,
+            state: 'active',
+            topicId: id,
+            keyword: input.keyword,
+            normalizedKeyword: input.normalizedKeyword,
+          },
+          occurredAt: new Date(),
+        });
+        return true;
       });
-      if (updated.count !== 1) return null;
+      if (!updated) return null;
       return this.queueRefresh(userId, id);
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
@@ -301,22 +663,103 @@ export class PrismaTopicStore implements TopicStore {
     }
   }
 
+  async pauseTopic(userId: string, id: string): Promise<Topic | null> {
+    return this.prisma.$transaction(async (transaction) => {
+      const current = await transaction.topic.findFirst({
+        where: { id, userId, deletedAt: null }, include: latestRunInclude,
+      });
+      if (!current) return null;
+      if (current.pausedAt) return mapTopic(current);
+      const occurredAt = new Date();
+      const paused = await transaction.topic.update({
+        where: { id },
+        data: {
+          pausedAt: occurredAt,
+          nextRunAt: null,
+          queuedTrigger: null,
+          manualRefreshPending: false,
+        },
+        include: latestRunInclude,
+      });
+      await appendInterestEvent(transaction, {
+        userId,
+        eventType: 'topic_state',
+        sourceRef: id,
+        payload: {
+          schemaVersion: 1,
+          state: 'paused',
+          topicId: id,
+          keyword: paused.keyword,
+          normalizedKeyword: paused.normalizedKeyword,
+        },
+        occurredAt,
+      });
+      return mapTopic(paused);
+    });
+  }
+
+  async resumeTopic(userId: string, id: string): Promise<QueueRefreshResult | null> {
+    const resumed = await this.prisma.$transaction(async (transaction) => {
+      const current = await transaction.topic.findFirst({
+        where: { id, userId, deletedAt: null },
+      });
+      if (!current) return false;
+      if (current.pausedAt) {
+        await transaction.topic.update({ where: { id }, data: { pausedAt: null } });
+      }
+      await appendInterestEvent(transaction, {
+        userId,
+        eventType: 'topic_state',
+        sourceRef: id,
+        payload: {
+          schemaVersion: 1,
+          state: 'active',
+          topicId: id,
+          keyword: current.keyword,
+          normalizedKeyword: current.normalizedKeyword,
+        },
+        occurredAt: new Date(),
+      });
+      return true;
+    });
+    return resumed ? this.queueRefresh(userId, id) : null;
+  }
+
   async deleteTopic(userId: string, id: string): Promise<boolean> {
     return this.prisma.$transaction(async (transaction) => {
+      const current = await transaction.topic.findFirst({
+        where: { id, userId, deletedAt: null },
+      });
+      if (!current) return false;
       const deletedAt = new Date();
       const active = await transaction.topic.updateMany({
         where: { id, userId, deletedAt: null, activeRunId: { not: null } },
         data: { deletedAt, nextRunAt: null, queuedTrigger: null, manualRefreshPending: false },
       });
-      if (active.count === 1) return true;
-      const inactive = await transaction.topic.updateMany({
-        where: { id, userId, deletedAt: null, activeRunId: null },
-        data: {
-          deletedAt, nextRunAt: null, runStatus: 'failed', queuedTrigger: null,
-          runLeaseUntil: null, manualRefreshPending: false,
+      if (active.count === 0) {
+        const inactive = await transaction.topic.updateMany({
+          where: { id, userId, deletedAt: null, activeRunId: null },
+          data: {
+            deletedAt, nextRunAt: null, runStatus: 'failed', queuedTrigger: null,
+            runLeaseUntil: null, manualRefreshPending: false,
+          },
+        });
+        if (inactive.count !== 1) return false;
+      }
+      await appendInterestEvent(transaction, {
+        userId,
+        eventType: 'topic_state',
+        sourceRef: id,
+        payload: {
+          schemaVersion: 1,
+          state: 'deleted',
+          topicId: id,
+          keyword: current.keyword,
+          normalizedKeyword: current.normalizedKeyword,
         },
+        occurredAt: deletedAt,
       });
-      return inactive.count === 1;
+      return true;
     });
   }
 
@@ -337,6 +780,7 @@ export class PrismaTopicStore implements TopicStore {
         where: { id, userId, deletedAt: null }, include: latestRunInclude,
       });
       if (!topic) return null;
+      if (topic.pausedAt) return { topic: mapTopic(topic), shouldEnqueue: false };
 
       if (topic.runStatus === 'running') {
         const pending = await transaction.topic.updateMany({
@@ -386,6 +830,9 @@ export class PrismaTopicStore implements TopicStore {
     userId: string,
     filter: FeedStoreFilter,
   ): Promise<FeedItem[]> {
+    const includeTopics = filter.origin === 'all' || filter.origin === 'topic';
+    const includeTrends = !filter.topicId && (filter.origin === 'all' || filter.origin === 'trend');
+    const includeCreators = !filter.topicId && (filter.origin === 'all' || filter.origin === 'creator');
     const timeWhere = filter.since ? {
       OR: [
         { publishedAt: { gte: filter.since } },
@@ -394,15 +841,28 @@ export class PrismaTopicStore implements TopicStore {
     } : {};
     if (filter.query) {
       const searchFilter = { ...filter, query: filter.query };
-      const topicRankPromise = filter.origin === 'trend'
+      const topicRankPromise = !includeTopics
         ? Promise.resolve([] as RankedId[])
         : this.prisma.$queryRaw<RankedId[]>(buildTopicRankQuery(userId, searchFilter));
-      const radarRankPromise = filter.origin === 'topic' || filter.topicId
+      const radarRankPromise = !includeTrends
         ? Promise.resolve([] as RankedId[])
         : this.prisma.$queryRaw<RankedId[]>(buildTrendRankQuery(userId, searchFilter));
-      const [topicRanks, radarRanks] = await Promise.all([
+      const creatorPromise = includeCreators
+        ? this.prisma.creatorItem.findMany({
+            where: {
+              userId,
+              feedEligible: true,
+              ...(filter.kind ? { kind: filter.kind } : {}),
+              ...timeWhere,
+              creator: { cancelledAt: null },
+            },
+            include: { creator: { select: { displayName: true } } },
+          })
+        : Promise.resolve([]);
+      const [topicRanks, radarRanks, creatorItems] = await Promise.all([
         topicRankPromise,
         radarRankPromise,
+        creatorPromise,
       ]);
       const topicRankById = new Map(topicRanks.map((rank) => [rank.id, rank.relevance]));
       const radarRankById = new Map(radarRanks.map((rank) => [rank.id, rank.relevance]));
@@ -431,7 +891,7 @@ export class PrismaTopicStore implements TopicStore {
               },
             }),
       ]);
-      return sortRankedFeed([
+      return this.attachFeedback(userId, mergeFeedItems(sortRankedFeed([
         ...topicItems.map((item) => ({
           item: mapTopicFeedItem(item),
           relevance: topicRankById.get(item.id) ?? 0,
@@ -440,9 +900,14 @@ export class PrismaTopicStore implements TopicStore {
           item: mapRadarFeedItem(item),
           relevance: radarRankById.get(item.id) ?? 0,
         })),
-      ]);
+        ...creatorItems.flatMap((item) => {
+          const feedItem = mapCreatorFeedItem(item);
+          const relevance = memorySearchRelevance(feedItem, filter.query!);
+          return relevance === null ? [] : [{ item: feedItem, relevance }];
+        }),
+      ])));
     }
-    const topicPromise = filter.origin === 'trend'
+    const topicPromise = !includeTopics
       ? Promise.resolve([] as PrismaDiscoveryItem[])
       : this.prisma.discoveryItem.findMany({
           where: {
@@ -456,7 +921,7 @@ export class PrismaTopicStore implements TopicStore {
           include: { topic: { select: { deletedAt: true, keyword: true } } },
           orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
         });
-    const radarPromise = filter.origin === 'topic' || filter.topicId
+    const radarPromise = !includeTrends
       ? Promise.resolve([] as PrismaRadarItem[])
       : this.prisma.radarItem.findMany({
           where: {
@@ -466,11 +931,100 @@ export class PrismaTopicStore implements TopicStore {
           },
           orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
         });
-    const [topicItems, radarItems] = await Promise.all([topicPromise, radarPromise]);
-    return sortFeed([
+    const creatorPromise = !includeCreators
+      ? Promise.resolve([])
+      : this.prisma.creatorItem.findMany({
+          where: {
+            userId,
+            feedEligible: true,
+            ...(filter.kind ? { kind: filter.kind } : {}),
+            ...timeWhere,
+            creator: { cancelledAt: null },
+          },
+          include: { creator: { select: { displayName: true } } },
+          orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
+        });
+    const [topicItems, radarItems, creatorItems] = await Promise.all([
+      topicPromise,
+      radarPromise,
+      creatorPromise,
+    ]);
+    const feed = await this.attachFeedback(userId, mergeFeedItems(sortFeed([
       ...topicItems.map(mapTopicFeedItem),
       ...radarItems.map(mapRadarFeedItem),
-    ]);
+      ...creatorItems.map(mapCreatorFeedItem),
+    ])));
+    return this.personalizeFeed(userId, feed);
+  }
+
+  async setFeedback(
+    userId: string,
+    contentKey: string,
+    value: FeedbackValue | null,
+  ): Promise<ContentFeedback | null> {
+    const canonicalContentKey = canonicalizeUrl(contentKey);
+    return this.prisma.$transaction(async (transaction) => {
+      const [topicItem, radarItem, creatorItem] = await Promise.all([
+        transaction.discoveryItem.findFirst({
+          where: { canonicalPrimaryUrl: canonicalContentKey, topic: { userId } },
+          select: { id: true },
+        }),
+        transaction.radarItem.findFirst({
+          where: { userId, canonicalPrimaryUrl: canonicalContentKey },
+          select: { id: true },
+        }),
+        transaction.creatorItem.findFirst({
+          where: {
+            userId,
+            canonicalPrimaryUrl: canonicalContentKey,
+            feedEligible: true,
+            creator: { cancelledAt: null },
+          },
+          select: { id: true },
+        }),
+      ]);
+      if (!topicItem && !radarItem && !creatorItem) return null;
+
+      const current = await transaction.contentFeedback.findUnique({
+        where: { userId_contentKey: { userId, contentKey: canonicalContentKey } },
+        select: { value: true },
+      });
+      if ((current?.value ?? null) === value) {
+        return contentFeedbackSchema.parse({ contentKey: canonicalContentKey, value });
+      }
+      const occurredAt = new Date();
+      if (value === null) {
+        await transaction.contentFeedback.deleteMany({
+          where: { userId, contentKey: canonicalContentKey },
+        });
+      } else {
+        await transaction.contentFeedback.upsert({
+          where: { userId_contentKey: { userId, contentKey: canonicalContentKey } },
+          create: { userId, contentKey: canonicalContentKey, value },
+          update: { value },
+        });
+      }
+      await appendInterestEvent(transaction, {
+        userId,
+        eventType: 'feedback_state',
+        sourceRef: canonicalContentKey,
+        payload: {
+          schemaVersion: 1,
+          state: value,
+          contentKey: canonicalContentKey,
+        },
+        occurredAt,
+      });
+      return contentFeedbackSchema.parse({ contentKey: canonicalContentKey, value });
+    });
+  }
+
+  async listInterestEvents(userId: string): Promise<InterestEvent[]> {
+    const events = await this.prisma.interestEvent.findMany({
+      where: { userId },
+      orderBy: [{ occurredAt: 'asc' }, { id: 'asc' }],
+    });
+    return events.map(mapInterestEvent);
   }
 
   async findItem(userId: string, id: string): Promise<FeedItem | null> {
@@ -478,9 +1032,16 @@ export class PrismaTopicStore implements TopicStore {
       where: { id, topic: { userId } },
       include: { topic: { select: { deletedAt: true, keyword: true } } },
     });
-    if (item) return mapTopicFeedItem(item);
+    if (item) return (await this.attachFeedback(userId, [mapTopicFeedItem(item)]))[0]!;
     const radar = await this.prisma.radarItem.findFirst({ where: { id, userId } });
-    return radar ? mapRadarFeedItem(radar) : null;
+    if (radar) return (await this.attachFeedback(userId, [mapRadarFeedItem(radar)]))[0]!;
+    const creatorItem = await this.prisma.creatorItem.findFirst({
+      where: { id, userId, feedEligible: true, creator: { cancelledAt: null } },
+      include: { creator: { select: { displayName: true } } },
+    });
+    return creatorItem
+      ? (await this.attachFeedback(userId, [mapCreatorFeedItem(creatorItem)]))[0]!
+      : null;
   }
 
   async getTrendStatus(userId: string, intervalHours: number, now = new Date()): Promise<TrendStatus> {
@@ -661,12 +1222,20 @@ export class PrismaTopicStore implements TopicStore {
   async close(): Promise<void> {
     await this.prisma.$disconnect();
   }
+
+  async healthCheck(): Promise<void> {
+    await this.prisma.$queryRaw`SELECT 1`;
+  }
 }
 
 export class MemoryTopicStore implements TopicStore {
   private readonly topics: Array<Topic & { deletedAt: string | null; variantsInitialized: boolean }> = [];
+  private readonly creators: Array<Creator & { cancelledAt: string | null; accountKey: string }> = [];
+  private readonly creatorItems: Array<CreatorItem & { userId: string; creatorName: string }> = [];
   private readonly items: Array<DiscoveryItem & { topicKeyword: string }> = [];
   private readonly radarItems: Array<TrendFeedItem & { userId: string }> = [];
+  private readonly feedback = new Map<string, FeedbackValue>();
+  private readonly interestEvents: InterestEvent[] = [];
   private readonly pendingManualRefreshes = new Set<string>();
   private readonly trendMonitors = new Map<string, TrendStatus & {
     manualRefreshPending: boolean;
@@ -674,7 +1243,44 @@ export class MemoryTopicStore implements TopicStore {
     runLeaseUntil: Date | null;
   }>();
 
-  constructor(private readonly now: () => Date = () => new Date()) {}
+  constructor(
+    private readonly now: () => Date = () => new Date(),
+    private readonly personalization?: PersonalizationMemory,
+  ) {}
+
+  private async personalizeFeed(userId: string, items: FeedItem[]): Promise<FeedItem[]> {
+    if (!this.personalization || items.length === 0) return items;
+    try {
+      const selection = await this.personalization.select({
+        userId,
+        surface: 'feed',
+        candidates: items,
+        asOf: this.now(),
+      });
+      if (!selection.personalizationEnabled) return items;
+      const itemByKey = new Map(items.map((item) => [item.contentKey, item]));
+      const personalized = selection.ranked.flatMap((ranked) => {
+        const item = itemByKey.get(ranked.contentKey);
+        if (!item) return [];
+        itemByKey.delete(ranked.contentKey);
+        return [{ ...item, recommendation: publicRecommendation(ranked) }];
+      });
+      return [...personalized, ...itemByKey.values()];
+    } catch {
+      return items;
+    }
+  }
+
+  private feedbackKey(userId: string, contentKey: string): string {
+    return `${userId}\u0000${canonicalizeUrl(contentKey)}`;
+  }
+
+  private attachFeedback(userId: string, items: FeedItem[]): FeedItem[] {
+    return items.map((item) => ({
+      ...item,
+      feedback: this.feedback.get(this.feedbackKey(userId, item.contentKey)) ?? null,
+    }));
+  }
 
   async createTopic(
     userId: string,
@@ -696,6 +1302,7 @@ export class MemoryTopicStore implements TopicStore {
       keyword,
       expandedTerms: [],
       createdAt: startedAt,
+      pausedAt: null,
       lastRunAt: null,
       nextRunAt: null,
       scheduleIntervalHours: 12,
@@ -709,7 +1316,212 @@ export class MemoryTopicStore implements TopicStore {
       variantsInitialized: false,
     };
     this.topics.unshift(topic);
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'topic_state',
+      sourceRef: topic.id,
+      payload: {
+        schemaVersion: 1,
+        state: 'active',
+        topicId: topic.id,
+        keyword,
+        normalizedKeyword,
+      },
+      occurredAt: this.now(),
+    });
     return structuredClone(topic);
+  }
+
+  async createCreator(userId: string, input: CreatorCreateInput): Promise<Creator> {
+    return (await this.createCreators(userId, [input]))[0]!;
+  }
+
+  async createCreators(userId: string, inputs: CreatorCreateInput[]): Promise<Creator[]> {
+    if (inputs.length === 0) return [];
+    const inputKeys = new Set(inputs.map((input) => `${input.platform}:${input.accountKey}`));
+    if (inputKeys.size !== inputs.length) throw new CreatorAlreadyExistsError();
+    const existingCreators = inputs.map((input) => this.creators.find((creator) => (
+      creator.userId === userId && creator.platform === input.platform && creator.accountKey === input.accountKey
+    )));
+    if (existingCreators.some((creator) => creator?.cancelledAt === null)) {
+      throw new CreatorAlreadyExistsError();
+    }
+    const results: Creator[] = [];
+    for (const [index, input] of inputs.entries()) {
+      const existing = existingCreators[index];
+      const now = this.now().toISOString();
+      if (existing) {
+        Object.assign(existing, {
+          displayName: input.displayName,
+          profileUrl: input.profileUrl,
+          feedUrl: input.feedUrl,
+          cancelledAt: null,
+          pausedAt: null,
+          nextRunAt: null,
+          runStatus: 'queued' as const,
+          lastError: null,
+        });
+        appendMemoryInterestEvent(this.interestEvents, {
+          userId,
+          eventType: 'creator_state',
+          sourceRef: existing.id,
+          payload: {
+            schemaVersion: 1,
+            state: 'active',
+            creatorId: existing.id,
+            platform: existing.platform,
+            accountKey: existing.accountKey,
+            displayName: existing.displayName,
+          },
+          occurredAt: this.now(),
+        });
+        results.push(structuredClone(existing));
+        continue;
+      }
+      const creator: Creator & { cancelledAt: string | null; accountKey: string } = {
+        id: randomUUID(),
+        userId,
+        platform: input.platform,
+        displayName: input.displayName,
+        profileUrl: input.profileUrl,
+        feedUrl: input.feedUrl,
+        createdAt: now,
+        pausedAt: null,
+        lastRunAt: null,
+        nextRunAt: null,
+        runStatus: 'queued',
+        lastError: null,
+        lastRun: null,
+        cancelledAt: null,
+        accountKey: input.accountKey,
+      };
+      this.creators.unshift(creator);
+      appendMemoryInterestEvent(this.interestEvents, {
+        userId,
+        eventType: 'creator_state',
+        sourceRef: creator.id,
+        payload: {
+          schemaVersion: 1,
+          state: 'active',
+          creatorId: creator.id,
+          platform: creator.platform,
+          accountKey: creator.accountKey,
+          displayName: creator.displayName,
+        },
+        occurredAt: this.now(),
+      });
+      results.push(structuredClone(creator));
+    }
+    return results;
+  }
+
+  async listCreators(userId: string): Promise<Creator[]> {
+    return this.creators
+      .filter((creator) => creator.userId === userId && creator.cancelledAt === null)
+      .map((creator) => structuredClone(creator));
+  }
+
+  async findCreator(userId: string, id: string): Promise<Creator | null> {
+    const creator = this.creators.find((candidate) => (
+      candidate.userId === userId && candidate.id === id && candidate.cancelledAt === null
+    ));
+    return creator ? structuredClone(creator) : null;
+  }
+
+  async updateCreator(userId: string, id: string, input: CreatorUpdate): Promise<Creator | null> {
+    const creator = this.creators.find((candidate) => (
+      candidate.userId === userId && candidate.id === id && candidate.cancelledAt === null
+    ));
+    if (!creator) return null;
+    const alreadyInState = input.paused ? creator.pausedAt !== null : creator.pausedAt === null;
+    if (alreadyInState) return structuredClone(creator);
+    const occurredAt = this.now();
+    if (input.paused) {
+      creator.pausedAt = occurredAt.toISOString();
+      creator.nextRunAt = null;
+    } else {
+      creator.pausedAt = null;
+      creator.nextRunAt = this.now().toISOString();
+      creator.runStatus = 'succeeded';
+      creator.lastError = null;
+    }
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'creator_state',
+      sourceRef: creator.id,
+      payload: {
+        schemaVersion: 1,
+        state: input.paused ? 'paused' : 'active',
+        creatorId: creator.id,
+        platform: creator.platform,
+        accountKey: creator.accountKey,
+        displayName: creator.displayName,
+      },
+      occurredAt,
+    });
+    return structuredClone(creator);
+  }
+
+  async deleteCreator(userId: string, id: string): Promise<boolean> {
+    const creator = this.creators.find((candidate) => (
+      candidate.userId === userId && candidate.id === id && candidate.cancelledAt === null
+    ));
+    if (!creator) return false;
+    const occurredAt = this.now();
+    creator.cancelledAt = occurredAt.toISOString();
+    creator.pausedAt = creator.cancelledAt;
+    creator.nextRunAt = null;
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'creator_state',
+      sourceRef: creator.id,
+      payload: {
+        schemaVersion: 1,
+        state: 'cancelled',
+        creatorId: creator.id,
+        platform: creator.platform,
+        accountKey: creator.accountKey,
+        displayName: creator.displayName,
+      },
+      occurredAt,
+    });
+    return true;
+  }
+
+  async queueCreatorRefresh(userId: string, id: string): Promise<CreatorQueueResult | null> {
+    const creator = this.creators.find((candidate) => (
+      candidate.userId === userId && candidate.id === id && candidate.cancelledAt === null
+    ));
+    if (!creator) return null;
+    if (creator.pausedAt) return { creator: structuredClone(creator), shouldEnqueue: false };
+    if (creator.runStatus === 'queued' && creator.lastRun === null) {
+      return { creator: structuredClone(creator), shouldEnqueue: true };
+    }
+    if (creator.runStatus === 'running' || creator.runStatus === 'queued') {
+      return { creator: structuredClone(creator), shouldEnqueue: false };
+    }
+    creator.runStatus = 'queued';
+    creator.lastError = null;
+    return { creator: structuredClone(creator), shouldEnqueue: true };
+  }
+
+  async compensateCreatorRefresh(userId: string, id: string): Promise<boolean> {
+    const creator = this.creators.find((candidate) => (
+      candidate.userId === userId && candidate.id === id && candidate.cancelledAt === null
+        && candidate.runStatus === 'queued'
+    ));
+    if (!creator) return false;
+    creator.runStatus = 'failed';
+    creator.lastError = { code: 'CREATOR_QUEUE_UNAVAILABLE', message: '博主任务暂时无法入队，请稍后重试' };
+    return true;
+  }
+
+  async listCreatorItems(userId: string, id: string): Promise<CreatorItem[] | null> {
+    const creator = this.creators.find((candidate) => candidate.userId === userId && candidate.id === id);
+    if (!creator) return null;
+    return this.creatorItems
+      .filter((item) => item.userId === userId && item.creatorId === id)
+      .map(({ userId: _userId, creatorName: _creatorName, ...item }) => structuredClone(item));
   }
 
   async listTopics(userId: string): Promise<Topic[]> {
@@ -730,19 +1542,95 @@ export class MemoryTopicStore implements TopicStore {
       throw new TopicAlreadyExistsError();
     }
     topic.keyword = input.keyword;
-    topic.expandedTerms = input.expandedTerms;
-    topic.variantsInitialized = true;
+    topic.expandedTerms = [];
+    topic.variantsInitialized = false;
     topic.nextRunAt = null;
     topic.lastError = null;
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'topic_state',
+      sourceRef: topic.id,
+      payload: {
+        schemaVersion: 1,
+        state: 'active',
+        topicId: topic.id,
+        keyword: topic.keyword,
+        normalizedKeyword: input.normalizedKeyword,
+      },
+      occurredAt: this.now(),
+    });
+    return this.queueRefresh(userId, id);
+  }
+
+  async pauseTopic(userId: string, id: string): Promise<Topic | null> {
+    const topic = this.topics.find(
+      (candidate) => candidate.userId === userId && candidate.id === id && candidate.deletedAt === null,
+    );
+    if (!topic) return null;
+    if (topic.pausedAt) return structuredClone(topic);
+    const occurredAt = this.now();
+    topic.pausedAt = occurredAt.toISOString();
+    topic.nextRunAt = null;
+    this.pendingManualRefreshes.delete(id);
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'topic_state',
+      sourceRef: topic.id,
+      payload: {
+        schemaVersion: 1,
+        state: 'paused',
+        topicId: topic.id,
+        keyword: topic.keyword,
+        normalizedKeyword: normalizeKeyword(topic.keyword),
+      },
+      occurredAt,
+    });
+    return structuredClone(topic);
+  }
+
+  async resumeTopic(userId: string, id: string): Promise<QueueRefreshResult | null> {
+    const topic = this.topics.find(
+      (candidate) => candidate.userId === userId && candidate.id === id && candidate.deletedAt === null,
+    );
+    if (!topic) return null;
+    const occurredAt = this.now();
+    topic.pausedAt = null;
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'topic_state',
+      sourceRef: topic.id,
+      payload: {
+        schemaVersion: 1,
+        state: 'active',
+        topicId: topic.id,
+        keyword: topic.keyword,
+        normalizedKeyword: normalizeKeyword(topic.keyword),
+      },
+      occurredAt,
+    });
     return this.queueRefresh(userId, id);
   }
 
   async deleteTopic(userId: string, id: string): Promise<boolean> {
     const topic = this.topics.find((candidate) => candidate.userId === userId && candidate.id === id && candidate.deletedAt === null);
     if (!topic) return false;
-    topic.deletedAt = this.now().toISOString();
+    const occurredAt = this.now();
+    topic.deletedAt = occurredAt.toISOString();
     topic.nextRunAt = null;
     if (topic.runStatus !== 'running') topic.runStatus = 'failed';
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'topic_state',
+      sourceRef: topic.id,
+      payload: {
+        schemaVersion: 1,
+        state: 'deleted',
+        topicId: topic.id,
+        keyword: topic.keyword,
+        normalizedKeyword: normalizeKeyword(topic.keyword),
+      },
+      occurredAt,
+    });
     return true;
   }
 
@@ -761,6 +1649,7 @@ export class MemoryTopicStore implements TopicStore {
       candidate.userId === userId && candidate.id === id && candidate.deletedAt === null
     ));
     if (!topic) return null;
+    if (topic.pausedAt) return { topic: structuredClone(topic), shouldEnqueue: false };
     if (topic.runStatus === 'running') {
       this.pendingManualRefreshes.add(id);
       topic.lastError = null;
@@ -788,7 +1677,7 @@ export class MemoryTopicStore implements TopicStore {
     const topicIds = new Set(
       this.topics.filter((topic) => topic.userId === userId).map((topic) => topic.id),
     );
-    const topicItems = filter.origin === 'trend' ? [] : this.items
+    const topicItems = filter.origin === 'trend' || filter.origin === 'creator' ? [] : this.items
       .filter(
         (item) =>
           topicIds.has(item.topicId) &&
@@ -798,24 +1687,109 @@ export class MemoryTopicStore implements TopicStore {
       )
       .map((item) => {
         const topic = this.topics.find((candidate) => candidate.id === item.topicId);
+        const topicKeywordActive = topic?.deletedAt === null && topic.keyword === item.topicKeyword;
         return topicFeedItemSchema.parse({
           ...item, origin: 'topic',
-          topicKeywordActive: topic?.deletedAt === null && topic.keyword === item.topicKeyword,
+          topicKeywordActive,
+          contentKey: canonicalizeUrl(item.sourceUrls[0]!),
+          feedback: null,
+          origins: [{
+            origin: 'topic',
+            topicId: item.topicId,
+            topicKeyword: item.topicKeyword,
+            topicKeywordActive,
+          }],
         });
       });
-    const radarItems = filter.origin === 'topic' || filter.topicId ? [] : this.radarItems
+    const radarItems = filter.origin === 'topic' || filter.origin === 'creator' || filter.topicId ? [] : this.radarItems
       .filter((item) =>
         item.userId === userId &&
         (!filter.kind || item.kind === filter.kind) &&
         (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()))
       .map(({ userId: _userId, ...item }) => trendFeedItemSchema.parse(item));
+    const creatorItems = filter.origin === 'topic' || filter.origin === 'trend' || filter.topicId
+      ? []
+      : this.creatorItems
+          .filter((item) =>
+            item.userId === userId &&
+            item.feedEligible &&
+            (!filter.kind || item.kind === filter.kind) &&
+            (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()))
+          .map(({ userId: _userId, creatorName, contentType,
+            originalAuthorName: _originalAuthorName, originalAuthorHandle: _originalAuthorHandle,
+            originalContentId: _originalContentId, originalContentUrl: _originalContentUrl,
+            parentContentId: _parentContentId, parentContentUrl: _parentContentUrl,
+            parentContentText: _parentContentText, ...item }) => creatorFeedItemSchema.parse({
+            ...item,
+            topicId: null,
+            origin: 'creator',
+            creatorName,
+            feedEligible: true,
+            contentKey: canonicalizeUrl(item.sourceUrls[0]!),
+            feedback: null,
+            origins: [{
+              origin: 'creator',
+              creatorId: item.creatorId,
+              creatorName,
+              platform: item.platform,
+              contentType,
+            }],
+          }));
     if (filter.query) {
-      return sortRankedFeed([...topicItems, ...radarItems].flatMap((item) => {
+      return this.attachFeedback(userId, mergeFeedItems(sortRankedFeed([...topicItems, ...radarItems, ...creatorItems].flatMap((item) => {
         const relevance = memorySearchRelevance(item, filter.query!);
         return relevance === null ? [] : [{ item, relevance }];
-      })).map((item) => structuredClone(item));
+      })))).map((item) => structuredClone(item));
     }
-    return sortFeed([...topicItems, ...radarItems]).map((item) => structuredClone(item));
+    const feed = this.attachFeedback(
+      userId,
+      mergeFeedItems(sortFeed([...topicItems, ...radarItems, ...creatorItems])),
+    ).map((item) => structuredClone(item));
+    return this.personalizeFeed(userId, feed);
+  }
+
+  async setFeedback(
+    userId: string,
+    contentKey: string,
+    value: FeedbackValue | null,
+  ): Promise<ContentFeedback | null> {
+    const canonicalContentKey = canonicalizeUrl(contentKey);
+    const ownsTopicItem = this.items.some((item) => (
+      canonicalizeUrl(item.sourceUrls[0]!) === canonicalContentKey
+      && this.topics.some((topic) => topic.id === item.topicId && topic.userId === userId)
+    ));
+    const ownsRadarItem = this.radarItems.some((item) => (
+      item.userId === userId && canonicalizeUrl(item.contentKey) === canonicalContentKey
+    ));
+    const ownsCreatorItem = this.creatorItems.some((item) => (
+      item.userId === userId
+      && item.feedEligible
+      && canonicalizeUrl(item.sourceUrls[0]!) === canonicalContentKey
+      && this.creators.some((creator) => (
+        creator.id === item.creatorId && creator.userId === userId && creator.cancelledAt === null
+      ))
+    ));
+    if (!ownsTopicItem && !ownsRadarItem && !ownsCreatorItem) return null;
+
+    const key = this.feedbackKey(userId, canonicalContentKey);
+    const current = this.feedback.get(key) ?? null;
+    if (current === value) return contentFeedbackSchema.parse({ contentKey: canonicalContentKey, value });
+    if (value === null) this.feedback.delete(key);
+    else this.feedback.set(key, value);
+    appendMemoryInterestEvent(this.interestEvents, {
+      userId,
+      eventType: 'feedback_state',
+      sourceRef: canonicalContentKey,
+      payload: { schemaVersion: 1, state: value, contentKey: canonicalContentKey },
+      occurredAt: this.now(),
+    });
+    return contentFeedbackSchema.parse({ contentKey: canonicalContentKey, value });
+  }
+
+  async listInterestEvents(userId: string): Promise<InterestEvent[]> {
+    return this.interestEvents
+      .filter((event) => event.userId === userId)
+      .map((event) => structuredClone(event));
   }
 
   async findItem(userId: string, id: string): Promise<FeedItem | null> {
@@ -826,18 +1800,55 @@ export class MemoryTopicStore implements TopicStore {
       );
       const topic = this.topics.find((candidate) => candidate.id === item.topicId);
       return ownsTopic
-        ? structuredClone(topicFeedItemSchema.parse({
+          ? structuredClone(this.attachFeedback(userId, [topicFeedItemSchema.parse({
             ...item, origin: 'topic',
             topicKeywordActive: topic?.deletedAt === null && topic.keyword === item.topicKeyword,
-          }))
+            contentKey: canonicalizeUrl(item.sourceUrls[0]!),
+            feedback: null,
+            origins: [{
+              origin: 'topic', topicId: item.topicId, topicKeyword: item.topicKeyword,
+              topicKeywordActive: topic?.deletedAt === null && topic.keyword === item.topicKeyword,
+            }],
+          })])[0]!)
         : null;
     }
     const radar = this.radarItems.find(
       (candidate) => candidate.id === id && candidate.userId === userId,
     );
-    if (!radar) return null;
-    const { userId: _userId, ...feedItem } = radar;
-    return structuredClone(trendFeedItemSchema.parse(feedItem));
+    if (radar) {
+      const { userId: _userId, ...feedItem } = radar;
+      return structuredClone(this.attachFeedback(userId, [trendFeedItemSchema.parse(feedItem)])[0]!);
+    }
+    const creatorItem = this.creatorItems.find(
+      (candidate) => candidate.id === id && candidate.userId === userId && candidate.feedEligible,
+    );
+    if (!creatorItem) return null;
+    const {
+      userId: _userId,
+      creatorName,
+      contentType,
+      originalAuthorName: _originalAuthorName,
+      originalAuthorHandle: _originalAuthorHandle,
+      originalContentId: _originalContentId,
+      originalContentUrl: _originalContentUrl,
+      parentContentId: _parentContentId,
+      parentContentUrl: _parentContentUrl,
+      parentContentText: _parentContentText,
+      ...feedItem
+    } = creatorItem;
+    return structuredClone(this.attachFeedback(userId, [creatorFeedItemSchema.parse({
+      ...feedItem,
+      topicId: null,
+      origin: 'creator',
+      creatorName,
+      feedEligible: true,
+      contentKey: canonicalizeUrl(feedItem.sourceUrls[0]!),
+      feedback: null,
+      origins: [{
+        origin: 'creator', creatorId: creatorItem.creatorId, creatorName,
+        platform: creatorItem.platform, contentType,
+      }],
+    })])[0]!);
   }
 
   async getTrendStatus(
@@ -980,6 +1991,7 @@ export class MemoryTopicStore implements TopicStore {
       keyword,
       expandedTerms: [],
       createdAt: new Date().toISOString(),
+      pausedAt: null,
       lastRunAt: null,
       nextRunAt: null,
       scheduleIntervalHours: 12,
@@ -1028,9 +2040,10 @@ export class MemoryTopicStore implements TopicStore {
   seedRadarItem(
     userId: string,
     kind: DiscoveryKind,
-    timestamps: { publishedAt?: string | null; discoveredAt?: string } = {},
+    timestamps: { publishedAt?: string | null; discoveredAt?: string; sourceUrl?: string } = {},
   ): TrendFeedItem {
     const id = randomUUID();
+    const sourceUrl = timestamps.sourceUrl ?? `https://example.com/radar/${id}`;
     const item = trendFeedItemSchema.parse({
       id,
       topicId: null,
@@ -1039,7 +2052,7 @@ export class MemoryTopicStore implements TopicStore {
       title: kind === 'hot' ? 'Trend hot content' : 'Trend quality content',
       summary: 'Chinese summary',
       reason: 'Supported by substantive source material',
-      sourceUrls: [`https://example.com/radar/${id}`],
+      sourceUrls: [sourceUrl],
       publishedAt: timestamps.publishedAt ?? null,
       discoveredAt: timestamps.discoveredAt ?? this.now().toISOString(),
       sourceType: 'web',
@@ -1048,8 +2061,52 @@ export class MemoryTopicStore implements TopicStore {
       authorHandle: null,
       externalId: null,
       provenanceKind: 'ai_citation',
+      contentKey: canonicalizeUrl(sourceUrl),
+      feedback: null,
+      origins: [{ origin: 'trend' }],
     });
     this.radarItems.push({ ...item, userId });
+    return structuredClone(item);
+  }
+
+  seedCreatorItem(
+    userId: string,
+    creatorId: string,
+    kind: DiscoveryKind,
+    timestamps: { publishedAt?: string | null; discoveredAt?: string; sourceUrl?: string } = {},
+  ): CreatorItem {
+    const creator = this.creators.find((candidate) => (
+      candidate.id === creatorId && candidate.userId === userId && candidate.cancelledAt === null
+    ));
+    if (!creator) throw new Error('Creator was not found');
+    const id = randomUUID();
+    const item = creatorItemSchema.parse({
+      id,
+      creatorId,
+      kind,
+      title: kind === 'hot' ? '博主热点内容' : '博主优质内容',
+      summary: '中文摘要',
+      reason: '内容深入且有原文依据',
+      sourceUrls: [timestamps.sourceUrl ?? `https://example.com/creator/${id}`],
+      publishedAt: timestamps.publishedAt ?? null,
+      discoveredAt: timestamps.discoveredAt ?? this.now().toISOString(),
+      sourceType: 'feed',
+      platform: 'RSS/Atom',
+      authorName: creator.displayName,
+      authorHandle: null,
+      externalId: id,
+      provenanceKind: 'feed_entry',
+      feedEligible: true,
+      contentType: 'original',
+      originalAuthorName: null,
+      originalAuthorHandle: null,
+      originalContentId: null,
+      originalContentUrl: null,
+      parentContentId: null,
+      parentContentUrl: null,
+      parentContentText: null,
+    });
+    this.creatorItems.push({ ...item, userId, creatorName: creator.displayName });
     return structuredClone(item);
   }
 
@@ -1169,6 +2226,9 @@ export class MemoryTopicStore implements TopicStore {
         this.radarItems.push({
           ...candidate, id, userId, topicId: null, origin: 'trend',
           discoveredAt: this.now().toISOString(),
+          contentKey: primary,
+          feedback: null,
+          origins: [{ origin: 'trend' }],
         });
         newItemCount += 1;
       }
@@ -1198,4 +2258,104 @@ export class MemoryTopicStore implements TopicStore {
   }
 
   async close(): Promise<void> {}
+
+  async healthCheck(): Promise<void> {}
+}
+
+function publicRecommendation(
+  ranked: PersonalizedSlate['ranked'][number],
+): FeedRecommendation {
+  const reason = ranked.isExploration
+    ? 'exploration'
+    : ranked.reasonCodes.includes('FOLLOWED_TOPIC')
+      ? 'followed_topic'
+      : ranked.reasonCodes.includes('FOLLOWED_CREATOR')
+        ? 'followed_creator'
+        : ranked.reasonCodes.includes('RELATED_INTEREST')
+          ? 'related_interest'
+          : 'recent_hot';
+  return { lane: ranked.lane, reason, isExploration: ranked.isExploration };
+}
+
+type CreatorWithRuns = PrismaCreatorSubscription & { runs?: PrismaCreatorRun[] };
+
+function mapCreator(creator: CreatorWithRuns): Creator {
+  const error = safeErrorSchema.safeParse(creator.lastError);
+  return creatorSchema.parse({
+    id: creator.id,
+    userId: creator.userId,
+    platform: creator.platform,
+    displayName: creator.displayName,
+    profileUrl: creator.profileUrl,
+    feedUrl: creator.feedUrl,
+    createdAt: creator.createdAt.toISOString(),
+    pausedAt: creator.pausedAt?.toISOString() ?? null,
+    lastRunAt: creator.lastRunAt?.toISOString() ?? null,
+    nextRunAt: creator.nextRunAt?.toISOString() ?? null,
+    runStatus: creator.runStatus,
+    lastError: error.success ? error.data : null,
+    lastRun: mapRunSummary(creator.runs?.[0]),
+  });
+}
+
+function mapCreatorItem(item: PrismaCreatorItem): CreatorItem {
+  return creatorItemSchema.parse({
+    id: item.id,
+    creatorId: item.creatorId,
+    kind: item.kind,
+    title: item.title,
+    summary: item.summary,
+    reason: item.reason,
+    sourceUrls: item.sourceUrls,
+    publishedAt: item.publishedAt?.toISOString() ?? null,
+    discoveredAt: item.discoveredAt.toISOString(),
+    sourceType: item.sourceType,
+    platform: item.platform,
+    authorName: item.authorName,
+    authorHandle: item.authorHandle,
+    externalId: item.externalId,
+    provenanceKind: item.provenanceKind,
+    feedEligible: item.feedEligible,
+    contentType: item.contentType,
+    originalAuthorName: item.originalAuthorName,
+    originalAuthorHandle: item.originalAuthorHandle,
+    originalContentId: item.originalContentId,
+    originalContentUrl: item.originalContentUrl,
+    parentContentId: item.parentContentId,
+    parentContentUrl: item.parentContentUrl,
+    parentContentText: item.parentContentText,
+  });
+}
+
+function mapCreatorFeedItem(
+  item: PrismaCreatorItem & { creator: { displayName: string } },
+): CreatorFeedItem {
+  const creatorItem = mapCreatorItem(item);
+  const {
+    contentType,
+    originalAuthorName: _originalAuthorName,
+    originalAuthorHandle: _originalAuthorHandle,
+    originalContentId: _originalContentId,
+    originalContentUrl: _originalContentUrl,
+    parentContentId: _parentContentId,
+    parentContentUrl: _parentContentUrl,
+    parentContentText: _parentContentText,
+    ...feedItem
+  } = creatorItem;
+  return creatorFeedItemSchema.parse({
+    ...feedItem,
+    topicId: null,
+    origin: 'creator',
+    creatorName: item.creator.displayName,
+    feedEligible: true,
+    contentKey: item.canonicalPrimaryUrl,
+    feedback: null,
+    origins: [{
+      origin: 'creator',
+      creatorId: item.creatorId,
+      creatorName: item.creator.displayName,
+      platform: item.platform,
+      contentType,
+    }],
+  });
 }

@@ -6,7 +6,11 @@ import {
   type SafeError,
   type Topic,
 } from '@lettermate/contracts';
-import { canonicalizeUrl } from '@lettermate/domain';
+import {
+  canonicalizeUrl,
+  classifyKeywordProfile,
+  type KeywordProfile,
+} from '@lettermate/domain';
 import { Prisma, type Topic as PrismaTopic } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
@@ -14,6 +18,7 @@ import { AiGatewayError, type AiGateway } from './ai-gateway.js';
 import type { ConnectorSearchSummary, SourceQueryPlan } from './connectors/types.js';
 import { buildKeywordPolicy } from './keyword-policy.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
+import type { ContentInterestTagger } from './content-interest-tagger.js';
 import { SourceRouter } from './source-router.js';
 import {
   calculateFailureSchedule,
@@ -46,6 +51,7 @@ export interface SaveSuccessInput {
 export interface BegunDiscoveryRun {
   runId: string;
   keyword: string;
+  keywordProfile: KeywordProfile;
   expandedTerms: string[];
   initialExpansion: boolean;
 }
@@ -137,15 +143,27 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
   ): Promise<BegunDiscoveryRun | null> {
     return this.prisma.$transaction(async (transaction) => {
       const previous = await transaction.topic.findFirst({
-        where: { id: topicId, deletedAt: null },
-        select: { activeRunId: true, runStatus: true, runLeaseUntil: true, keyword: true, expandedTerms: true, variantsInitialized: true },
+        where: { id: topicId, deletedAt: null, pausedAt: null },
+        select: {
+          activeRunId: true,
+          runStatus: true,
+          runLeaseUntil: true,
+          keyword: true,
+          keywordProfile: true,
+          expandedTerms: true,
+          variantsInitialized: true,
+        },
       });
       if (!previous) return null;
       const runId = randomUUID();
+      const keywordProfile = previous.keywordProfile === 'unknown'
+        ? classifyKeywordProfile(previous.keyword)
+        : { kind: previous.keywordProfile };
       const claimed = await transaction.topic.updateMany({
         where: {
           id: topicId,
           deletedAt: null,
+          pausedAt: null,
           activeRunId: previous.activeRunId,
           OR: [
             { runStatus: { not: 'running' } },
@@ -158,6 +176,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
           queuedTrigger: null,
           activeRunId: runId,
           runLeaseUntil: new Date(startedAt.getTime() + this.runLeaseMs),
+          keywordProfile: keywordProfile.kind,
           lastError: Prisma.DbNull,
           ...(trigger === 'manual' ? { manualRefreshPending: false } : {}),
         },
@@ -184,12 +203,14 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         data: {
           id: runId, topicId, trigger, status: 'running', startedAt,
           keywordSnapshot: previous.keyword, expandedTermsSnapshot: previous.expandedTerms,
+          keywordProfileSnapshot: keywordProfile.kind,
         },
         select: { id: true },
       });
       return {
         runId: run.id,
         keyword: previous.keyword,
+        keywordProfile,
         expandedTerms: previous.expandedTerms,
         initialExpansion: !previous.variantsInitialized,
       };
@@ -254,7 +275,12 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
       }
       const topicState = await transaction.topic.findFirst({
         where: { id: input.topicId },
-        select: { manualRefreshPending: true, variantsInitialized: true, deletedAt: true },
+        select: {
+          manualRefreshPending: true,
+          variantsInitialized: true,
+          deletedAt: true,
+          pausedAt: true,
+        },
       });
       const run = await transaction.discoveryRun.findUnique({
         where: { id: input.runId },
@@ -327,19 +353,22 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
           } : {}),
           runStatus: topicState?.deletedAt
             ? 'failed'
-            : topicState?.manualRefreshPending ? 'queued' : 'succeeded',
-          queuedTrigger: !topicState?.deletedAt && topicState?.manualRefreshPending ? 'manual' : null,
-          ...(topicState?.deletedAt ? { nextRunAt: null } : {}),
+            : !topicState?.pausedAt && topicState?.manualRefreshPending ? 'queued' : 'succeeded',
+          queuedTrigger: !topicState?.deletedAt && !topicState?.pausedAt && topicState?.manualRefreshPending
+            ? 'manual'
+            : null,
+          ...(topicState?.deletedAt || topicState?.pausedAt ? { nextRunAt: null } : {}),
           lastRunAt: input.finishedAt,
           lastError: Prisma.DbNull,
           activeRunId: null,
           runLeaseUntil: null,
-          ...(!topicState?.deletedAt ? input.schedule ?? {} : {}),
+          ...(!topicState?.deletedAt && !topicState?.pausedAt ? input.schedule ?? {} : {}),
         },
       });
       return {
         newItemCount,
-        pendingManualRefresh: !topicState?.deletedAt && (topicState?.manualRefreshPending ?? false),
+        pendingManualRefresh: !topicState?.deletedAt && !topicState?.pausedAt
+          && (topicState?.manualRefreshPending ?? false),
       };
     }, persistenceTransactionOptions(input.persistenceTimeoutMs));
   }
@@ -365,23 +394,27 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
       });
       const topicState = await transaction.topic.findFirst({
         where: { id: input.topicId },
-        select: { manualRefreshPending: true },
+        select: { manualRefreshPending: true, pausedAt: true },
       });
       await transaction.topic.update({
         where: { id: input.topicId },
         data: {
-          runStatus: topicState?.manualRefreshPending ? 'queued' : input.status,
-          queuedTrigger: topicState?.manualRefreshPending
+          runStatus: !topicState?.pausedAt && topicState?.manualRefreshPending ? 'queued' : input.status,
+          queuedTrigger: !topicState?.pausedAt && topicState?.manualRefreshPending
             ? 'manual'
             : input.status === 'queued' ? (input.trigger ?? 'scheduled') : null,
+          ...(topicState?.pausedAt ? { nextRunAt: null } : {}),
           lastRunAt: input.finishedAt,
           lastError: input.error,
           activeRunId: null,
           runLeaseUntil: null,
-          ...(input.schedule ?? {}),
+          ...(!topicState?.pausedAt ? input.schedule ?? {} : {}),
         },
       });
-      return { pendingManualRefresh: topicState?.manualRefreshPending ?? false };
+      return {
+        pendingManualRefresh: !topicState?.pausedAt
+          && (topicState?.manualRefreshPending ?? false),
+      };
     });
   }
 }
@@ -418,6 +451,7 @@ interface QualityPipelineLike {
 interface SourceRouterLike {
   route(input: {
     keyword: string;
+    keywordProfile?: KeywordProfile;
     expanded: Awaited<ReturnType<AiGateway['expandTopic']>>;
     windowStart: string;
     windowEnd: string;
@@ -432,6 +466,7 @@ export interface TopicDiscoveryServiceOptions {
   router?: SourceRouterLike;
   now?: () => Date;
   timeoutMs?: number;
+  interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>;
 }
 
 export interface DiscoveryRunContext {
@@ -446,6 +481,7 @@ export class TopicDiscoveryService {
   private readonly router: SourceRouterLike;
   private readonly now: () => Date;
   private readonly timeoutMs: number;
+  private readonly interestTagger: Pick<ContentInterestTagger, 'tagCandidates'> | undefined;
 
   constructor(options: TopicDiscoveryServiceOptions) {
     this.gateway = options.gateway;
@@ -455,6 +491,7 @@ export class TopicDiscoveryService {
     this.router = options.router ?? new SourceRouter();
     this.now = options.now ?? (() => new Date());
     this.timeoutMs = options.timeoutMs ?? 600_000;
+    this.interestTagger = options.interestTagger;
   }
 
   async run(
@@ -470,7 +507,13 @@ export class TopicDiscoveryService {
     const claim = await this.repository.beginRun(topicId, trigger, startedAt);
     if (claim === null) return;
     const begun: BegunDiscoveryRun = typeof claim === 'string'
-      ? { runId: claim, keyword: topic.keyword, expandedTerms: topic.expandedTerms, initialExpansion: true }
+      ? {
+          runId: claim,
+          keyword: topic.keyword,
+          keywordProfile: classifyKeywordProfile(topic.keyword),
+          expandedTerms: topic.expandedTerms,
+          initialExpansion: true,
+        }
       : claim;
     const { runId } = begun;
     const controller = new AbortController();
@@ -488,6 +531,7 @@ export class TopicDiscoveryService {
       const windowStart = new Date(windowEnd.getTime() - 7 * 24 * 60 * 60 * 1_000);
       const plan = this.router.route({
         keyword: begun.keyword,
+        keywordProfile: begun.keywordProfile,
         windowStart: windowStart.toISOString(),
         windowEnd: windowEnd.toISOString(),
         expanded,
@@ -557,6 +601,7 @@ export class TopicDiscoveryService {
       });
       this.throwIfTimedOut(controller.signal, deadlineAt);
       pendingManualRefresh = saved.pendingManualRefresh;
+      await this.interestTagger?.tagCandidates(items, controller.signal);
     } catch (error) {
       const failure = this.isTimedOut(error, controller.signal, deadlineAt)
         ? new DiscoveryOrchestrationError(

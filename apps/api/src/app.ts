@@ -1,12 +1,20 @@
 import { parseConfig } from '@lettermate/config';
 import {
+  creatorPlatformStatusSchema,
+  creatorResolutionInputSchema,
   discoverySourceStatusSchema,
+  feedbackInputSchema,
+  creatorInputSchema,
+  creatorUpdateInputSchema,
   feedQuerySchema,
+  httpUrlSchema,
+  interestMemorySchema,
+  interestMemorySettingsInputSchema,
   topicInputSchema,
   topicUpdateInputSchema,
   type DiscoverySourceStatus,
 } from '@lettermate/contracts';
-import { normalizeKeyword } from '@lettermate/domain';
+import { canonicalizeUrl, normalizeKeyword } from '@lettermate/domain';
 import {
   BadRequestException,
   Body,
@@ -23,6 +31,7 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   Query,
   ServiceUnavailableException,
   UnauthorizedException,
@@ -30,12 +39,15 @@ import {
 import type { DynamicModule, INestApplication, NestModule, OnModuleDestroy } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { PrismaClient } from '@prisma/client';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import type { z } from 'zod';
+import { checkApiReadiness, type ApiHealthChecks, type HealthProbe } from './health.js';
 import {
   MemoryTopicStore,
   PrismaTopicStore,
   TopicAlreadyExistsError,
+  CreatorAlreadyExistsError,
+  type CreatorCreateInput,
   type TopicStore,
 } from './topic-store.js';
 import {
@@ -46,14 +58,37 @@ import {
   createBullTrendQueue,
   type TrendQueue,
 } from './trend-queue.js';
+import {
+  createBullCreatorQueue,
+  type CreatorQueue,
+} from './creator-queue.js';
+import {
+  CreatorResolutionError,
+  CreatorResolutionService,
+  RssCreatorIdentityResolver,
+  XCreatorIdentityResolver,
+  BilibiliCreatorIdentityResolver,
+  type CreatorResolutionGateway,
+  type ResolvedCreatorIdentity,
+} from './creator-resolver.js';
+import {
+  MemoryPersonalizationMemory,
+  PrismaPersonalizationMemory,
+  type MemoryPersonalizationFacts,
+  type PersonalizationMemory,
+} from './personalization-memory.js';
 
 const STORE = Symbol('TopicStore');
 const QUEUE = Symbol('TopicQueue');
 const TREND_QUEUE = Symbol('TrendQueue');
+const CREATOR_QUEUE = Symbol('CreatorQueue');
+const CREATOR_RESOLUTION = Symbol('CreatorResolution');
 const AI_CONFIGURED = Symbol('AiConfigured');
 const DISCOVERY_SOURCES = Symbol('DiscoverySources');
 const NOW = Symbol('Now');
 const TREND_INTERVAL_HOURS = Symbol('TrendIntervalHours');
+const HEALTH_CHECKS = Symbol('HealthChecks');
+const PERSONALIZATION_MEMORY = Symbol('PersonalizationMemory');
 
 function errorBody(code: string, message: string) {
   return { code, message, traceId: randomUUID() };
@@ -91,15 +126,24 @@ class ApiController {
     @Inject(STORE) private readonly store: TopicStore,
     @Inject(QUEUE) private readonly queue: TopicQueue,
     @Inject(TREND_QUEUE) private readonly trendQueue: TrendQueue,
+    @Inject(CREATOR_QUEUE) private readonly creatorQueue: CreatorQueue,
+    @Inject(CREATOR_RESOLUTION) private readonly creatorResolution: CreatorResolutionGateway,
     @Inject(AI_CONFIGURED) private readonly aiConfigured: boolean,
     @Inject(DISCOVERY_SOURCES) private readonly discoverySources: DiscoverySourceStatus[],
     @Inject(NOW) private readonly now: () => Date,
     @Inject(TREND_INTERVAL_HOURS) private readonly trendIntervalHours: number,
+    @Inject(HEALTH_CHECKS) private readonly healthChecks: ApiHealthChecks,
+    @Inject(PERSONALIZATION_MEMORY) private readonly personalization: PersonalizationMemory,
   ) {}
 
   @Get('health')
   health() {
     return { status: 'ok', timestamp: new Date().toISOString() };
+  }
+
+  @Get('health/ready')
+  readiness() {
+    return checkApiReadiness(this.healthChecks);
   }
 
   @Get('auth/session')
@@ -176,6 +220,168 @@ class ApiController {
     }
   }
 
+  @Post('topics/:id/pause')
+  @HttpCode(200)
+  async pauseTopic(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+  ) {
+    const topic = await this.store.pauseTopic(authenticatedUser(header), id);
+    if (!topic) throw new NotFoundException(errorBody('TOPIC_NOT_FOUND', '关键词不存在'));
+    return topic;
+  }
+
+  @Post('topics/:id/resume')
+  @HttpCode(202)
+  async resumeTopic(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+  ) {
+    this.assertAiConfigured();
+    const userId = authenticatedUser(header);
+    const resumed = await this.store.resumeTopic(userId, id);
+    if (!resumed) throw new NotFoundException(errorBody('TOPIC_NOT_FOUND', '关键词不存在'));
+    if (resumed.shouldEnqueue) {
+      try {
+        await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
+      } catch (error) {
+        await this.store.compensateTopicRefresh(userId, id);
+        throw error;
+      }
+    }
+    return resumed.topic;
+  }
+
+  @Post('creators')
+  @HttpCode(202)
+  async createCreator(
+    @Headers('x-user-id') header: string | undefined,
+    @Body() body: unknown,
+  ) {
+    this.assertAiConfigured();
+    const userId = authenticatedUser(header);
+    const input = parseOrThrow(creatorInputSchema, body, '博主地址无效');
+    try {
+      if ('url' in input) {
+        const canonicalUrl = canonicalizeUrl(input.url);
+        const url = new URL(canonicalUrl);
+        const [creator] = await this.createAndEnqueueCreators(userId, [{
+          platform: 'rss',
+          accountKey: canonicalUrl,
+          displayName: url.hostname,
+          profileUrl: canonicalUrl,
+          feedUrl: canonicalUrl,
+        }]);
+        return creator;
+      }
+      const identities = await this.creatorResolution.confirm(userId, input.resolutionTokens);
+      return this.createAndEnqueueCreators(userId, identities.map(toCreatorCreateInput));
+    } catch (error) {
+      if (error instanceof CreatorAlreadyExistsError) {
+        throw new ConflictException(errorBody('CREATOR_ALREADY_EXISTS', '该博主已经关注'));
+      }
+      this.throwCreatorResolutionError(error);
+      throw error;
+    }
+  }
+
+  @Post('creators/resolve')
+  async resolveCreators(
+    @Headers('x-user-id') header: string | undefined,
+    @Body() body: unknown,
+  ) {
+    const userId = authenticatedUser(header);
+    const input = parseOrThrow(creatorResolutionInputSchema, body, '博主名字或地址无效');
+    try {
+      return await this.creatorResolution.resolve(userId, input.input);
+    } catch (error) {
+      this.throwCreatorResolutionError(error);
+      throw error;
+    }
+  }
+
+  @Get('creator-platforms')
+  creatorPlatforms(@Headers('x-user-id') header?: string) {
+    authenticatedUser(header);
+    return creatorPlatformStatusSchema.array().parse(this.creatorResolution.capabilities());
+  }
+
+  @Get('creators')
+  listCreators(@Headers('x-user-id') header?: string) {
+    return this.store.listCreators(authenticatedUser(header));
+  }
+
+  @Patch('creators/:id')
+  async updateCreator(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+    @Body() body: unknown,
+  ) {
+    this.assertAiConfigured();
+    const userId = authenticatedUser(header);
+    const input = parseOrThrow(creatorUpdateInputSchema, body, '博主关注设置无效');
+    const updated = await this.store.updateCreator(userId, id, input);
+    if (!updated) throw new NotFoundException(errorBody('CREATOR_NOT_FOUND', '博主关注不存在'));
+    if (!input.paused) {
+      const refresh = await this.store.queueCreatorRefresh(userId, id);
+      if (refresh?.shouldEnqueue) {
+        try {
+          await this.creatorQueue.enqueue({ creatorId: id, userId, trigger: 'manual' });
+        } catch (error) {
+          await this.store.compensateCreatorRefresh(userId, id);
+          throw error;
+        }
+        return refresh.creator;
+      }
+    }
+    return updated;
+  }
+
+  @Delete('creators/:id')
+  @HttpCode(204)
+  async deleteCreator(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+  ) {
+    if (!await this.store.deleteCreator(authenticatedUser(header), id)) {
+      throw new NotFoundException(errorBody('CREATOR_NOT_FOUND', '博主关注不存在'));
+    }
+  }
+
+  @Post('creators/:id/refresh')
+  @HttpCode(202)
+  async refreshCreator(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+  ) {
+    this.assertAiConfigured();
+    const userId = authenticatedUser(header);
+    const refresh = await this.store.queueCreatorRefresh(userId, id);
+    if (!refresh) throw new NotFoundException(errorBody('CREATOR_NOT_FOUND', '博主关注不存在'));
+    if (refresh.creator.pausedAt) {
+      throw new ConflictException(errorBody('CREATOR_PAUSED', '博主关注已暂停'));
+    }
+    if (refresh.shouldEnqueue) {
+      try {
+        await this.creatorQueue.enqueue({ creatorId: id, userId, trigger: 'manual' });
+      } catch (error) {
+        await this.store.compensateCreatorRefresh(userId, id);
+        throw error;
+      }
+    }
+    return refresh.creator;
+  }
+
+  @Get('creators/:id/items')
+  async listCreatorItems(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+  ) {
+    const items = await this.store.listCreatorItems(authenticatedUser(header), id);
+    if (items === null) throw new NotFoundException(errorBody('CREATOR_NOT_FOUND', '博主关注不存在'));
+    return items;
+  }
+
   @Delete('topics/:id')
   @HttpCode(204)
   async deleteTopic(
@@ -198,6 +404,9 @@ class ApiController {
     const refresh = await this.store.queueRefresh(userId, id);
     if (!refresh) {
       throw new NotFoundException(errorBody('NOT_FOUND', '主题不存在'));
+    }
+    if (refresh.topic.pausedAt) {
+      throw new ConflictException(errorBody('TOPIC_PAUSED', '关键词监控已暂停'));
     }
     if (refresh.shouldEnqueue) {
       await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
@@ -267,6 +476,71 @@ class ApiController {
     return this.discoverySources;
   }
 
+  @Get('interests')
+  async getInterests(@Headers('x-user-id') header?: string) {
+    return interestMemorySchema.parse(
+      await this.personalization.inspect(authenticatedUser(header)),
+    );
+  }
+
+  @Put('interests/settings')
+  async updateInterestSettings(
+    @Headers('x-user-id') header: string | undefined,
+    @Body() body: unknown,
+  ) {
+    const userId = authenticatedUser(header);
+    const input = parseOrThrow(
+      interestMemorySettingsInputSchema,
+      body,
+      '兴趣记忆设置无效',
+    );
+    return interestMemorySchema.parse(await this.personalization.control(userId, {
+      type: 'set_enabled', enabled: input.personalizationEnabled,
+    }));
+  }
+
+  @Delete('interests/:tagId')
+  async forgetInterest(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('tagId') tagId: string,
+  ) {
+    const userId = authenticatedUser(header);
+    if (!tagId.trim()) {
+      throw new BadRequestException(errorBody('VALIDATION_ERROR', '兴趣主题无效'));
+    }
+    return interestMemorySchema.parse(await this.personalization.control(userId, {
+      type: 'forget_tag', tagId,
+    }));
+  }
+
+  @Delete('interests')
+  async clearInterestHistory(@Headers('x-user-id') header?: string) {
+    const userId = authenticatedUser(header);
+    return interestMemorySchema.parse(await this.personalization.control(userId, {
+      type: 'clear_history',
+    }));
+  }
+
+  @Put('feedback/:contentKey')
+  async setFeedback(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('contentKey') contentKeyParam: string,
+    @Body() body: unknown,
+  ) {
+    const userId = authenticatedUser(header);
+    const contentKey = canonicalizeUrl(parseOrThrow(
+      httpUrlSchema,
+      contentKeyParam,
+      '内容标识无效',
+    ));
+    const input = parseOrThrow(feedbackInputSchema, body, '反馈内容无效');
+    const feedback = await this.store.setFeedback(userId, contentKey, input.value);
+    if (!feedback) {
+      throw new NotFoundException(errorBody('NOT_FOUND', '发现内容不存在'));
+    }
+    return feedback;
+  }
+
   @Get('items/:id')
   async getItem(
     @Headers('x-user-id') header: string | undefined,
@@ -286,6 +560,45 @@ class ApiController {
       );
     }
   }
+
+  private async createAndEnqueueCreators(
+    userId: string,
+    inputs: CreatorCreateInput[],
+  ) {
+    const creators = await this.store.createCreators(userId, inputs);
+    const queued = await Promise.allSettled(creators.map((creator) => this.creatorQueue.enqueue({
+      creatorId: creator.id,
+      userId,
+      trigger: 'manual',
+    })));
+    const failures = queued
+      .map((result, index) => ({ result, creator: creators[index]! }))
+      .filter(({ result }) => result.status === 'rejected');
+    if (failures.length > 0) {
+      await Promise.all(failures.map(({ creator }) => (
+        this.store.compensateCreatorRefresh(userId, creator.id)
+      )));
+      throw (failures[0]!.result as PromiseRejectedResult).reason;
+    }
+    return creators;
+  }
+
+  private throwCreatorResolutionError(error: unknown): void {
+    if (!(error instanceof CreatorResolutionError)) return;
+    const body = errorBody(error.code, error.message);
+    if (error.httpStatus === 503) throw new ServiceUnavailableException(body);
+    throw new BadRequestException(body);
+  }
+}
+
+function toCreatorCreateInput(identity: ResolvedCreatorIdentity): CreatorCreateInput {
+  return {
+    platform: identity.platform,
+    accountKey: identity.accountKey,
+    displayName: identity.displayName,
+    profileUrl: identity.profileUrl,
+    feedUrl: identity.feedUrl,
+  };
 }
 
 @Injectable()
@@ -294,11 +607,13 @@ class ResourceCloser implements OnModuleDestroy {
     @Inject(STORE) private readonly store: TopicStore,
     @Inject(QUEUE) private readonly queue: TopicQueue,
     @Inject(TREND_QUEUE) private readonly trendQueue: TrendQueue,
+    @Inject(CREATOR_QUEUE) private readonly creatorQueue: CreatorQueue,
   ) {}
 
   async onModuleDestroy() {
     await this.queue.close();
     await this.trendQueue.close();
+    await this.creatorQueue.close();
     await this.store.close();
   }
 }
@@ -311,10 +626,14 @@ class AppModule implements NestModule {
     store: TopicStore,
     queue: TopicQueue,
     trendQueue: TrendQueue,
+    creatorQueue: CreatorQueue,
+    creatorResolution: CreatorResolutionGateway,
     aiConfigured: boolean,
     discoverySources: DiscoverySourceStatus[],
     now: () => Date,
     trendIntervalHours: number,
+    healthChecks: ApiHealthChecks,
+    personalization: PersonalizationMemory,
   ): DynamicModule {
     return {
       module: AppModule,
@@ -323,10 +642,14 @@ class AppModule implements NestModule {
         { provide: STORE, useValue: store },
         { provide: QUEUE, useValue: queue },
         { provide: TREND_QUEUE, useValue: trendQueue },
+        { provide: CREATOR_QUEUE, useValue: creatorQueue },
+        { provide: CREATOR_RESOLUTION, useValue: creatorResolution },
         { provide: AI_CONFIGURED, useValue: aiConfigured },
         { provide: DISCOVERY_SOURCES, useValue: discoverySources },
         { provide: NOW, useValue: now },
         { provide: TREND_INTERVAL_HOURS, useValue: trendIntervalHours },
+        { provide: HEALTH_CHECKS, useValue: healthChecks },
+        { provide: PERSONALIZATION_MEMORY, useValue: personalization },
         ResourceCloser,
       ],
     };
@@ -337,11 +660,15 @@ export interface CreateApiAppOptions {
   store?: TopicStore;
   queue?: TopicQueue;
   trendQueue?: TrendQueue;
+  creatorQueue?: CreatorQueue;
+  creatorResolution?: CreatorResolutionGateway;
   aiConfigured?: boolean;
   discoverySources?: DiscoverySourceStatus[];
   now?: () => Date;
   trendIntervalHours?: number;
   webOrigin?: string;
+  healthChecks?: Partial<Omit<ApiHealthChecks, 'aiConfigured'>>;
+  personalizationMemory?: PersonalizationMemory;
 }
 
 export function configuredDiscoverySources(
@@ -368,6 +695,7 @@ export function configuredDiscoverySources(
       status: status(config.DISCOVERY_RSS_FEED_URLS.length > 0),
     },
     { id: 'hacker-news', label: 'Hacker News', category: 'community', status: 'enabled' },
+    { id: 'stack-overflow', label: 'Stack Overflow', category: 'community', status: 'enabled' },
     { id: 'arxiv', label: 'arXiv', category: 'paper', status: 'enabled' },
     { id: 'github', label: 'GitHub', category: 'code', status: 'enabled' },
     {
@@ -403,7 +731,7 @@ export function configuredDiscoverySources(
     { id: 'bluesky', label: 'Bluesky', category: 'social', status: 'enabled' },
     { id: 'bilibili', label: 'Bilibili', category: 'video', status: 'enabled' },
     {
-      id: 'x-trends', label: 'X Trends', category: 'social',
+      id: 'twitter-trends', label: 'X Trends', category: 'social',
       status: status(Boolean(config.TWITTERAPI_IO_API_KEY)),
     },
     {
@@ -420,7 +748,7 @@ export function configuredDiscoverySources(
     },
     { id: 'bilibili-trends', label: 'Bilibili Popular', category: 'video', status: 'enabled' },
     {
-      id: 'google-trends', label: 'Google Trends RSS', category: 'feed',
+      id: 'google-trends-rss', label: 'Google Trends RSS', category: 'feed',
       status: status(config.TREND_GOOGLE_RSS_URLS.length > 0),
     },
   ]);
@@ -430,10 +758,39 @@ export async function createApiApp(
   options: CreateApiAppOptions = {},
 ): Promise<INestApplication> {
   const config = parseConfig(process.env);
-  const store = options.store ?? new PrismaTopicStore(new PrismaClient());
+  const memoryFacts: MemoryPersonalizationFacts = {
+    events: [], tags: [], creatorContent: [], settings: {}, forgottenTagIds: {},
+  };
+  let personalization = options.personalizationMemory;
+  const store = options.store ?? (() => {
+    const prisma = new PrismaClient();
+    personalization ??= new PrismaPersonalizationMemory(prisma);
+    return new PrismaTopicStore(prisma, personalization);
+  })();
+  personalization ??= new MemoryPersonalizationMemory(() => memoryFacts, options.now);
   const queue = options.queue ?? createBullTopicQueue(config.REDIS_URL);
   const trendQueue = options.trendQueue ?? createBullTrendQueue(config.REDIS_URL);
+  const creatorQueue = options.creatorQueue ?? createBullCreatorQueue(config.REDIS_URL);
+  const creatorResolution = options.creatorResolution ?? new CreatorResolutionService(
+    [
+      new RssCreatorIdentityResolver(),
+      new XCreatorIdentityResolver(config.TWITTERAPI_IO_API_KEY),
+      new BilibiliCreatorIdentityResolver(),
+    ],
+    config.SESSION_SECRET ?? randomBytes(32).toString('base64url'),
+    options.now ?? (() => new Date()),
+  );
   const aiConfigured = options.aiConfigured ?? Boolean(config.AI_API_KEY);
+  const databaseProbe = options.healthChecks?.database ?? healthProbe(store);
+  const redisProbe = options.healthChecks?.redis
+    ?? healthProbe(queue)
+    ?? healthProbe(trendQueue)
+    ?? healthProbe(creatorQueue);
+  const healthChecks: ApiHealthChecks = {
+    ...(databaseProbe ? { database: databaseProbe } : {}),
+    ...(redisProbe ? { redis: redisProbe } : {}),
+    aiConfigured,
+  };
   const discoverySources = discoverySourceStatusSchema.array().parse(
     options.discoverySources ?? configuredDiscoverySources(config),
   );
@@ -442,10 +799,14 @@ export async function createApiApp(
       store,
       queue,
       trendQueue,
+      creatorQueue,
+      creatorResolution,
       aiConfigured,
       discoverySources,
       options.now ?? (() => new Date()),
       options.trendIntervalHours ?? config.TREND_INTERVAL_HOURS,
+      healthChecks,
+      personalization,
     ),
     { logger: false },
   );
@@ -455,6 +816,13 @@ export async function createApiApp(
   });
   await app.init();
   return app;
+}
+
+function healthProbe(value: unknown): HealthProbe | undefined {
+  if (!value || typeof value !== 'object' || !('healthCheck' in value)) return undefined;
+  const check = (value as { healthCheck?: unknown }).healthCheck;
+  if (typeof check !== 'function') return undefined;
+  return { check: () => Promise.resolve(check.call(value)) };
 }
 
 export { MemoryTopicStore };

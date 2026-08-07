@@ -1,10 +1,11 @@
 import type { SourceType } from '@lettermate/contracts';
-import type { SourceCandidate, ValidatedSourceCandidate } from '@lettermate/domain';
+import type { KeywordProfile, SourceCandidate, ValidatedSourceCandidate } from '@lettermate/domain';
 import type { KeywordPolicy } from '../keyword-policy.js';
 
 export interface SourceQueryPlan {
   keyword: string;
   matchPolicy: KeywordPolicy;
+  keywordProfile?: KeywordProfile;
   expandedTerms: string[];
   queries: string[];
   sourceTypes: SourceType[];
@@ -26,6 +27,11 @@ export interface SourceConnector {
 export interface ConnectorResult {
   candidates: SourceCandidate[];
   requestCount?: number;
+  identity?: {
+    displayName: string;
+    profileUrl: string;
+    handle: string | null;
+  };
 }
 
 export interface ConnectorFailure {

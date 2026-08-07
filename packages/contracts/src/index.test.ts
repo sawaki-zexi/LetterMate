@@ -1,14 +1,28 @@
 import { describe, expect, it } from 'vitest';
 import {
+  creatorInputSchema,
+  creatorIdentityCandidateSchema,
+  creatorPlatformStatusSchema,
+  creatorResolutionInputSchema,
+  creatorResolutionResultSchema,
+  creatorJobDataSchema,
+  creatorSchema,
   discoveryItemSchema,
   discoveryJobDataSchema,
   discoveryQueueName,
   discoveryResultSchema,
   discoverySourceStatusSchema,
+  contentFeedbackSchema,
+  feedbackInputSchema,
+  interestEventSchema,
+  interestTagExtractionSchema,
+  interestMemorySchema,
+  interestMemorySettingsInputSchema,
   feedItemSchema,
   feedOriginSchema,
   feedQuerySchema,
   feedRangeSchema,
+  readinessSchema,
   runSummarySchema,
   sourceTypeSchema,
   topicFeedItemSchema,
@@ -36,9 +50,60 @@ const feedItemFixture = {
   authorHandle: null,
   externalId: '123',
   provenanceKind: 'fetched_page' as const,
+  contentKey: 'https://example.com/project',
+  feedback: null,
 };
 
+const topicOriginFixture = {
+  origin: 'topic' as const,
+  topicId: 'topic-1',
+  topicKeyword: 'AI agents',
+  topicKeywordActive: true,
+};
+
+const trendOriginFixture = { origin: 'trend' as const };
+
 describe('AI discovery contracts', () => {
+  it('accepts only versioned, exact interest events', () => {
+    const event = {
+      id: 'event-1',
+      userId: 'user-1',
+      eventType: 'topic_state' as const,
+      sourceRef: 'topic-1',
+      payload: {
+        schemaVersion: 1 as const,
+        state: 'active' as const,
+        topicId: 'topic-1',
+        keyword: 'GPT-5.7',
+        normalizedKeyword: 'gpt-5.7',
+      },
+      occurredAt: '2026-08-08T08:00:00.000Z',
+      recordedAt: '2026-08-08T08:00:00.000Z',
+      supersededAt: null,
+    };
+    expect(interestEventSchema.parse(event)).toEqual(event);
+    expect(() => interestEventSchema.parse({
+      ...event, payload: { ...event.payload, schemaVersion: 2 },
+    })).toThrow();
+    expect(() => interestEventSchema.parse({
+      ...event, payload: { ...event.payload, inferredPreference: true },
+    })).toThrow();
+  });
+
+  it('accepts one to five controlled interest tags only', () => {
+    expect(interestTagExtractionSchema.parse({
+      schemaVersion: 1,
+      tags: [{
+        slug: 'gpt-5-7', displayName: 'GPT-5.7', kind: 'entity', confidence: 0.95,
+      }],
+    }).tags).toHaveLength(1);
+    expect(() => interestTagExtractionSchema.parse({ schemaVersion: 1, tags: [] })).toThrow();
+    expect(() => interestTagExtractionSchema.parse({
+      schemaVersion: 1,
+      tags: [{ slug: 'Broad AI', displayName: 'AI', kind: 'broad', confidence: 2 }],
+    })).toThrow();
+  });
+
   it('shares one stable discovery queue name', () => {
     expect(discoveryQueueName).toBe('topic-discovery');
   });
@@ -49,38 +114,63 @@ describe('AI discovery contracts', () => {
     expect(() => topicInputSchema.parse({ keyword: 'x'.repeat(101) })).toThrow();
   });
 
-  it('accepts a complete topic keyword update and trims its values', () => {
-    expect(topicUpdateInputSchema.parse({
-      keyword: '  gpt-5.7  ',
-      expandedTerms: ['  gpt 5.7  ', '  gpt5.7  '],
-    })).toEqual({
-      keyword: 'gpt-5.7',
-      expandedTerms: ['gpt 5.7', 'gpt5.7'],
+  it('accepts only a trimmed keyword for updates', () => {
+    expect(topicUpdateInputSchema.parse({ keyword: '  gpt-5.7  ' })).toEqual({ keyword: 'gpt-5.7' });
+    expect(() => topicUpdateInputSchema.parse({ keyword: '' })).toThrow();
+  });
+
+  it('accepts a public RSS creator subscription and safe job shape', () => {
+    expect(creatorInputSchema.parse({ url: 'https://example.com/feed.xml' })).toEqual({
+      url: 'https://example.com/feed.xml',
     });
-  });
-
-  it('accepts the complete set of terms and search queries generated for a topic', () => {
-    const expandedTerms = Array.from({ length: 32 }, (_, index) => `term-${index}`);
-
-    expect(topicUpdateInputSchema.parse({
-      keyword: 'gpt-5.7',
-      expandedTerms,
-    })).toEqual({ keyword: 'gpt-5.7', expandedTerms });
-  });
-
-  it('limits topic keyword updates to thirty-two nonempty terms of at most one hundred characters', () => {
-    expect(() => topicUpdateInputSchema.parse({
-      keyword: 'gpt-5.7',
-      expandedTerms: Array.from({ length: 33 }, (_, index) => `term-${index}`),
-    })).toThrow();
-    expect(() => topicUpdateInputSchema.parse({
-      keyword: 'gpt-5.7',
-      expandedTerms: ['   '],
-    })).toThrow();
-    expect(() => topicUpdateInputSchema.parse({
-      keyword: 'gpt-5.7',
-      expandedTerms: ['x'.repeat(101)],
-    })).toThrow();
+    expect(() => creatorInputSchema.parse({ url: 'file:///private/feed.xml' })).toThrow();
+    expect(creatorResolutionInputSchema.parse({ input: '  Example Author  ' })).toEqual({
+      input: 'Example Author',
+    });
+    expect(creatorInputSchema.parse({ resolutionTokens: ['x'.repeat(32)] })).toEqual({
+      resolutionTokens: ['x'.repeat(32)],
+    });
+    const candidate = {
+      resolutionToken: 'x'.repeat(32),
+      platform: 'rss' as const,
+      displayName: 'Example Author',
+      handle: null,
+      avatarUrl: null,
+      bio: 'Engineering notes',
+      verified: null,
+      profileUrl: 'https://example.com/',
+      feedUrl: 'https://example.com/feed.xml',
+    };
+    expect(creatorIdentityCandidateSchema.parse(candidate)).toEqual(candidate);
+    expect(creatorResolutionResultSchema.parse({ candidates: [candidate] })).toEqual({
+      candidates: [candidate],
+    });
+    expect(creatorPlatformStatusSchema.parse({
+      id: 'rss', label: 'RSS/Atom', status: 'enabled',
+    })).toEqual({ id: 'rss', label: 'RSS/Atom', status: 'enabled' });
+    expect(creatorIdentityCandidateSchema.parse({
+      ...candidate,
+      platform: 'x',
+      handle: '@example',
+      profileUrl: 'https://x.com/example',
+      feedUrl: null,
+    })).toMatchObject({ platform: 'x', handle: '@example', feedUrl: null });
+    expect(creatorIdentityCandidateSchema.parse({
+      ...candidate,
+      platform: 'bilibili',
+      handle: 'UID 946974',
+      profileUrl: 'https://space.bilibili.com/946974',
+      feedUrl: null,
+    })).toMatchObject({ platform: 'bilibili', handle: 'UID 946974', feedUrl: null });
+    expect(creatorJobDataSchema.parse({
+      creatorId: 'creator-1', userId: 'user-1', trigger: 'scheduled',
+    })).toEqual({ creatorId: 'creator-1', userId: 'user-1', trigger: 'scheduled' });
+    expect(creatorSchema.parse({
+      id: 'creator-1', userId: 'user-1', platform: 'rss', displayName: 'Example',
+      profileUrl: 'https://example.com/feed.xml', feedUrl: 'https://example.com/feed.xml',
+      createdAt: '2026-08-06T08:00:00.000Z', pausedAt: null, lastRunAt: null,
+      nextRunAt: null, runStatus: 'queued', lastError: null, lastRun: null,
+    })).toMatchObject({ id: 'creator-1', platform: 'rss' });
   });
 
   it('rejects expanded terms duplicated after Unicode normalization', () => {
@@ -157,7 +247,7 @@ describe('AI discovery contracts', () => {
       'paper',
     ]);
     expect(feedRangeSchema.options).toEqual(['1d', '3d', '7d', '30d', '90d', 'all']);
-    expect(feedOriginSchema.options).toEqual(['all', 'topic', 'trend']);
+    expect(feedOriginSchema.options).toEqual(['all', 'topic', 'trend', 'creator']);
     expect(() => feedRangeSchema.parse('archive')).toThrow();
     expect(() => feedOriginSchema.parse('keyword')).toThrow();
   });
@@ -174,6 +264,9 @@ describe('AI discovery contracts', () => {
     expect(() => feedQuerySchema.parse({ q: 'x'.repeat(101) })).toThrow();
     expect(() => feedQuerySchema.parse({
       topicId: 'topic-1', origin: 'trend',
+    })).toThrow();
+    expect(() => feedQuerySchema.parse({
+      topicId: 'topic-1', origin: 'creator',
     })).toThrow();
   });
 
@@ -235,6 +328,7 @@ describe('AI discovery contracts', () => {
       keyword: 'AI agents',
       expandedTerms: ['agent framework'],
       createdAt: '2026-07-27T00:00:00.000Z',
+      pausedAt: null,
       lastRunAt: null,
       nextRunAt: '2026-07-28T00:00:00.000Z',
       scheduleIntervalHours: 12,
@@ -244,6 +338,7 @@ describe('AI discovery contracts', () => {
     });
 
     expect(topic).toMatchObject({
+      pausedAt: null,
       nextRunAt: '2026-07-28T00:00:00.000Z',
       scheduleIntervalHours: 12,
     });
@@ -321,8 +416,11 @@ describe('AI discovery contracts', () => {
       topicId: 'topic-1',
       topicKeyword: 'AI agents',
       topicKeywordActive: true,
+      origins: [topicOriginFixture],
     };
-    const trendItem = { ...feedItemFixture, origin: 'trend' as const, topicId: null };
+    const trendItem = {
+      ...feedItemFixture, origin: 'trend' as const, topicId: null, origins: [trendOriginFixture],
+    };
 
     expect(topicFeedItemSchema.parse(topicItem).origin).toBe('topic');
     expect(trendFeedItemSchema.parse(trendItem).origin).toBe('trend');
@@ -348,12 +446,14 @@ describe('AI discovery contracts', () => {
         topicId: 'topic-1',
         topicKeyword: 'AI agents',
         topicKeywordActive: true,
+        origins: [topicOriginFixture],
       };
       const trendItem = {
         ...feedItemFixture,
         sourceUrls: [sourceUrl],
         origin: 'trend' as const,
         topicId: null,
+        origins: [trendOriginFixture],
       };
 
       expect(topicFeedItemSchema.parse(topicItem).sourceUrls).toEqual([sourceUrl]);
@@ -376,12 +476,14 @@ describe('AI discovery contracts', () => {
       topicId: 'topic-1',
       topicKeyword: 'AI agents',
       topicKeywordActive: true,
+      origins: [topicOriginFixture],
     };
     const trendItem = {
       ...feedItemFixture,
       sourceUrls: [sourceUrl],
       origin: 'trend' as const,
       topicId: null,
+      origins: [trendOriginFixture],
     };
 
     expect(() => discoveryResultSchema.parse({ citations: [sourceUrl], items: [] })).toThrow();
@@ -398,8 +500,11 @@ describe('AI discovery contracts', () => {
       topicId: 'topic-1',
       topicKeyword: 'AI agents',
       topicKeywordActive: true,
+      origins: [topicOriginFixture],
     };
-    const trendItem = { ...feedItemFixture, origin: 'trend' as const, topicId: null };
+    const trendItem = {
+      ...feedItemFixture, origin: 'trend' as const, topicId: null, origins: [trendOriginFixture],
+    };
 
     expect(() => trendJobDataSchema.parse({
       userId: 'user-a',
@@ -467,5 +572,71 @@ describe('AI discovery contracts', () => {
         status: 'enabled',
       }),
     ).toThrow();
+  });
+
+  it('accepts only explicit persisted feedback states', () => {
+    expect(feedbackInputSchema.parse({ value: 'interested' })).toEqual({ value: 'interested' });
+    expect(feedbackInputSchema.parse({ value: 'less' })).toEqual({ value: 'less' });
+    expect(feedbackInputSchema.parse({ value: null })).toEqual({ value: null });
+    expect(() => feedbackInputSchema.parse({ value: 'like' })).toThrow();
+    expect(() => feedbackInputSchema.parse({ value: null, score: 1 })).toThrow();
+    expect(contentFeedbackSchema.parse({
+      contentKey: 'https://example.com/article', value: 'interested',
+    })).toEqual({ contentKey: 'https://example.com/article', value: 'interested' });
+  });
+
+  it('exposes recommendation context and interest memory without internal scores', () => {
+    const recommendation = {
+      lane: 'interest' as const,
+      reason: 'related_interest' as const,
+      isExploration: false,
+    };
+    const memory = {
+      personalizationEnabled: true,
+      resetAt: null,
+      recent: [{
+        id: 'opaque-theme-1',
+        name: 'AI Agents',
+        kind: 'topic' as const,
+        sources: ['keyword', 'feedback'] as const,
+        updatedAt: '2026-08-08T08:00:00.000Z',
+      }],
+      longTerm: [],
+      reduced: [],
+    };
+    expect(feedItemSchema.parse({
+      ...feedItemFixture,
+      origin: 'trend', topicId: null, origins: [trendOriginFixture], recommendation,
+    }).recommendation).toEqual(recommendation);
+    expect(interestMemorySchema.parse(memory)).toEqual(memory);
+    expect(interestMemorySettingsInputSchema.parse({ personalizationEnabled: false }))
+      .toEqual({ personalizationEnabled: false });
+    expect(() => interestMemorySchema.parse({ ...memory, internalScore: 1 })).toThrow();
+    expect(() => interestMemorySchema.parse({
+      ...memory,
+      recent: [{ ...memory.recent[0], weight: 0.9 }],
+    })).toThrow();
+    expect(() => feedItemSchema.parse({
+      ...feedItemFixture,
+      origin: 'trend', topicId: null, origins: [trendOriginFixture],
+      recommendation: { ...recommendation, score: 9 },
+    })).toThrow();
+  });
+
+  it('accepts only safe readiness dependency states', () => {
+    expect(readinessSchema.parse({
+      status: 'degraded',
+      timestamp: '2026-08-05T00:00:00.000Z',
+      dependencies: {
+        database: { status: 'ok' },
+        redis: { status: 'error', code: 'REDIS_UNAVAILABLE' },
+        ai: { status: 'not_configured', code: 'AI_NOT_CONFIGURED' },
+      },
+    }).status).toBe('degraded');
+    expect(() => readinessSchema.parse({
+      status: 'ok',
+      timestamp: '2026-08-05T00:00:00.000Z',
+      dependencies: { redis: { status: 'error', message: 'secret' } },
+    })).toThrow();
   });
 });

@@ -30,6 +30,38 @@ const candidate = (
 });
 
 describe('topic store multi-source mappings', () => {
+  it('resets the persisted keyword profile when the keyword changes', async () => {
+    const updateMany = vi.fn().mockResolvedValue({ count: 1 });
+    const prisma = {
+      topic: { updateMany },
+      interestEvent: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({}),
+      },
+      $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
+    } as unknown as PrismaClient;
+    const store = new PrismaTopicStore(prisma);
+    vi.spyOn(store, 'queueRefresh').mockResolvedValue({
+      topic: {} as never,
+      shouldEnqueue: true,
+    });
+
+    await store.updateTopic('user-1', 'topic-1', {
+      keyword: 'GPT-5.8',
+      normalizedKeyword: 'gpt-5.8',
+    });
+
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: 'topic-1', userId: 'user-1', deletedAt: null },
+      data: expect.objectContaining({
+        keyword: 'GPT-5.8',
+        expandedTerms: [],
+        keywordProfile: 'unknown',
+        variantsInitialized: false,
+      }),
+    });
+  });
+
   it('updates only an owned topic, invalidates prior variants, and permits a deleted keyword to be reused', async () => {
     const store = new MemoryTopicStore();
     const original = await store.createTopic('user-1', 'GPT-5.7', 'gpt-5.7');
@@ -44,7 +76,7 @@ describe('topic store multi-source mappings', () => {
     });
     expect(updated).toMatchObject({
       shouldEnqueue: false,
-      topic: { id: original.id, keyword: 'GPT-5.8', expandedTerms: ['gpt 5.8'] },
+      topic: { id: original.id, keyword: 'GPT-5.8', expandedTerms: [] },
     });
 
     expect(await store.deleteTopic('user-2', original.id)).toBe(false);
@@ -165,6 +197,8 @@ describe('topic store multi-source mappings', () => {
         }]),
       },
       radarItem: { findMany: vi.fn().mockResolvedValue([]) },
+      creatorItem: { findMany: vi.fn().mockResolvedValue([]) },
+      contentFeedback: { findMany: vi.fn().mockResolvedValue([]) },
     } as unknown as PrismaClient;
 
     const items = await new PrismaTopicStore(prisma).listFeed('user-1', {
@@ -184,6 +218,85 @@ describe('topic store multi-source mappings', () => {
     });
   });
 
+  it('upserts and clears Prisma feedback only after an ownership proof', async () => {
+    const upsert = vi.fn().mockResolvedValue({});
+    const deleteMany = vi.fn().mockResolvedValue({ count: 1 });
+    const findUnique = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ value: 'interested' });
+    const prisma = {
+      discoveryItem: { findFirst: vi.fn().mockResolvedValue({ id: 'item-1' }) },
+      radarItem: { findFirst: vi.fn().mockResolvedValue(null) },
+      creatorItem: { findFirst: vi.fn().mockResolvedValue(null) },
+      contentFeedback: { upsert, deleteMany, findUnique },
+      interestEvent: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockResolvedValue({}),
+      },
+      $transaction: vi.fn(async (callback: (client: unknown) => unknown) => callback(prisma)),
+    } as unknown as PrismaClient;
+    const store = new PrismaTopicStore(prisma);
+    const contentKey = 'https://example.com/article';
+
+    await expect(store.setFeedback('user-1', contentKey, 'interested')).resolves.toEqual({
+      contentKey,
+      value: 'interested',
+    });
+    expect(upsert).toHaveBeenCalledWith({
+      where: { userId_contentKey: { userId: 'user-1', contentKey } },
+      create: { userId: 'user-1', contentKey, value: 'interested' },
+      update: { value: 'interested' },
+    });
+
+    await expect(store.setFeedback('user-1', contentKey, null)).resolves.toEqual({
+      contentKey,
+      value: null,
+    });
+    expect(deleteMany).toHaveBeenCalledWith({ where: { userId: 'user-1', contentKey } });
+  });
+
+  it('records idempotent Topic and Creator lifecycle events with exact identifiers', async () => {
+    const store = new MemoryTopicStore(() => new Date('2026-08-08T08:00:00.000Z'));
+    const topic = await store.createTopic('user-1', 'GPT-5.7', 'gpt-5.7');
+    await store.pauseTopic('user-1', topic.id);
+    await store.pauseTopic('user-1', topic.id);
+    await store.resumeTopic('user-1', topic.id);
+    await store.resumeTopic('user-1', topic.id);
+    await store.updateTopic('user-1', topic.id, {
+      keyword: 'GPT-5.8', normalizedKeyword: 'gpt-5.8',
+    });
+    await store.deleteTopic('user-1', topic.id);
+
+    const creator = await store.createCreator('user-1', {
+      platform: 'x', accountKey: 'openai', displayName: 'OpenAI',
+      profileUrl: 'https://x.com/openai', feedUrl: null,
+    });
+    await store.updateCreator('user-1', creator.id, { paused: true });
+    await store.updateCreator('user-1', creator.id, { paused: true });
+    await store.updateCreator('user-1', creator.id, { paused: false });
+    await store.deleteCreator('user-1', creator.id);
+
+    const events = await store.listInterestEvents('user-1');
+    const topicEvents = events.filter((event) => event.eventType === 'topic_state');
+    expect(topicEvents.map((event) => event.payload.state)).toEqual([
+      'active', 'paused', 'active', 'active', 'deleted',
+    ]);
+    expect(topicEvents[3]).toMatchObject({
+      sourceRef: topic.id,
+      payload: { topicId: topic.id, keyword: 'GPT-5.8', normalizedKeyword: 'gpt-5.8' },
+    });
+    const creatorEvents = events.filter((event) => event.eventType === 'creator_state');
+    expect(creatorEvents.map((event) => event.payload.state)).toEqual([
+      'active', 'paused', 'active', 'cancelled',
+    ]);
+    expect(creatorEvents.every((event) => (
+      event.sourceRef === creator.id
+      && event.payload.creatorId === creator.id
+      && event.payload.accountKey === 'openai'
+    ))).toBe(true);
+    expect(await store.listInterestEvents('user-2')).toEqual([]);
+  });
+
   it('keeps the memory store on the same public contract', async () => {
     const store = new MemoryTopicStore();
     const topic = store.seedTopic('user-1', 'Agents');
@@ -198,6 +311,51 @@ describe('topic store multi-source mappings', () => {
       externalId: null,
       provenanceKind: 'ai_citation',
     });
+  });
+
+  it('merges only owned creator items into the unified Feed', async () => {
+    const store = new MemoryTopicStore(() => new Date('2026-08-06T08:00:00.000Z'));
+    const creator = await store.createCreator('user-1', {
+      platform: 'rss',
+      accountKey: 'https://example.com/feed.xml',
+      displayName: 'Example Author',
+      profileUrl: 'https://example.com/feed.xml',
+      feedUrl: 'https://example.com/feed.xml',
+    });
+    const item = store.seedCreatorItem('user-1', creator.id, 'quality');
+
+    expect(await store.listFeed('user-1', { origin: 'creator', since: null })).toEqual([
+      expect.objectContaining({
+        id: item.id,
+        origin: 'creator',
+        creatorId: creator.id,
+        creatorName: 'Example Author',
+        feedEligible: true,
+      }),
+    ]);
+    expect(await store.listFeed('user-2', { origin: 'all', since: null })).toEqual([]);
+    expect(await store.findItem('user-2', item.id)).toBeNull();
+  });
+
+  it('does not partially create a batch when one creator is already active', async () => {
+    const store = new MemoryTopicStore();
+    const existing = {
+      platform: 'rss' as const,
+      accountKey: 'https://example.com/existing.xml',
+      displayName: 'Existing',
+      profileUrl: 'https://example.com/',
+      feedUrl: 'https://example.com/existing.xml',
+    };
+    await store.createCreator('user-1', existing);
+
+    await expect(store.createCreators('user-1', [{
+      ...existing,
+      accountKey: 'https://example.com/new.xml',
+      displayName: 'New',
+      feedUrl: 'https://example.com/new.xml',
+    }, existing])).rejects.toThrow('Creator already exists');
+
+    expect(await store.listCreators('user-1')).toHaveLength(1);
   });
 
   it('tracks queued, running, succeeded, and failed memory run summaries with actual inserts', async () => {
@@ -270,6 +428,149 @@ describe('topic store multi-source mappings', () => {
     ]));
     expect(await store.listFeed('user-1', { origin: 'topic', since: null })).toHaveLength(1);
     expect(await store.listFeed('user-1', { origin: 'trend', since: null })).toHaveLength(2);
+  });
+
+  it('merges one original across Topic, Trend, and Creator while retaining every origin', async () => {
+    const store = new MemoryTopicStore(() => new Date('2026-08-08T08:00:00.000Z'));
+    const topic = store.seedTopic('user-1', 'Project release');
+    const creator = await store.createCreator('user-1', {
+      platform: 'rss',
+      accountKey: 'https://example.com/feed.xml',
+      displayName: 'Project Maintainer',
+      profileUrl: 'https://example.com/',
+      feedUrl: 'https://example.com/feed.xml',
+    });
+    await store.completeFakeDiscovery('user-1', topic.id, {
+      expandedTerms: [],
+      items: [candidate('Project release', 'Summary', 'Reason', 'shared-topic', {
+        sourceUrls: ['https://twitter.com/project/status/42?utm_source=topic'],
+      })],
+    });
+    await store.completeFakeTrendDiscovery('user-1', 4, [
+      candidate('Project release', 'Summary', 'Reason', 'shared-trend', {
+        sourceUrls: ['https://mobile.twitter.com/project/status/42'],
+      }),
+    ]);
+    store.seedCreatorItem('user-1', creator.id, 'quality', {
+      sourceUrl: 'https://x.com/project/status/42',
+    });
+
+    const feed = await store.listFeed('user-1', { origin: 'all', since: null });
+
+    expect(feed).toHaveLength(1);
+    expect(feed[0]).toMatchObject({ origin: 'topic', topicKeyword: 'Project release' });
+    expect(feed[0]?.origins).toEqual(expect.arrayContaining([
+      expect.objectContaining({ origin: 'topic', topicId: topic.id }),
+      { origin: 'trend' },
+      expect.objectContaining({ origin: 'creator', creatorId: creator.id }),
+    ]));
+    expect(feed[0]?.origins).toHaveLength(3);
+    expect(await store.listFeed('user-1', { origin: 'creator', since: null })).toHaveLength(1);
+  });
+
+  it('persists one idempotent feedback state for merged content and isolates users', async () => {
+    const store = new MemoryTopicStore(() => new Date('2026-08-08T08:00:00.000Z'));
+    const topic = store.seedTopic('user-1', 'Project release');
+    await store.completeFakeDiscovery('user-1', topic.id, {
+      expandedTerms: [],
+      items: [candidate('Project release', 'Summary', 'Reason', 'topic', {
+        sourceUrls: ['https://twitter.com/project/status/42?utm_source=topic'],
+      })],
+    });
+    store.seedRadarItem('user-1', 'quality', {
+      sourceUrl: 'https://x.com/project/status/42',
+    });
+    const [merged] = await store.listFeed('user-1', { origin: 'all', since: null });
+    expect(merged?.feedback).toBeNull();
+
+    await expect(store.setFeedback('user-1', merged!.contentKey, 'interested')).resolves.toEqual({
+      contentKey: merged!.contentKey,
+      value: 'interested',
+    });
+    await expect(store.setFeedback('user-1', merged!.contentKey, 'interested')).resolves.toEqual({
+      contentKey: merged!.contentKey,
+      value: 'interested',
+    });
+    expect((await store.listFeed('user-1', { origin: 'all', since: null }))[0]?.feedback)
+      .toBe('interested');
+
+    await store.setFeedback('user-1', merged!.contentKey, 'less');
+    expect((await store.listFeed('user-1', { origin: 'trend', since: null }))[0]?.feedback)
+      .toBe('less');
+    await store.setFeedback('user-1', merged!.contentKey, null);
+    expect((await store.listFeed('user-1', { origin: 'all', since: null }))[0]?.feedback)
+      .toBeNull();
+    await store.setFeedback('user-1', merged!.contentKey, null);
+    const feedbackEvents = (await store.listInterestEvents('user-1'))
+      .filter((event) => event.eventType === 'feedback_state');
+    expect(feedbackEvents.map((event) => event.payload.state)).toEqual([
+      'interested', 'less', null,
+    ]);
+    expect(feedbackEvents.slice(0, -1).every((event) => event.supersededAt !== null)).toBe(true);
+    expect(feedbackEvents.at(-1)?.supersededAt).toBeNull();
+    await expect(store.setFeedback('user-2', merged!.contentKey, 'interested')).resolves.toBeNull();
+    await expect(store.setFeedback('user-1', 'https://example.com/unknown', 'interested'))
+      .resolves.toBeNull();
+  });
+
+  it('personalizes ordinary Feed while leaving search relevance unchanged', async () => {
+    const select = vi.fn().mockImplementation(async ({ candidates }) => ({
+      decisionId: 'decision-1', profileVersion: 'profile-1',
+      candidateVersion: 'candidates-1', personalizationEnabled: true,
+      ranked: [...candidates].reverse().map((item, position) => ({
+        contentKey: item.contentKey,
+        position,
+        lane: 'subscription',
+        isExploration: false,
+        reasonCodes: ['FOLLOWED_TOPIC'],
+      })),
+    }));
+    const store = new MemoryTopicStore(
+      () => new Date('2026-08-08T08:00:00.000Z'),
+      { select, inspect: vi.fn(), control: vi.fn() },
+    );
+    const topic = store.seedTopic('user-1', 'Agents');
+    const older = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-08-07T08:00:00.000Z',
+    });
+    const newer = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-08-08T07:00:00.000Z',
+    });
+
+    const feed = await store.listFeed('user-1', { origin: 'all', since: null });
+    expect(feed.map((item) => item.id)).toEqual([older.id, newer.id]);
+    expect(feed[0]?.recommendation).toEqual({
+      lane: 'subscription', reason: 'followed_topic', isExploration: false,
+    });
+    expect(select).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-1', surface: 'feed',
+    }));
+
+    select.mockClear();
+    await store.listFeed('user-1', { origin: 'all', since: null, query: '内容' });
+    expect(select).not.toHaveBeenCalled();
+  });
+
+  it('keeps the baseline Feed available when personalization fails', async () => {
+    const store = new MemoryTopicStore(
+      () => new Date('2026-08-08T08:00:00.000Z'),
+      {
+        select: vi.fn().mockRejectedValue(new Error('memory unavailable')),
+        inspect: vi.fn(),
+        control: vi.fn(),
+      },
+    );
+    const topic = store.seedTopic('user-1', 'Agents');
+    const older = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-08-07T08:00:00.000Z',
+    });
+    const newer = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-08-08T07:00:00.000Z',
+    });
+
+    const feed = await store.listFeed('user-1', { origin: 'all', since: null });
+    expect(feed.map((item) => item.id)).toEqual([newer.id, older.id]);
+    expect(feed.every((item) => item.recommendation === undefined)).toBe(true);
   });
 
   it('searches owner articles and ranks title, summary, then recommendation reason', async () => {
@@ -363,6 +664,8 @@ describe('topic store multi-source mappings', () => {
         findFirst: vi.fn().mockImplementation(({ where }) =>
           where.userId === 'user-1' ? radar : null),
       },
+      creatorItem: { findFirst: vi.fn().mockResolvedValue(null) },
+      contentFeedback: { findMany: vi.fn().mockResolvedValue([]) },
     } as unknown as PrismaClient;
     const store = new PrismaTopicStore(prisma);
 

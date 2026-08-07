@@ -8,7 +8,10 @@ type ManualTrendJobData = Extract<TrendJobData, { trigger: 'manual' }>;
 export interface TrendQueue {
   enqueue(data: ManualTrendJobData): Promise<void>;
   close(): Promise<void>;
+  healthCheck?(): Promise<void>;
 }
+
+type RedisConnection = Pick<Redis, 'quit'> & Partial<Pick<Redis, 'ping'>>;
 
 export const manualTrendJobId = (runId: string): string =>
   `manual-trend-${createHash('sha256').update(runId).digest('hex')}`;
@@ -19,7 +22,7 @@ const failedRetention = { age: 7 * 24 * 3_600, count: 1_000 } as const;
 export class BullTrendQueue implements TrendQueue {
   constructor(
     private readonly queue: Pick<Queue<ManualTrendJobData>, 'add' | 'close'>,
-    private readonly redis: Pick<Redis, 'quit'>,
+    private readonly redis: RedisConnection,
   ) {}
 
   async enqueue(data: ManualTrendJobData): Promise<void> {
@@ -35,6 +38,11 @@ export class BullTrendQueue implements TrendQueue {
   async close(): Promise<void> {
     await this.queue.close();
     await this.redis.quit();
+  }
+
+  async healthCheck(): Promise<void> {
+    if (!this.redis.ping) throw new Error('Redis health probe is unavailable');
+    await this.redis.ping();
   }
 }
 

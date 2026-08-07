@@ -1,6 +1,7 @@
 import type {
   DiscoveryJobData,
   DiscoverySourceStatus,
+  CreatorJobData,
   TrendJobData,
 } from '@lettermate/contracts';
 import type { INestApplication } from '@nestjs/common';
@@ -11,6 +12,15 @@ import { parseConfig } from '@lettermate/config';
 import { MemoryTopicStore } from './topic-store.js';
 import type { TopicQueue } from './topic-queue.js';
 import type { TrendQueue } from './trend-queue.js';
+import type { CreatorQueue } from './creator-queue.js';
+import {
+  MemoryPersonalizationMemory,
+  type MemoryPersonalizationFacts,
+} from './personalization-memory.js';
+import {
+  CreatorResolutionService,
+  type CreatorIdentityResolver,
+} from './creator-resolver.js';
 
 class RecordingQueue implements TopicQueue {
   jobs: DiscoveryJobData[] = [];
@@ -56,11 +66,36 @@ class FailOnceTrendQueue extends RecordingTrendQueue {
   }
 }
 
+class RecordingCreatorQueue implements CreatorQueue {
+  jobs: CreatorJobData[] = [];
+
+  async enqueue(data: CreatorJobData) {
+    this.jobs.push(data);
+  }
+
+  async close() {}
+}
+
+class FailOnceCreatorQueue extends RecordingCreatorQueue {
+  private failed = false;
+
+  override async enqueue(data: CreatorJobData) {
+    if (!this.failed) {
+      this.failed = true;
+      throw new Error('Redis unavailable');
+    }
+    await super.enqueue(data);
+  }
+}
+
 describe('AI discovery API', () => {
   let app: INestApplication;
   let store: MemoryTopicStore;
   let queue: RecordingQueue;
   let trendQueue: RecordingTrendQueue;
+  let creatorQueue: RecordingCreatorQueue;
+  let creatorResolution: CreatorResolutionService;
+  let personalizationFacts: MemoryPersonalizationFacts;
   const discoverySources: DiscoverySourceStatus[] = [
     { id: 'openrouter-search', label: 'OpenRouter Web Search', category: 'web', status: 'enabled' },
     { id: 'twitterapi-io', label: 'X', category: 'social', status: 'not_configured' },
@@ -70,18 +105,97 @@ describe('AI discovery API', () => {
     store = new MemoryTopicStore();
     queue = new RecordingQueue();
     trendQueue = new RecordingTrendQueue();
+    creatorQueue = new RecordingCreatorQueue();
+    personalizationFacts = {
+      events: [{
+        id: 'interest-event-1', userId: 'user-a', eventType: 'topic_state',
+        sourceRef: 'topic-agents', occurredAt: '2026-07-27T08:00:00.000Z',
+        recordedAt: '2026-07-27T08:00:00.000Z', supersededAt: null,
+        payload: {
+          schemaVersion: 1, state: 'active', topicId: 'topic-agents',
+          keyword: 'Agents', normalizedKeyword: 'agents',
+        },
+      }],
+      tags: [{
+        tagId: 'tag-agents', slug: 'agents', displayName: 'Agents', kind: 'topic',
+        confidence: 1, contentKey: 'topic://agents',
+        createdAt: '2026-07-27T08:00:00.000Z',
+      }],
+      creatorContent: [], settings: {}, forgottenTagIds: {},
+    };
+    const rssResolver: CreatorIdentityResolver = {
+      platform: 'rss',
+      label: 'RSS/Atom',
+      status: 'enabled',
+      supports: (input) => input.startsWith('https://'),
+      resolve: async (input) => [{
+        platform: 'rss',
+        accountKey: input,
+        resolutionInput: input,
+        displayName: 'Example Engineering',
+        handle: 'Example Team',
+        avatarUrl: 'https://example.com/avatar.png',
+        bio: 'Engineering updates',
+        verified: null,
+        profileUrl: 'https://example.com/',
+        feedUrl: input,
+      }],
+    };
+    creatorResolution = new CreatorResolutionService(
+      [rssResolver],
+      'test-creator-resolution-secret',
+      () => new Date('2026-07-27T12:00:00.000Z'),
+    );
     app = await createApiApp({
       store,
       queue,
       trendQueue,
+      creatorQueue,
+      creatorResolution,
       aiConfigured: true,
       discoverySources,
       now: () => new Date('2026-07-27T12:00:00.000Z'),
+      personalizationMemory: new MemoryPersonalizationMemory(
+        () => personalizationFacts,
+        () => new Date('2026-07-27T12:00:00.000Z'),
+      ),
     });
   });
 
   afterEach(async () => {
     await app.close();
+  });
+
+  it('reads and controls only the authenticated user interest memory', async () => {
+    const initial = await request(app.getHttpServer())
+      .get('/api/v1/interests')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(initial.body).toMatchObject({
+      personalizationEnabled: true,
+      longTerm: [{ id: 'tag-agents', name: 'Agents', sources: ['keyword'] }],
+    });
+    expect(initial.body.longTerm[0]).not.toHaveProperty('score');
+
+    const paused = await request(app.getHttpServer())
+      .put('/api/v1/interests/settings')
+      .set('x-user-id', 'user-a')
+      .send({ personalizationEnabled: false })
+      .expect(200);
+    expect(paused.body.personalizationEnabled).toBe(false);
+
+    const forgotten = await request(app.getHttpServer())
+      .delete('/api/v1/interests/tag-agents')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(forgotten.body.longTerm).toEqual([]);
+    expect(personalizationFacts.forgottenTagIds['user-b']).toBeUndefined();
+
+    await request(app.getHttpServer())
+      .delete('/api/v1/interests')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    await request(app.getHttpServer()).get('/api/v1/interests').expect(401);
   });
 
   it('creates one trimmed keyword topic and enqueues its first refresh', async () => {
@@ -103,6 +217,218 @@ describe('AI discovery API', () => {
       userId: 'user-a',
       trigger: 'initial',
     }]);
+  });
+
+  it('manages an owned RSS creator subscription and enqueues synchronization', async () => {
+    const created = await request(app.getHttpServer())
+      .post('/api/v1/creators')
+      .set('x-user-id', 'user-a')
+      .send({ url: 'https://Example.com/feed.xml?utm_source=test' })
+      .expect(202);
+
+    expect(created.body).toMatchObject({
+      userId: 'user-a',
+      platform: 'rss',
+      displayName: 'example.com',
+      feedUrl: 'https://example.com/feed.xml',
+      runStatus: 'queued',
+    });
+    expect(creatorQueue.jobs).toEqual([{
+      creatorId: created.body.id,
+      userId: 'user-a',
+      trigger: 'manual',
+    }]);
+
+    await request(app.getHttpServer())
+      .post('/api/v1/creators')
+      .set('x-user-id', 'user-a')
+      .send({ url: 'https://example.com/feed.xml' })
+      .expect(409);
+    await request(app.getHttpServer())
+      .get('/api/v1/creators')
+      .set('x-user-id', 'user-b')
+      .expect(200, []);
+
+    await request(app.getHttpServer())
+      .patch(`/api/v1/creators/${created.body.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ paused: true })
+      .expect(200)
+      .expect(({ body }) => expect(body.pausedAt).not.toBeNull());
+    await request(app.getHttpServer())
+      .post(`/api/v1/creators/${created.body.id}/refresh`)
+      .set('x-user-id', 'user-a')
+      .expect(409);
+    await request(app.getHttpServer())
+      .delete(`/api/v1/creators/${created.body.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(204);
+  });
+
+  it('resolves a public creator identity before creating the confirmed subscription', async () => {
+    await request(app.getHttpServer())
+      .get('/api/v1/creator-platforms')
+      .set('x-user-id', 'user-a')
+      .expect(200, [{ id: 'rss', label: 'RSS/Atom', status: 'enabled' }]);
+
+    const resolution = await request(app.getHttpServer())
+      .post('/api/v1/creators/resolve')
+      .set('x-user-id', 'user-a')
+      .send({ input: 'https://example.com/feed.xml' })
+      .expect(201);
+
+    expect(resolution.body.candidates).toEqual([expect.objectContaining({
+      platform: 'rss',
+      displayName: 'Example Engineering',
+      handle: 'Example Team',
+      profileUrl: 'https://example.com/',
+      feedUrl: 'https://example.com/feed.xml',
+    })]);
+
+    const created = await request(app.getHttpServer())
+      .post('/api/v1/creators')
+      .set('x-user-id', 'user-a')
+      .send({ resolutionTokens: [resolution.body.candidates[0].resolutionToken] })
+      .expect(202);
+
+    expect(created.body).toEqual([expect.objectContaining({
+      platform: 'rss',
+      displayName: 'Example Engineering',
+      profileUrl: 'https://example.com/',
+      feedUrl: 'https://example.com/feed.xml',
+    })]);
+    expect(creatorQueue.jobs).toEqual([{
+      creatorId: created.body[0].id,
+      userId: 'user-a',
+      trigger: 'manual',
+    }]);
+  });
+
+  it('returns a safe 404 for another user creator item collection', async () => {
+    const created = await request(app.getHttpServer())
+      .post('/api/v1/creators')
+      .set('x-user-id', 'user-a')
+      .send({ url: 'https://example.com/feed.xml' })
+      .expect(202);
+
+    await request(app.getHttpServer())
+      .get(`/api/v1/creators/${created.body.id}/items`)
+      .set('x-user-id', 'user-b')
+      .expect(404)
+      .expect(({ body }) => expect(body.code).toBe('CREATOR_NOT_FOUND'));
+    await request(app.getHttpServer())
+      .get(`/api/v1/creators/${created.body.id}/items`)
+      .set('x-user-id', 'user-a')
+      .expect(200, []);
+  });
+
+  it('compensates creator refresh registration when enqueueing fails', async () => {
+    const failingCreatorQueue = new FailOnceCreatorQueue();
+    const localApp = await createApiApp({
+      store,
+      queue,
+      trendQueue,
+      creatorQueue: failingCreatorQueue,
+      aiConfigured: true,
+      discoverySources,
+    });
+    const creator = await store.createCreator('user-a', {
+      platform: 'rss',
+      accountKey: 'https://example.com/feed.xml',
+      displayName: 'Example',
+      profileUrl: 'https://example.com/feed.xml',
+      feedUrl: 'https://example.com/feed.xml',
+    });
+    await store.compensateCreatorRefresh('user-a', creator.id);
+
+    await request(localApp.getHttpServer())
+      .post(`/api/v1/creators/${creator.id}/refresh`)
+      .set('x-user-id', 'user-a')
+      .expect(500);
+    await request(localApp.getHttpServer())
+      .get('/api/v1/creators')
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body[0]).toMatchObject({
+        id: creator.id,
+        runStatus: 'failed',
+        lastError: { code: 'CREATOR_QUEUE_UNAVAILABLE' },
+      }));
+
+    await localApp.close();
+  });
+
+  it('compensates creator resume when enqueueing fails', async () => {
+    const failingCreatorQueue = new FailOnceCreatorQueue();
+    const localApp = await createApiApp({
+      store,
+      queue,
+      trendQueue,
+      creatorQueue: failingCreatorQueue,
+      aiConfigured: true,
+      discoverySources,
+    });
+    const creator = await store.createCreator('user-a', {
+      platform: 'rss',
+      accountKey: 'https://example.com/feed.xml',
+      displayName: 'Example',
+      profileUrl: 'https://example.com/feed.xml',
+      feedUrl: 'https://example.com/feed.xml',
+    });
+    await store.updateCreator('user-a', creator.id, { paused: true });
+
+    await request(localApp.getHttpServer())
+      .patch(`/api/v1/creators/${creator.id}`)
+      .set('x-user-id', 'user-a')
+      .send({ paused: false })
+      .expect(500);
+    await request(localApp.getHttpServer())
+      .get('/api/v1/creators')
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body[0]).toMatchObject({
+        id: creator.id,
+        pausedAt: null,
+        runStatus: 'failed',
+        lastError: { code: 'CREATOR_QUEUE_UNAVAILABLE' },
+      }));
+
+    await localApp.close();
+  });
+
+  it('exposes liveness and dependency readiness without secrets', async () => {
+    const localApp = await createApiApp({
+      store,
+      queue,
+      trendQueue,
+      creatorQueue,
+      aiConfigured: false,
+      healthChecks: {
+        database: { check: async () => {} },
+        redis: { check: async () => { throw new Error('redis://secret'); } },
+      },
+    });
+
+    await request(localApp.getHttpServer())
+      .get('/api/v1/health')
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({ status: 'ok' }));
+    await request(localApp.getHttpServer())
+      .get('/api/v1/health/ready')
+      .expect(200)
+      .expect(({ body }) => {
+        expect(body).toEqual(expect.objectContaining({
+          status: 'degraded',
+          dependencies: {
+            database: { status: 'ok' },
+            redis: { status: 'error', code: 'REDIS_UNAVAILABLE' },
+            ai: { status: 'not_configured', code: 'AI_NOT_CONFIGURED' },
+          },
+        }));
+        expect(JSON.stringify(body)).not.toContain('secret');
+      });
+
+    await localApp.close();
   });
 
   it('rejects equivalent duplicate keywords for one user', async () => {
@@ -129,6 +455,7 @@ describe('AI discovery API', () => {
       store: localStore,
       queue: localQueue,
       trendQueue: new RecordingTrendQueue(),
+      creatorQueue: new RecordingCreatorQueue(),
       aiConfigured: false,
     });
 
@@ -175,23 +502,72 @@ describe('AI discovery API', () => {
     });
   });
 
-  it('updates owned topic keywords and variants and enqueues discovery', async () => {
+  it('pauses and resumes only an owned keyword monitor while retaining history', async () => {
+    const own = store.seedTopic('user-a', 'AI Agent');
+    const other = store.seedTopic('user-b', 'Private');
+    store.seedItem(own.id, 'quality');
+
+    await request(app.getHttpServer())
+      .post(`/api/v1/topics/${other.id}/pause`)
+      .set('x-user-id', 'user-a')
+      .expect(404);
+
+    await request(app.getHttpServer())
+      .post(`/api/v1/topics/${own.id}/pause`)
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({
+        id: own.id,
+        pausedAt: expect.any(String),
+        nextRunAt: null,
+      }));
+
+    await request(app.getHttpServer())
+      .post(`/api/v1/topics/${own.id}/refresh`)
+      .set('x-user-id', 'user-a')
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe('TOPIC_PAUSED'));
+    expect(queue.jobs).toEqual([]);
+
+    await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body[0]).toMatchObject({ topicKeywordActive: true }));
+
+    await request(app.getHttpServer())
+      .post(`/api/v1/topics/${own.id}/resume`)
+      .set('x-user-id', 'user-a')
+      .expect(202)
+      .expect(({ body }) => expect(body).toMatchObject({
+        id: own.id,
+        pausedAt: null,
+        runStatus: 'queued',
+      }));
+    expect(queue.jobs).toEqual([{
+      topicId: own.id,
+      userId: 'user-a',
+      trigger: 'manual',
+    }]);
+  });
+
+  it('updates an owned keyword monitor and enqueues discovery', async () => {
     const topic = store.seedTopic('user-a', 'gpt-5.7');
 
     const response = await request(app.getHttpServer())
       .patch(`/api/v1/topics/${topic.id}`)
       .set('x-user-id', 'user-a')
-      .send({ keyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'] })
+      .send({ keyword: 'gpt-5.8' })
       .expect(200);
 
-    expect(response.body).toMatchObject({ keyword: 'gpt-5.8', expandedTerms: ['gpt 5.8'] });
+    expect(response.body).toMatchObject({ keyword: 'gpt-5.8', expandedTerms: [] });
     expect(queue.jobs).toContainEqual({ topicId: topic.id, userId: 'user-a', trigger: 'manual' });
   });
 
   it('compensates a failed update enqueue so the topic can be refreshed again', async () => {
     const failingQueue = new FailOnceTopicQueue();
     const localApp = await createApiApp({
-      store, queue: failingQueue, trendQueue, aiConfigured: true, discoverySources,
+      store, queue: failingQueue, trendQueue, creatorQueue, aiConfigured: true, discoverySources,
     });
     const topic = store.seedTopic('user-a', 'gpt-5.7');
 
@@ -445,6 +821,45 @@ describe('AI discovery API', () => {
     expect(topicOnly.body.map((item: { id: string }) => item.id)).toEqual([topicItem.id]);
   });
 
+  it('sets, switches, clears, and safely scopes persisted Feed feedback', async () => {
+    const own = store.seedRadarItem('user-a', 'quality', {
+      sourceUrl: 'https://example.com/articles/feedback?utm_source=test',
+    });
+    const other = store.seedRadarItem('user-b', 'quality', {
+      sourceUrl: 'https://example.com/articles/private',
+    });
+    const path = `/api/v1/feedback/${encodeURIComponent(own.contentKey)}`;
+
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ value: 'interested' }).expect(200)
+      .expect({ contentKey: own.contentKey, value: 'interested' });
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ value: 'interested' }).expect(200);
+    await request(app.getHttpServer()).get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a').expect(200)
+      .expect(({ body }) => expect(body[0].feedback).toBe('interested'));
+
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ value: 'less' }).expect(200)
+      .expect({ contentKey: own.contentKey, value: 'less' });
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ value: null }).expect(200)
+      .expect({ contentKey: own.contentKey, value: null });
+    await request(app.getHttpServer()).get(`/api/v1/items/${own.id}`)
+      .set('x-user-id', 'user-a').expect(200)
+      .expect(({ body }) => expect(body.feedback).toBeNull());
+
+    await request(app.getHttpServer())
+      .put(`/api/v1/feedback/${encodeURIComponent(other.contentKey)}`)
+      .set('x-user-id', 'user-a').send({ value: 'interested' }).expect(404);
+    await request(app.getHttpServer())
+      .put(`/api/v1/feedback/${encodeURIComponent('https://example.com/unknown')}`)
+      .set('x-user-id', 'user-a').send({ value: 'interested' }).expect(404);
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ value: 'like' }).expect(400)
+      .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+  });
+
   it('returns safe trend status and registers only one repeated manual refresh', async () => {
     const initial = await request(app.getHttpServer())
       .get('/api/v1/trends/status')
@@ -482,6 +897,7 @@ describe('AI discovery API', () => {
       store: localStore,
       queue: new RecordingQueue(),
       trendQueue: localTrendQueue,
+      creatorQueue: new RecordingCreatorQueue(),
       aiConfigured: true,
       now: () => new Date('2026-07-27T12:00:00.000Z'),
     });
@@ -520,6 +936,31 @@ describe('AI discovery API', () => {
       TWITTERAPI_IO_API_KEY: 'twitter-secret',
       DISCOVERY_RSS_FEED_URLS: 'https://example.com/feed.xml',
     }));
+
+    expect(statuses.map(({ id }) => id)).toEqual([
+      'openrouter-search',
+      'twitterapi-io',
+      'rss',
+      'hacker-news',
+      'stack-overflow',
+      'arxiv',
+      'github',
+      'search-brave',
+      'search-tavily',
+      'search-bing',
+      'youtube',
+      'reddit',
+      'bluesky',
+      'bilibili',
+      'twitter-trends',
+      'hacker-news-trends',
+      'youtube-trends',
+      'reddit-trends',
+      'bilibili-trends',
+      'google-trends-rss',
+    ]);
+    expect(statuses.map(({ id }) => id)).not.toContain('x-trends');
+    expect(statuses.map(({ id }) => id)).not.toContain('google-trends');
 
     expect(statuses).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'twitterapi-io', status: 'enabled' }),

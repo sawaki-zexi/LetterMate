@@ -19,6 +19,9 @@ const feedItem: FeedItem = {
   authorHandle: null,
   externalId: null,
   provenanceKind: 'fetched_page',
+  contentKey: 'https://example.com/release',
+  feedback: null,
+  origins: [{ origin: 'trend' }],
 };
 
 const trendStatus: TrendStatus = {
@@ -27,6 +30,17 @@ const trendStatus: TrendStatus = {
   intervalHours: 4,
   lastError: null,
   lastRun: null,
+};
+
+const interestMemory = {
+  personalizationEnabled: true,
+  resetAt: null,
+  recent: [{
+    id: 'tag-agents', name: 'Agents', kind: 'topic' as const,
+    sources: ['feedback' as const], updatedAt: '2026-08-08T08:00:00.000Z',
+  }],
+  longTerm: [],
+  reduced: [],
 };
 
 describe('web API client', () => {
@@ -96,5 +110,46 @@ describe('web API client', () => {
       '/api/v1/trends/refresh',
       expect.objectContaining({ method: 'POST' }),
     );
+  });
+
+  it('writes validated feedback against the encoded stable content key', async () => {
+    const fetchMock = vi.fn(async () => Response.json({
+      contentKey: feedItem.contentKey,
+      value: 'interested',
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.setFeedback(feedItem.contentKey, { value: 'interested' })).resolves.toEqual({
+      contentKey: feedItem.contentKey,
+      value: 'interested',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/v1/feedback/${encodeURIComponent(feedItem.contentKey)}`,
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ value: 'interested' }) }),
+    );
+    expect(() => api.setFeedback(feedItem.contentKey, { value: 'like' as never })).toThrow();
+  });
+
+  it('reads and controls interest memory with validated payloads', async () => {
+    const fetchMock = vi.fn(async () => Response.json(interestMemory));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.interests()).resolves.toEqual(interestMemory);
+    await api.setInterestSettings({ personalizationEnabled: false });
+    await api.forgetInterest('tag/agents');
+    await api.clearInterestHistory();
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/interests/settings', expect.objectContaining({
+      method: 'PUT', body: JSON.stringify({ personalizationEnabled: false }),
+    }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/interests/tag%2Fagents',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/interests',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+    expect(() => api.setInterestSettings({ personalizationEnabled: 'yes' as never })).toThrow();
   });
 });

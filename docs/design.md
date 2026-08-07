@@ -1,251 +1,227 @@
-# LetterMate 精准追踪与趋势发现技术方案
+# LetterMate 个性化发现技术方案
 
-**状态：** 当前有效
-**更新日期：** 2026-08-02
+**状态：** 当前架构上的下一阶段设计
+**更新日期：** 2026-08-08
 
-## 当前开发进度
+## 1. 当前状态
 
-已实现 Topic 精准追踪、11 个主发现连接器、6 个趋势输入、正文和事实支持门控、Topic/Trend 调度、运行租约、统一 Feed、已入库文章搜索、时间与来源筛选、点击/下拉刷新、持久化新增计数，以及对应 Prisma 迁移和默认离线自动化测试。
-
-当前仍有两个生产交付缺口：
-
-- Web 固定发送 `x-user-id: user-a`，API 直接信任该请求头。真实登录、服务端会话和 CSRF 尚未实现，`SESSION_SECRET` 与 `CSRF_SECRET` 目前只是预留配置。
-- 外部连接器的默认测试使用 Fake 或固定响应；OpenRouter、TwitterAPI.io 及其他凭据型来源仍需在目标环境完成 live smoke test、配额和故障行为验收。
-
-## 1. 架构决策
-
-系统保留 Topic 精准追踪和自动趋势发现两条独立、可持久化的运行管线。趋势榜单适配器只产生搜索种子，不产生 Feed 条目；两条管线共享主发现连接器、正文补全、来源验证、事实支持门控、去重、AI 评审和中文内容生成。
+当前代码已经形成两条可运行的发现管线：
 
 ```text
-Topic keyword
-  -> exact KeywordPolicy
-  -> SourceRouter + main discovery connectors
-  -> content enrichment + keyword/fact-support gates
-  -> dedupe + Chinese composition
-  -> DiscoveryItem
-
-External trend inputs
-  -> TrendSeed normalization + recent-seed dedupe
-  -> technology vertical classification
-  -> precise source query plans
-  -> main discovery connectors
-  -> content enrichment + fact-support gate
-  -> dedupe + Chinese composition
-  -> RadarItem
-
-DiscoveryItem + RadarItem
-  -> NestJS unified Feed API
-  -> persisted article search and range/origin filters
-  -> React calendar groups
+Topic keyword -> connectors -> enrichment -> quality gates -> DiscoveryItem
+Trend sources -> TrendSeed -> connectors -> enrichment -> quality gates -> RadarItem
+DiscoveryItem + RadarItem -> unified Feed API -> React Web
 ```
 
-React Web 只调用 NestJS API。API 负责认证、用户边界、输入验证和 BullMQ 入队；Worker 负责外部网络访问和发现编排；PostgreSQL/Prisma 保存调度与运行真实状态；Redis/BullMQ 传递任务。所有外部密钥和鉴权头只在 API/Worker 服务端存在。
+已实现 Topic 管理与调度、14 个主发现连接器、6 个趋势输入、正文和事实支持门控、去重、中文内容生成、统一 Feed、已入库搜索、手动刷新、运行租约和离线测试。博主关注已完成 RSS/Atom、X 与 Bilibili 三个切片，包括统一身份确认、订阅生命周期、独立队列、每日调度、完整有效内容档案、质量门控和 Creator Feed 来源。
 
-## 2. 模块边界
+RSS/Atom、X 与 Bilibili 已接入统一身份基础：支持名字、Handle、平台主页、Feed URL、RSS/Atom 自动发现、身份预览、短期确认令牌、批量原子创建契约和平台能力展示。X 订阅固定 provider 稳定用户 ID，按账号时间线同步原创、引用、纯转发、连续帖和带父帖上下文的高价值回复。Bilibili 订阅固定 `mid`，通过公开卡片接口刷新身份，并以 WBI 搜索分页和稳定 `mid` 过滤同步公开视频。未通过精选的结构有效内容仍保留在 Creator 档案中，并可在 Web 博主内容页查看；转发与回复会保留原帖入口和上下文。统一 Feed 已按规范化 URL、稳定内容 ID 和内容指纹合并 Topic、Trend 与 Creator，并返回全部 `origins[]`。Feed 显式反馈已实现持久化、幂等切换、取消、合并内容共享状态和用户所有权保护。Bluesky、YouTube 的博主适配器、兴趣排序、探索推荐和邮件发送尚未实现。身份层仍信任开发用 `x-user-id`，不能直接用于不可信网络。
 
-| 路径 | 职责 |
-| --- | --- |
-| `apps/web` | Feed、筛选、分组、刷新协调、Topic 管理和安全来源状态 |
-| `apps/api` | 用户边界、验证、Feed 合并、运行摘要、Topic/Trend 入队 |
-| `apps/worker/src/connectors` | 主发现连接器、候选标准化和安全错误映射 |
-| `apps/worker/src/trends` | 趋势榜单适配器和最小化 TrendSeed 收集 |
-| `apps/worker/src/keyword-policy.ts` | 完整关键词、必要标识符和有限形式别名 |
-| `apps/worker/src/quality-pipeline.ts` | 正文、关键词、事实支持、去重、质量与多样性规则 |
-| `apps/worker/src/discovery-service.ts` | Topic 发现编排和原子持久化 |
-| `apps/worker/src/trend-service.ts` | 趋势分类、再搜索、质量管线和 RadarItem 持久化 |
-| `apps/worker/src/scheduler.ts` | 6/12/24 小时 Topic 调度和租约 |
-| `apps/worker/src/trend-scheduler.ts` | 按持久化周期执行 TrendMonitor 调度和租约，并以默认 4 小时补建缺失记录 |
-| `packages/contracts` | API、Worker 与 Web 共用 DTO 和 Zod schema |
-| `packages/domain` | 来源证明、URL、质量门槛、去重和多样性规则 |
-| `packages/config` | 服务端环境配置解析与默认值 |
-| `prisma/schema.prisma` | 用户、Topic、Trend、运行和发现条目持久化 |
+## 2. 目标架构
 
-提供商专有响应不得进入共享契约。完整正文仅在单次 Worker 运行内短期使用，不写入 Feed 条目。
+下一阶段不替换现有发现管线，而是增加一个博主入口、一个个性化选择层和一个邮件出口：
 
-## 3. 来源模型
+```mermaid
+flowchart LR
+    Topic["关键词监控"] --> Discover["共享发现与质量管线"]
+    Trend["自动技术热点"] --> Discover
+    Creator["公开博主关注"] --> CreatorIngest["博主采集与正文补全"]
+    CreatorIngest --> Discover
+    Discover --> Store["持久化内容与来源"]
+    Store --> Rank["兴趣排序与探索编排"]
+    Rank --> Feed["浏览器 Feed"]
+    Rank --> Digest["每日重点选择"]
+    Digest --> Email["EmailGateway"]
+```
 
-### 3.1 主发现连接器
+核心约束：
 
-`SourceConnector` 接收有限的 `SourceQueryPlan`，返回标准化候选和 `SourceProof`。当前运行时注册：
+- 质量门控先于个性化；偏好不能使不合格内容入库。
+- 发现、排序和交付分离；邮件失败不影响 Feed 和发现调度。
+- 所有跨应用结构进入共享 contracts，业务规则进入 domain，提供商代码留在适配层。
+- 当前表和 API 以增量方式扩展，避免为了个性化重写已稳定的 Topic/Trend 管线。
 
-| 连接器 | 配置 | 用途 |
+## 3. 模块边界
+
+| 模块 | 当前职责 | 下一阶段增量 |
 | --- | --- | --- |
-| OpenRouter Web Search | `AI_API_KEY`, `AI_MODEL`, `AI_WEB_SEARCH` | 只接受本次 citation annotation 的 URL |
-| TwitterAPI.io | `TWITTERAPI_IO_API_KEY` | X 搜索、原创帖、引用和线程上下文 |
-| RSS/Atom | `DISCOVERY_RSS_FEED_URLS` | 配置的 Feed |
-| Hacker News | 无 Key | 技术社区条目 |
-| arXiv | 无 Key | 论文元数据和摘要 |
-| GitHub | 可选 `GITHUB_TOKEN` | 仓库、README、Release 和讨论 |
-| Brave-compatible Search | `SEARCH_PROVIDER=brave`, `SEARCH_API_KEY`, 可选 `SEARCH_API_BASE_URL` | 额外 Web 搜索 |
-| YouTube | `YOUTUBE_API_KEY` | 视频说明和结构化元数据 |
-| Reddit | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | 结构化社区内容 |
-| Bluesky | 无 Key | 公共社交记录 |
-| Bilibili | 无 Key | 公共视频内容 |
+| React Web | Topic、Feed、筛选、刷新和详情 | 博主、反馈、探索标记和邮件设置 |
+| NestJS API | 用户边界、验证、Feed 合并和任务入队 | 博主/反馈/邮件端点与个性化 Feed |
+| Worker connectors | 多来源候选标准化 | 可按稳定账号身份拉取内容的博主适配器 |
+| Worker discovery | Topic/Trend 编排与质量管线 | 关键词意图、博主内容评审和兴趣标签 |
+| Schedulers/BullMQ | Topic/Trend 定时运行 | 博主采集和每日邮件任务 |
+| PostgreSQL/Prisma | Topic、Trend、运行和发现结果 | 博主、反馈、兴趣权重和邮件记录 |
+| packages/contracts | API 与任务 DTO | Creator、Feedback、Digest 和扩展 Feed 契约 |
+| packages/domain | 关键词、来源、质量和去重规则 | 兴趣权重、探索配额和邮件选择规则 |
 
-主发现连接器用于 Topic 搜索，也用于趋势种子的后续验证。缺少可选配置时，对应连接器返回 `not_configured`，不会阻塞公共连接器。
+## 4. 关键词监控
 
-### 3.2 趋势输入
+### 4.1 用户模型
 
-趋势适配器使用独立 `TrendSource` 契约，只返回 `sourceId`、平台、外部 ID、标题、原始 HTTP(S) URL 和可用发布时间：
+Web 将“主题”统一改称“关键词监控”。用户只编辑一个主关键词；查询变体是内部检索数据，不再作为必填配置或主要交互暴露。
 
-| 趋势输入 | 配置/入口 |
-| --- | --- |
-| X Trends | TwitterAPI.io `/twitter/trends`；`TWITTERAPI_IO_API_KEY`, `TREND_X_WOEIDS` |
-| Hacker News | 官方 Top Stories；无 Key |
-| YouTube | `mostPopular`；`YOUTUBE_API_KEY`, `TREND_YOUTUBE_REGION` |
-| Reddit | 指定社区 Hot；Reddit OAuth, `TREND_REDDIT_COMMUNITIES` |
-| Bilibili | 公共热门接口；无 Key |
-| Google Trends | 配置的 HTTPS Trending RSS；`TREND_GOOGLE_RSS_URLS` |
+### 4.2 内部意图
 
-GitHub 没有在本项目中作为趋势榜单输入；它和 arXiv、RSS/Atom、Web 等主连接器可支持趋势种子的后续内容检索。趋势输入不保存平台顺序、完整响应或敏感请求信息。
+Worker 为关键词建立提供商无关的内部 `KeywordProfile`：
 
-## 4. 精准关键词策略
+- `entity`：具体产品、项目、型号或版本，查询优先覆盖发布、可用性、价格、能力变化和重大问题；
+- `domain`：领域或主题，查询优先覆盖重要发布、研究、工具和行业变化；
+- `unknown`：分类失败时沿用当前完整关键词检索，不扩大语义范围。
 
-`buildKeywordPolicy` 规范化 Unicode 宽度、大小写和空白，但保留数字版本段和实体边界。确定性别名只改变标点和间距，不创建语义近义词。`SourceRouter` 会丢弃不包含精确短语或必要标识符的 AI 查询，并补充包含完整短语的 release、update、documentation 等有限意图查询。
+该分类不由用户选择。主关键词变更后 profile 失效并在下一次运行重建。无论 profile 为何，候选都必须通过现有完整关键词与必要标识符门控。
 
-Topic 首次运行在 `variantsInitialized=false` 时生成扩展词并将其初始化；此后 `expandedTerms` 是用户管理数据，即使为空也不会再次调用 AI 扩展。编辑主关键词或扩展词会保存完整的新集合并登记一次发现运行。
+查询变体可以改变大小写、空格和标点，或增加 release、update 等有限意图词；不得删除版本段、替换实体或创建宽泛近义词。
 
-候选必须在标题或正文中命中完整短语或确认变体。例如：
+### 4.3 兼容策略
 
-- `gpt-5.7`、`GPT 5.7`、`gpt5.7` 可以表示同一形式标识；
-- `GPT`、`latest GPT model` 和宽泛 AI 内容不匹配；
-- `gpt-5.7.1` 是另一个版本，不能作为 `gpt-5.7` 的命中。
+数据库继续保留 `Topic` 作为内部模型，避免无价值的全仓库重命名。API 可以继续使用 `/topics`，但 Web 文案和产品文档统一使用“关键词监控”。现有历史关键词快照、软删除和运行记录保持不变。
 
-命中检查发生在 AI 质量评审之前。这样即使上游扩展或搜索结果过宽，也不能越过 Topic 的完整关键词边界。
+## 5. 博主关注
 
-## 5. 趋势编排
+### 5.1 来源契约
 
-1. `TrendRegistry` 对启用的趋势源执行有限并发、单源超时、schema 验证、URL 规范化和失败隔离。
-2. `TrendDiscoveryService` 按外部 ID、规范化 URL 和标题指纹去重，并跳过近期已处理的种子。
-3. OpenRouter 的结构化分类仅接受 AI、技术、软件产品、工程和研究种子，并保留实体、产品名和版本标识。
-4. 接受的种子转换为精准 `SourceQueryPlan`，通过主发现连接器执行多来源搜索。
-5. 候选进入与 Topic 相同的正文补全、事实支持门控、去重、质量和中文内容生成流程。
-6. 最终条目在一个事务中写入 `RadarItem`，`newItemCount` 来自实际新插入行。
+博主创建分为身份解析和持续同步两步。新增 `CreatorIdentityResolver`，接收名字、Handle、公开主页 URL 或 RSS/Atom URL，返回零到多个 `CreatorIdentityCandidate`：
 
-趋势榜单中的出现和热度不构成事实证明。若标题声称发布、上线或其他事件，而正文、一手平台记录、代码 Release 或论文记录不能支持核心事实，候选必须被拒绝。至少一个趋势源成功且后续质量管线完成时，零结果是成功；所有趋势源失败或 AI 阶段失败时，不写半成品。
+- 平台、稳定账号 ID 和规范化主页 URL；
+- 展示名、Handle、头像、简介和平台认证状态；
+- `enabled | not_configured` 能力状态；
+- 短期、服务端可验证的 `resolutionToken`，供确认创建使用。
 
-## 6. 质量、安全与去重
+名字和 Handle 默认在所有已启用 Creator 平台中并发解析；URL 先路由到对应平台或 Feed 解析器。只有带 `@` 的 Handle 和平台主页 URL 走精确账号查询；其他裸文本（包括单个不完整词）交给平台原生搜索并按平台相关度返回，不在本地猜测子串关系。客户端不能提交自造的稳定账号 ID。`POST /creators` 只接受一个或多个未过期 `resolutionToken`，服务端重新校验平台身份后创建独立订阅。未配置平台可以显示在能力列表中，但不返回可创建的候选。
 
-统一管线按以下顺序处理：
+`CreatorConnector` 输入已确认且规范化的公开账号引用，输出：
 
-1. 验证候选结构、时间、HTTP(S) URL 和 `SourceProof`。
-2. 过滤搜索页、分类页、登录页、广告页、采集模板、明显无关和过期内容。
-3. 按平台 ID、规范化 URL 和已知重定向精确去重。
-4. 补全网页正文、线程、README、Release Notes、论文摘要、视频说明或字幕。
-5. 对 Topic 应用精确关键词命中；对两类候选应用 `claimSupport === 'supported'` 门控。
-6. 按标题和正文指纹近似去重，并与当前用户历史比较信息增量。
-7. AI 批量评审相关性、原创性、实质性、时效性和可理解性。
-8. 应用来源多样性后，仅为最终结果生成中文摘要、推荐理由和 `hot | quality` 分类。
+- 平台和稳定账号 ID；
+- 账号主页 HTTP(S) URL；
+- 内容外部 ID、发布时间和原始 URL；
+- `original | repost | reply` 类型及可获取正文；
+- 转发的原作者和原内容引用；
+- 回复的父帖上下文及连续帖归并信息。
 
-AI 只能引用已验证候选池中的 URL。外部抓取在每次请求和重定向前执行 DNS/地址检查，拒绝 localhost、环回、私网、链路本地和云元数据地址，并限制 MIME、大小、重定向数和超时。
+连接器必须固定平台账号 ID，后续运行不得仅依赖可变展示名或 Handle。改名更新展示信息但不创建新订阅；账号不存在、封禁或转私密时进入 `unavailable`，保留历史并按退避策略重试。单个平台失败与现有连接器一样隔离，不阻塞其他博主。
 
-事实支持判断是内部运行门控，不持久化为用户状态。数据库、API 和 Web 不暴露可信分数、来源排名、证据数量、内部评分或“已核实”标签。
+RSS/Atom、X 与 Bilibili 已实现身份和采集链路。Bluesky 和 YouTube Creator 暂未实现。只使用官方 API、公开端点、已配置的合规中转服务或公开 Feed。
 
-## 7. 数据与一致性
+### 5.2 数据模型
 
-- `Topic`：完整关键词、用户管理的扩展词、`variantsInitialized`、软删除时间、运行状态、`queuedTrigger`、`nextRunAt`、6/12/24 小时周期和最新安全运行摘要。
-- `DiscoveryRun`：Topic 触发方式、状态、开始/结束时间、运行时关键词/扩展词快照和实际新增数。
-- `DiscoveryItem`：Topic 所有的最终中文内容、原始 URL、来源元数据和发现时关键词快照。
-- `TrendMonitor`：用户唯一的趋势状态、持久化 `intervalHours`、`nextRunAt`、租约和待处理手动刷新；缺失记录的间隔默认按 4 小时创建。
-- `TrendRun`：趋势触发方式、状态、候选/录取/新增数和安全错误；手动刷新在入队前先创建持久化的 `queued` 运行。
-- `TrendSeed`：最小化来源、外部 ID、标题、URL、指纹和精准查询词。
-- `RadarItem`：用户所有的最终趋势内容，按 `(userId, canonicalPrimaryUrl)` 唯一。
+- `CreatorSubscription`：用户、平台、稳定账号 ID、主页 URL、展示信息、启用状态、可用状态、下次运行时间和租约。同一用户不能重复关注同一平台账号；同一个人在不同平台的账号分别订阅。
+- `CreatorRun`：触发方式、状态、时间、候选数、新增数和安全错误。
+- `CreatorItem`：某个订阅账号发布、转发或回复公开内容的记录，包含平台内容 ID、类型、原始 URL、作者、原作者、父帖上下文、发布时间、内容指纹、质量结果和 `feedEligible`。
 
-Topic 和趋势完成事务都从实际插入数写入 `newItemCount`。运行中数量为 `null`。刷新协调只接受请求开始之后的新 `manual` 运行 ID，因此页面提示来自持久化终态，而不是入队响应或客户端猜测。
+博主页面读取全部成功解析且通过结构、安全和来源校验的 `CreatorItem`，包括低优先级内容。内容质量只决定 `feedEligible`；只有 `feedEligible=true` 的条目进入统一 Feed、生成中文内容并成为每日邮件候选。无效、来源不可验证或重复条目不持久化为可浏览内容。
 
-## 8. 调度和队列
+### 5.3 调度与去重
 
-- 新 Topic 使用 `initial` 任务；手动刷新使用 `manual`；调度使用 `scheduled`。
-- `Topic.queuedTrigger` 区分排队中的 `initial | manual | scheduled`。初始或定时任务排队时收到手动刷新，只登记一个 pending 请求；当前任务终止后再创建后续手动任务。
-- Topic 首次成功后默认为 12 小时；连续两个高产定时运行缩短为 6 小时，连续两个空定时运行延长为 24 小时。
-- `TREND_INTERVAL_HOURS` 默认为 4，只在缺少 TrendMonitor 时提供创建值；已有记录的持久化 `intervalHours` 是后续调度的权威值，环境变量变化不回写已有记录。
-- 两类 scheduler 每 10 分钟扫描，PostgreSQL `nextRunAt` 是真实状态，BullMQ job ID 确保幂等。
-- Topic 使用稳定 ±10% 抖动；手动运行不改变 Topic streak、Topic 自动周期或趋势自动周期。
-- Topic 和 TrendMonitor 都使用运行租约恢复 Worker 中断；同一目标最多一个运行，重复手动请求只保留一个 pending 刷新。
-- 趋势手动刷新在数据库事务中创建带短租约的 `TrendRun`，BullMQ job 携带其 `runId`。入队失败时只补偿尚未被 Worker 认领的登记，旧版无 `runId` 的遗留任务不会重复执行。
+博主使用独立队列和持久化 `nextRunAt`，沿用现有租约、幂等任务 ID、失败隔离和手动刷新模式。平台内容 ID、规范化 URL 和指纹用于精确及近似去重。
 
-## 9. API
+CreatorItem 保留每个博主的发布或转发行为。统一 Feed 在读取时按平台原内容 ID、规范化主 URL 和内容指纹合并 Topic、Trend 和多个 Creator 条目，并返回 `origins[]`、原作者及推荐/转发账号；跨入口命中的同一内容只渲染一次，每日邮件也只选择一次。多个已关注博主转发可增加排序信号，但不能改变 `feedEligible`。
 
-所有业务端点位于 `/api/v1`：
+### 5.4 平台切片
+
+**X Creator 切片（已实现）：** 复用 TwitterAPI.io 的鉴权与安全错误语义，通过用户资料/搜索接口解析账号并固定稳定用户 ID；按账号时间线增量同步原创、引用、纯转发、连续帖和高价值回复。纯转发保留原作者与原帖，回复缺少父帖时通过批量帖子接口补取，连续帖通过线程上下文归并，简短社交回复在质量判断前过滤。
+
+**Bilibili Creator 切片（已实现）：** UP 主名称通过 WBI 用户搜索解析，空间主页通过公开卡片接口校验，订阅固定稳定 `mid`。同步先按 `mid` 刷新当前名称，再分页搜索公开视频并严格过滤 `mid`；这避免依赖可变名称，同时不使用 Cookie、登录态或验证码绕过。空间稿件接口在当前环境返回 `-352`，因此不作为运行前提。`412`、`-352`、限流或接口不可用只使该账号运行失败。第一版不包含动态和专栏。
+
+## 6. 兴趣与探索
+
+完整的兴趣记忆、模块界面、数据模型、排序与分期方案见 [LetterMate 兴趣记忆与个性化发现设计](./personalization-memory-design.md)；开源与企业一手资料见 [兴趣记忆与个性化发现研究](./research/personalization-memory-systems.md)。
+
+### 6.1 信号
+
+已实现两种显式反馈：`interested | less`。`ContentFeedback` 以 `(userId, contentKey)` 唯一，Feed DTO 返回 `feedback: interested | less | null`，使跨来源合并后的同一内容共享反馈。`PUT /feedback/:contentKey` 重复写入幂等，切换时覆盖，`null` 清除；写入前必须证明该内容属于当前用户可见的 Topic、Trend 或有效 Creator Feed，未知和跨用户目标统一返回 `404`。
+
+内容生成阶段为最终合格条目产生有限、规范化的 `interestTags`。标签只用于排序，不参与事实判断，也不向用户表示可信度。
+
+用户的兴趣权重来自：
+
+- 活动关键词监控；
+- 活动博主关注；
+- 对内容的 `interested | less` 反馈。
+
+活动博主只从其 `feedEligible=true` 内容中贡献有限兴趣标签，不能把该博主涉及的所有主题都视为强兴趣。显式反馈权重高于博主推断；取消关注后停止新增该信号，但保留历史反馈。点击和未反馈不改变权重。重复提交同一反馈必须幂等，切换反馈时撤销旧权重后应用新权重。
+
+### 6.2 排序
+
+Feed 先取得通过当前筛选的合格内容，再计算稳定排序：
+
+1. 用户明确订阅的直接命中；
+2. 兴趣标签得分；
+3. `hot | quality` 与信息增量；
+4. `publishedAt ?? discoveredAt`；
+5. ID。
+
+搜索结果仍以文本相关性为主，兴趣得分只作为相同相关度下的次级排序，避免个性化破坏明确搜索意图。
+
+### 6.3 探索
+
+探索候选必须满足质量门槛、未被用户明确排斥，且来自已有正向兴趣的相邻技术标签。服务端在普通排序之后按稳定规则插入，最多每 10 条出现 1 条；不足 10 条时允许没有探索内容。
+
+Feed DTO 返回 `isExploration`。邮件选择器始终排除该字段为真的条目。
+
+## 7. 每日邮件
+
+### 7.1 数据与窗口
+
+- `DigestPreference`：用户、启用状态和本地发送时间；时区使用 User 的 IANA timezone。
+- `DigestRun`：用户、候选窗口、状态、计划日期、发送时间、提供商消息 ID 和安全错误。
+- `DigestItem`：某次邮件包含的规范化内容键、顺序和内容快照。
+
+每次运行的窗口从该用户最近一次成功发送的窗口终点开始，到本次任务创建时间结束。没有合格内容时记录 `skipped` 终态但不调用邮件服务，使下一天不会反复扫描同一批不合格候选。
+
+### 7.2 选择与投递
+
+邮件选择器复用个性化得分，从关键词、自动热点和博主高价值内容中选择最多 10 条，并排除探索内容和已经成功投递的规范化内容键。
+
+新增服务端 `EmailGateway`，生产适配器负责发送，Fake 适配器用于默认测试。模板只接收已持久化的中文标题、摘要、推荐理由和原始链接，不访问外部正文，也不再次调用 AI。
+
+同一用户和计划日期只能有一个有效 `DigestRun`。任务重试复用同一运行与内容快照；只有提供商确认成功后才提交成功终态。失败不会推进成功投递边界。
+
+### 7.3 调度
+
+邮件调度器按短周期扫描在其本地时间已经到期且当天尚无终态运行的用户，创建持久化运行后再入队。夏令时和服务中断恢复以用户时区的计划日期判定，每个本地日期最多发送一次。
+
+## 8. API 与契约
+
+现有端点保持兼容，新增：
 
 | Method | Path | 行为 |
 | --- | --- | --- |
-| `POST` | `/topics` | 创建完整关键词 Topic 并入队首次运行 |
-| `GET` | `/topics` | 返回 Topic 状态、调度和最新运行摘要 |
-| `PATCH` | `/topics/:id` | 修改主关键词和扩展词，并按新配置登记发现运行 |
-| `DELETE` | `/topics/:id` | 软删除 Topic 并停止调度，保留历史 Feed |
-| `POST` | `/topics/:id/refresh` | 登记 Topic 手动刷新，不改变自动周期 |
-| `GET` | `/trends/status` | 返回当前用户的安全 TrendMonitor/TrendRun 摘要 |
-| `POST` | `/trends/refresh` | 登记趋势手动刷新，返回 `202` |
-| `GET` | `/feed` | 合并 Topic/Radar 条目并在服务端筛选、排序 |
-| `GET` | `/items/:id` | 在用户所有权检查后读取 Topic 或 Radar 详情 |
-| `GET` | `/discovery-sources` | 只返回连接器名称、类别和安全启用状态 |
+| `POST` | `/topics/:id/pause` | 暂停关键词监控，保留历史内容并停止后续调度 |
+| `POST` | `/topics/:id/resume` | 恢复关键词监控并安全排队一次刷新 |
+| `POST` | `/creators/resolve` | 用名字、Handle、主页 URL 或 RSS/Atom URL 返回可核验身份候选和创建令牌 |
+| `POST` | `/creators` | 用一个或多个身份解析令牌创建独立关注 |
+| `GET` | `/creators` | 返回当前用户的关注与安全运行状态 |
+| `PATCH` | `/creators/:id` | 暂停或恢复关注 |
+| `DELETE` | `/creators/:id` | 取消关注并保留历史内容 |
+| `POST` | `/creators/:id/refresh` | 手动刷新单个博主 |
+| `GET` | `/creators/:id/items` | 分页读取该账号的全部有效公开内容 |
+| `PUT` | `/feedback/:contentKey` | 幂等设置或清除内容反馈 |
+| `GET` | `/digest-preference` | 读取每日邮件设置和最近运行摘要 |
+| `PUT` | `/digest-preference` | 启用、停用或修改本地发送时间 |
 
-Feed 参数：
+`GET /feed` 的 `origin` 扩展为 `all | topic | trend | creator`，条目增加 `origins[]`、反馈状态和 `isExploration`。所有输入由共享 schema 验证，跨用户资源继续返回 `404`。
 
-- `range=1d|3d|7d|30d|90d|all`，默认 `30d`；
-- `origin=all|topic|trend`，默认 `all`；
-- 可选 `kind=hot|quality`、`topicId` 和最长 100 字符的 `q`；
-- `topicId` 与 `origin=trend` 非法，API 返回 `VALIDATION_ERROR`。
+## 9. 质量、安全与隐私
 
-服务端始终执行用户边界和已有筛选。没有 `q` 时按 `publishedAt ?? discoveredAt`、ID 稳定倒序排列，`all` 不设置起始时间；有 `q` 时只查询已持久化的 `DiscoveryItem` 与 `RadarItem`，不会入队或访问外部来源。搜索使用 `pg_trgm` GIN 索引匹配标题、摘要和推荐理由，按标题 > 摘要 > 推荐理由的权重计算相关性，再按文章时间和 ID 稳定排序。Topic 与趋势结果各自取出相关性排名后，在 API 中执行同一稳定合并顺序；所有 SQL 值参数化，通配符按字面量转义。
+- Creator 内容进入 Feed 前复用正文补全、事实支持、历史增量、去重和 AI 评审。
+- 博主身份候选必须来自平台或 Feed 的结构化响应，并验证平台响应与主页 URL；AI 只能提示疑似冒充风险，不能生成候选、猜测账号或链接。
+- 转发必须保留原作者和原内容引用，回复必须保留父帖上下文；缺失必要上下文时不能成为 `feedEligible` 内容。
+- 邮件地址、平台凭据和邮件服务凭据不得进入客户端、日志、错误响应或测试快照。
+- 退订每日邮件只停用交付，不删除 Feed、监控、博主或历史邮件记录。
+- 用户数据和运行记录继续执行现有所有权边界；生产交付前替换固定 `x-user-id`。
+- 外部正文和博主页面抓取继续执行 SSRF、MIME、大小、重定向和超时限制。
 
-## 10. Web 交互
+## 10. 测试策略
 
-Feed 顶部提供已入库文章搜索框、来源 segmented control、分类 control、原生时间 `<select>` 和适用时的 Topic select。输入草稿与已提交搜索词分离，只有回车或点击搜索按钮才发送查询；清除按钮移除 `q` 并保留其他筛选。搜索失败保留输入上下文供重试，空结果显示专用状态。六个时间范围共用一个服务端查询，默认近 30 天。返回条目按“今天、昨天、近 3 天、近 7 天、本月更早、更早”互斥分组，空组不渲染。
+最高层验证边界是：用户配置关键词或博主后，固定来源产生候选，质量管线筛选，结果进入个性化 Feed，并在适用时进入下一封每日邮件。
 
-Topic 页面提供主关键词和扩展词的内联编辑，以及带确认对话框的删除操作。删除成功后 Topic 立即离开活动列表；Feed 仍用 `DiscoveryItem.topicKeyword` 展示历史归属，并在 Topic 已删除或当前关键词与快照不一致时显示“关键词已失效”。
+- 单元测试：关键词 profile、兴趣权重、稳定排序、探索配额、邮件窗口和幂等选择。
+- API/数据库集成测试：名字/Handle/URL 解析、令牌篡改与过期、多选创建、重复账号、所有权、Creator 生命周期、跨来源合并、反馈切换、邮件运行状态和失败恢复。
+- Worker 集成测试：CreatorConnector Fake、稳定账号 ID、改名与不可用恢复、X 转发/回复上下文、Bilibili 视频分页、博主调度、质量管线复用和邮件 Fake。
+- Playwright：跨平台候选确认、未配置平台状态、多选关注、关注/暂停博主、全部内容与重点内容分层、Feed 合并、反馈、探索标记、邮件设置和响应式布局。
+- 默认测试不联网；live smoke test 使用显式开关和对应凭据。
 
-刷新协调范围：
-
-- 选择具体 Topic：只刷新该 Topic；
-- `origin=topic`：刷新 Topic；
-- `origin=trend`：只刷新趋势；
-- `origin=all`：刷新 Topic 和趋势。
-
-点击或移动端顶部下拉触发后，刷新按钮立即设置 `aria-busy=true`，固定尺寸图标显示进行中状态，非阻塞状态行显示目标数。前端以 1.5 秒状态轮询等待持久化的后续 `manual` 运行，全部终止后重新读取 Feed 并汇总 `newItemCount`。成功有新增时精确显示“刷新完成，新增 N 条内容”；零新增、部分失败和全部失败有独立文案。`aria-live="polite"` 公布结果，已有内容始终可浏览。
-
-下拉刷新只在 `scrollY === 0`、单指主要向下、超过 72px、目标不是表单控件且没有活动刷新时触发。`prefers-reduced-motion` 下不依赖连续动画表达状态。布局在 1440px 桌面、平板、移动端和 320px 紧凑视口中让控件换行，不产生水平溢出。
-
-## 11. 配置
-
-完整示例见根目录 `.env.example`。相关服务端变量如下：
-
-```env
-AI_API_KEY=
-AI_MODEL=openrouter/auto
-AI_WEB_SEARCH=true
-AI_TIMEOUT_MS=60000
-
-TWITTERAPI_IO_API_KEY=
-GITHUB_TOKEN=
-YOUTUBE_API_KEY=
-REDDIT_CLIENT_ID=
-REDDIT_CLIENT_SECRET=
-SEARCH_PROVIDER=
-SEARCH_API_KEY=
-SEARCH_API_BASE_URL=
-DISCOVERY_RSS_FEED_URLS=
-
-DISCOVERY_RUN_TIMEOUT_MS=600000
-DISCOVERY_CONNECTOR_CONCURRENCY=4
-DISCOVERY_SCHEDULER_ENABLED=true
-
-TREND_MONITOR_ENABLED=true
-TREND_INTERVAL_HOURS=4
-TREND_X_WOEIDS=1
-TREND_YOUTUBE_REGION=US
-TREND_REDDIT_COMMUNITIES=MachineLearning,LocalLLaMA,programming,technology
-TREND_GOOGLE_RSS_URLS=
-```
-
-`TREND_MONITOR_ENABLED=false` 只关闭自动趋势调度，不删除历史，也不禁用手动趋势处理。`TREND_INTERVAL_HOURS` 默认为 4，且只用于创建缺失的 TrendMonitor；已有记录继续使用持久化的 `intervalHours`，环境变量变化不会修改它。所有 Key、`SESSION_SECRET` 和 `CSRF_SECRET` 只供服务端读取。真实 `.env`、私有 Feed URL 和授权头不得提交。
-
-## 12. 运行与验证
-
-本地需要 PostgreSQL 和 Redis。API/Web 可用根 `npm run dev` 启动，Worker 必须在另一个终端运行 `npm run dev -w @lettermate/worker`，否则排队的发现任务不会被消费。
-
-验证顺序：
+涉及 Prisma schema 的每个切片都必须生成 Prisma Client 并提交迁移。最终依次运行：
 
 ```powershell
 npm run db:generate
@@ -257,4 +233,44 @@ npm run build
 npm run test:e2e
 ```
 
-默认测试不访问外网。OpenRouter live smoke test 要求同时设置 `RUN_LIVE_AI_TESTS=1` 和 `AI_API_KEY`；TwitterAPI.io live smoke test 要求同时设置 `RUN_LIVE_TWITTERAPI_IO_TESTS=1` 和 `TWITTERAPI_IO_API_KEY`。数据库搜索集成测试还要求 `RUN_DATABASE_TESTS=1` 和可用的 `DATABASE_URL`。Playwright 使用确定性 API 覆盖四个配置视口、六范围中的默认 `30d`/交互 `3d`、来源过滤、提交式文章搜索、点击/下拉刷新、持久化计数、时间分组、禁用措辞和水平溢出。
+## 11. 交付顺序
+
+1. RSS/Atom 关注补身份解析与确认，替换“URL 直接创建”的临时交互。
+2. X Creator 切片：账号候选、身份确认、时间线增量、转发和带原帖的高价值回复，可独立上线。
+3. Bilibili Creator 切片（已完成）：UP 主候选、身份确认和公开视频增量；公开动态与专栏后续单独交付。
+4. Creator 全部有效内容档案、跨来源合并和 Feed 去重（已完成）。
+5. 兴趣反馈（已完成）、个性化筛选与探索推荐。
+6. 每日重点邮件。
+
+### 11.1 共享身份基础（已完成）
+
+1. 在 contracts 中增加解析输入、候选、平台能力和批量创建 schema；候选只暴露短期 `resolutionToken`，不把客户端字段作为账号事实。
+2. 在 API 增加 Resolver registry、令牌签发/校验、`POST /creators/resolve` 和令牌式 `POST /creators`；保留现有 URL 创建路径一个迁移周期，仅供旧客户端兼容。
+3. 为 RSS/Atom 增加 Feed 标题、作者和站点主页解析，返回单一候选预览。
+4. Web 将 URL 表单替换为统一搜索框、平台状态、候选列表和多选确认；未配置平台可见但不可选。
+5. 完成离线 resolver fixtures、令牌篡改/过期、重复账号、多选原子性和所有权测试。
+
+完成条件：名字、Handle 或普通主页即使暂时没有匹配，也会得到明确结果；RSS URL 不再未经预览直接创建；旧 RSS 关注继续运行。
+
+### 11.2 X Creator 切片
+
+1. 基于 TwitterAPI.io 实现用户搜索、主页/Handle 精确解析和稳定用户 ID 固定。
+2. 实现按账号时间线和游标增量同步，规范化原创、连续帖、引用、纯转发及回复。
+3. 转发保存原作者和原内容，回复补父帖并合并连续上下文；缺少父帖的回复不进入 Feed。
+4. 扩展 CreatorItem 和 Feed 合并所需字段，保留全部有效账号内容，只让 `feedEligible` 内容进入 Feed 和邮件候选。
+5. 增加改名、账号不可用、限流、重试、幂等游标、跨博主转发去重和 Web 用户闭环测试。
+6. 使用显式 live smoke 开关验证一个账号搜索和一次时间线读取；测试及日志不得输出 Key。
+
+完成条件：用户输入 X 名字、Handle 或主页，确认候选后可独立完成首次同步、每日增量、手动刷新、暂停/恢复和取消；高质量转发及带原帖回复正确展示；X 完成即可上线。
+
+### 11.3 Bilibili Creator 切片（已完成）
+
+1. 实现 UP 主名字搜索、空间主页解析和稳定 `mid` 固定。
+2. 实现公开视频列表分页和发布时间游标增量，复用现有 Bilibili 请求限制与安全错误映射。
+3. 将视频标题、简介、封面元数据和原始链接规范化为 CreatorItem；正文不足的视频可留在博主详情页，但不能进入 Feed。
+4. 增加改名、空账号、分页幂等、`412`、限流、暂不可用恢复和 X/RSS 故障隔离测试。
+5. 完成候选确认、视频列表和状态展示的 Web/E2E 验收；真实接口只通过显式 live smoke 开关运行。
+
+完成条件：用户输入 UP 主名字或空间主页，确认候选后可完成公开视频首次同步和每日增量；Bilibili 故障不影响 X、RSS、Topic 或 Trend。动态和专栏不阻塞本切片验收。
+
+真实认证、生产邮件供应商配置和外部连接器目标环境验收是正式部署的共同前置条件。

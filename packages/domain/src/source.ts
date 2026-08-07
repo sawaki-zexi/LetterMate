@@ -22,6 +22,16 @@ export interface SourceCandidate {
   language: string | null;
   engagement: Record<string, number>;
   proof: SourceProof;
+  creatorContext?: {
+    contentType: 'original' | 'repost' | 'reply';
+    originalAuthorName: string | null;
+    originalAuthorHandle: string | null;
+    originalContentId: string | null;
+    originalContentUrl: string | null;
+    parentContentId: string | null;
+    parentContentUrl: string | null;
+    parentContentText: string | null;
+  };
 }
 
 export interface ValidatedSourceCandidate extends SourceCandidate {
@@ -171,6 +181,9 @@ export function validateSourceCandidate(input: unknown): ValidatedSourceCandidat
     throw new SourceValidationError('Proof kind is not supported');
   }
   const proof = normalizeProof(input.proof);
+  const creatorContext = input.creatorContext === undefined
+    ? undefined
+    : normalizeCreatorContext(input.creatorContext);
   const candidate: SourceCandidate = {
     connectorId: requireString(input.connectorId, 'Connector ID'),
     sourceType: sourceType.data,
@@ -186,6 +199,7 @@ export function validateSourceCandidate(input: unknown): ValidatedSourceCandidat
     language: requireNullableString(input.language, 'Language'),
     engagement: input.engagement as Record<string, number>,
     proof,
+    ...(creatorContext ? { creatorContext } : {}),
   };
   const connectorId = candidate.connectorId.trim();
   if (connectorId.length === 0) {
@@ -225,5 +239,27 @@ export function validateSourceCandidate(input: unknown): ValidatedSourceCandidat
     language: trimNullable(candidate.language),
     engagement: { ...candidate.engagement },
     proof,
+  };
+}
+
+function normalizeCreatorContext(value: unknown): NonNullable<SourceCandidate['creatorContext']> {
+  if (!isPlainObject(value)) throw new SourceValidationError('Creator context must be a plain object');
+  if (!['original', 'repost', 'reply'].includes(String(value.contentType))) {
+    throw new SourceValidationError('Creator content type is not supported');
+  }
+  const nullable = (field: string): string | null => trimNullable(
+    requireNullableString(value[field], `Creator ${field}`),
+  );
+  const originalContentUrl = nullable('originalContentUrl');
+  const parentContentUrl = nullable('parentContentUrl');
+  return {
+    contentType: value.contentType as 'original' | 'repost' | 'reply',
+    originalAuthorName: nullable('originalAuthorName'),
+    originalAuthorHandle: nullable('originalAuthorHandle'),
+    originalContentId: nullable('originalContentId'),
+    originalContentUrl: originalContentUrl ? canonicalHttpUrl(originalContentUrl, 'Original content URL') : null,
+    parentContentId: nullable('parentContentId'),
+    parentContentUrl: parentContentUrl ? canonicalHttpUrl(parentContentUrl, 'Parent content URL') : null,
+    parentContentText: nullable('parentContentText'),
   };
 }

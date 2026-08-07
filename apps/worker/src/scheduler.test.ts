@@ -99,9 +99,12 @@ describe('PrismaTopicScheduleRepository', () => {
     expect(claimed).toEqual([
       { topicId: 'topic-1', userId: 'user-1', dueAt },
     ]);
+    expect(prisma.topic.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ deletedAt: null, pausedAt: null }),
+    }));
     expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith({
       where: {
-        id: 'topic-1', deletedAt: null,
+        id: 'topic-1', deletedAt: null, pausedAt: null,
         nextRunAt: dueAt,
         OR: [
           { runStatus: { not: 'running' } },
@@ -115,6 +118,27 @@ describe('PrismaTopicScheduleRepository', () => {
         queuedTrigger: 'scheduled',
       },
     });
+  });
+
+  it('does not claim paused topics even when their previous schedule is due', async () => {
+    const prisma = {
+      topic: {
+        findMany: vi.fn().mockResolvedValue([]),
+        updateMany: vi.fn(),
+      },
+    } as unknown as PrismaClient;
+
+    const claimed = await new PrismaTopicScheduleRepository(prisma).claimDueTopics(
+      finishedAt,
+      new Date('2026-07-27T10:10:00.000Z'),
+      50,
+    );
+
+    expect(claimed).toEqual([]);
+    expect(prisma.topic.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ pausedAt: null }),
+    }));
+    expect(prisma.topic.updateMany).not.toHaveBeenCalled();
   });
 
   it('claims a stale initial run even when it has no next scheduled time', async () => {
@@ -141,7 +165,7 @@ describe('PrismaTopicScheduleRepository', () => {
     }]);
     expect((prisma.topic.updateMany as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith({
       where: {
-        id: 'topic-initial', deletedAt: null,
+        id: 'topic-initial', deletedAt: null, pausedAt: null,
         runStatus: 'running',
         runLeaseUntil: leaseExpiredAt,
       },
@@ -213,7 +237,11 @@ describe('startTopicScheduler', () => {
     try {
       await vi.advanceTimersByTimeAsync(0);
       expect(service.scan).toHaveBeenCalledTimes(1);
-      expect(logger.error).toHaveBeenCalledWith('Topic scheduler scan failed');
+      expect(logger.error).toHaveBeenCalledWith(JSON.stringify({
+        code: 'TOPIC_SCHEDULER_SCAN_FAILED',
+        dependency: 'database',
+        message: 'Worker runtime dependency is temporarily unavailable',
+      }));
 
       await vi.advanceTimersByTimeAsync(1_000);
       expect(service.scan).toHaveBeenCalledTimes(2);

@@ -1,32 +1,48 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type {
+  Creator,
+  CreatorItem,
+  CreatorIdentityCandidate,
+  CreatorPlatformStatus,
   DiscoveryKind,
   DiscoverySourceStatus,
+  FeedItem,
   FeedRange,
+  FeedbackValue,
+  InterestMemory,
+  InterestMemoryTheme,
   SourceType,
   Topic,
   TrendStatus,
 } from '@lettermate/contracts';
 import {
   AlertCircle,
+  BadgeCheck,
+  BrainCircuit,
   Check,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   CircleDashed,
   Clock3,
   ExternalLink,
+  EyeOff,
   Inbox,
   Menu,
   Newspaper,
+  Pause,
+  Play,
   Plus,
   Pencil,
   RefreshCw,
+  Rss,
   Search,
   Trash2,
+  UserSearch,
   X,
 } from 'lucide-react';
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
-import { NavLink, Route, Routes, useParams } from 'react-router-dom';
+import { Link, NavLink, Route, Routes, useParams } from 'react-router-dom';
 import { api } from './api.js';
 import { DiscoveryCard } from './components/DiscoveryCard.js';
 import { discoveryKindLabels } from './discovery-display.js';
@@ -46,8 +62,16 @@ import { useTopicRefreshManager, type TopicRefreshNotification } from './use-top
 
 const navigation = [
   { to: '/', label: '发现', icon: Newspaper },
-  { to: '/topics', label: '主题', icon: Search },
+  { to: '/topics', label: '关键词监控', icon: Search },
+  { to: '/creators', label: '博主关注', icon: Rss },
+  { to: '/interests', label: '兴趣记忆', icon: BrainCircuit },
 ];
+
+const creatorPlatformLabels = {
+  rss: 'RSS/Atom',
+  x: 'X',
+  bilibili: 'Bilibili',
+} as const;
 
 const statusLabel: Record<Topic['runStatus'], string> = {
   queued: '等待多源发现',
@@ -256,6 +280,19 @@ function FeedPage() {
     queryKey: ['feed', filter],
     queryFn: () => api.feed(filter),
   });
+  const feedback = useMutation({
+    mutationFn: ({ contentKey, value }: { contentKey: string; value: FeedbackValue | null }) => (
+      api.setFeedback(contentKey, { value })
+    ),
+    onSuccess: (result) => {
+      client.setQueriesData<FeedItem[]>({ queryKey: ['feed'] }, (items) => items?.map((item) => (
+        item.contentKey === result.contentKey ? { ...item, feedback: result.value } : item
+      )));
+      client.setQueriesData<FeedItem>({ queryKey: ['item'] }, (item) => (
+        item?.contentKey === result.contentKey ? { ...item, feedback: result.value } : item
+      ));
+    },
+  });
   const refresh = useRefreshCoordinator({
     topics: topics.data ?? [],
     trendStatus: trendStatus.data,
@@ -277,17 +314,19 @@ function FeedPage() {
     ? topics.data?.some((topic) => topic.id === topicId) === true
     : false;
   const hasTopicTargets = topicId ? hasSelectedTopic : (topics.data?.length ?? 0) > 0;
-  const refreshReady = origin === 'trend'
+  const refreshReady = origin === 'creator'
+    ? false
+    : origin === 'trend'
     ? trendStatus.data !== undefined
     : origin === 'topic'
       ? topics.data !== undefined && hasTopicTargets
       : topics.data !== undefined && trendStatus.data !== undefined;
-  const activeTopicCount = origin === 'trend'
+  const activeTopicCount = origin === 'trend' || origin === 'creator'
     ? 0
     : (topics.data ?? []).filter((topic) => (
         (!topicId || topic.id === topicId) && isRunActive(topic.runStatus)
       )).length;
-  const activeTrendCount = origin !== 'topic'
+  const activeTrendCount = origin !== 'topic' && origin !== 'creator'
     && trendStatus.data
     && isTrendRunActive(trendStatus.data)
     ? 1
@@ -334,7 +373,7 @@ function FeedPage() {
         <RefreshCw className={refreshActive ? 'spin' : undefined} size={18} />
       </div>
       <RefreshFeedback refresh={refresh} active={refreshActive} targetCount={refreshTargetCount} />
-      {origin !== 'topic' && trendStatus.error && (
+      {(origin === 'all' || origin === 'trend') && trendStatus.error && (
         <div className="error-banner">
           <AlertCircle size={18} />
           <div><strong>趋势状态无法加载</strong><span>{trendStatus.error.message}</span></div>
@@ -386,6 +425,7 @@ function FeedPage() {
             >
               <option value="all">全部来源</option>
               <option value="trend">全网趋势</option>
+              <option value="creator">关注博主</option>
               {(topics.data ?? []).map((topic) => (
                 <option key={topic.id} value={topicSourceSelection(topic.id)}>{topic.keyword}</option>
               ))}
@@ -400,6 +440,11 @@ function FeedPage() {
         </div>
       </div>
       <TopicErrors topics={topics.data ?? []} />
+      {feedback.error && (
+        <div className="error-banner" role="alert">
+          <AlertCircle size={18} /><span>{feedback.error.message}</span>
+        </div>
+      )}
       {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
       {!feed.data && <QueryState isLoading={feed.isLoading} error={feed.error} retry={() => void feed.refetch()} />}
       {feed.data?.length === 0 && (
@@ -417,6 +462,8 @@ function FeedPage() {
                     item={item}
                     detailHref={`/items/${item.id}`}
                     headingLevel={3}
+                    feedbackPending={feedback.isPending && feedback.variables?.contentKey === item.contentKey}
+                    onFeedback={(value) => feedback.mutate({ contentKey: item.contentKey, value })}
                   />
                 );
               })}
@@ -433,30 +480,41 @@ function TopicRow({
   pending,
   onRefresh,
   onUpdate,
+  onTogglePaused,
   onDelete,
 }: {
   topic: Topic;
   pending: boolean;
   onRefresh: () => void;
   onUpdate: (input: { keyword: string; expandedTerms: string[] }) => Promise<void>;
+  onTogglePaused: () => Promise<void>;
   onDelete: () => Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [draftKeyword, setDraftKeyword] = useState(topic.keyword);
-  const [draftTerms, setDraftTerms] = useState(topic.expandedTerms);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const save = async () => {
     if (!draftKeyword.trim() || saving) return;
     setSaving(true); setError(null);
     try {
-      await onUpdate({ keyword: draftKeyword.trim(), expandedTerms: draftTerms.map((term) => term.trim()).filter(Boolean) });
+      await onUpdate({ keyword: draftKeyword.trim(), expandedTerms: [] });
       setEditing(false);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '保存失败');
     } finally { setSaving(false); }
   };
+  const togglePaused = async () => {
+    if (saving) return;
+    setSaving(true); setError(null);
+    try {
+      await onTogglePaused();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '状态更新失败');
+    } finally { setSaving(false); }
+  };
+  const paused = topic.pausedAt !== null;
   return (
     <article className="topic-row">
       <div className="topic-row__main">
@@ -470,28 +528,15 @@ function TopicRow({
               onChange={(event) => setDraftKeyword(event.target.value)}
             />
           : <h2>{topic.keyword}</h2>}
-          <span className={`run-state run-state--${topic.runStatus}`}>{statusLabel[topic.runStatus]}</span>
+          <span className={`run-state run-state--${paused ? 'paused' : topic.runStatus}`}>
+            {paused ? '已暂停' : statusLabel[topic.runStatus]}
+          </span>
         </div>
-        <p className="topic-schedule"><Clock3 size={14} />{topic.nextRunAt
+        <p className="topic-schedule"><Clock3 size={14} />{paused
+          ? '已暂停自动更新'
+          : topic.nextRunAt
           ? `下次自动更新 ${new Date(topic.nextRunAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · 每 ${topic.scheduleIntervalHours} 小时`
           : `每 ${topic.scheduleIntervalHours} 小时 · 等待首次自动更新`}</p>
-        {editing
-          ? <div className="term-list" aria-label="扩展词">
-              {draftTerms.map((term, index) => <span className="term-list__item term-list__item--editing" key={index}>
-                <button className="term-list__remove" type="button" aria-label={`删除扩展词 ${term || index + 1}`} onClick={() => setDraftTerms((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={12} /></button>
-                <input
-                  className="term-list__input"
-                  aria-label={`扩展词 ${index + 1}`}
-                  autoFocus={index === draftTerms.length - 1 && !term}
-                  value={term}
-                  maxLength={100}
-                  size={Math.max(4, term.length)}
-                  onChange={(event) => setDraftTerms((current) => current.map((value, itemIndex) => itemIndex === index ? event.target.value : value))}
-                />
-              </span>)}
-              <button className="term-list__add" type="button" onClick={() => setDraftTerms((current) => [...current, ''])}><Plus size={12} />添加扩展词</button>
-            </div>
-          : topic.expandedTerms.length > 0 && <div className="term-list" aria-label="AI 扩展词">{topic.expandedTerms.map((term) => <span className="term-list__item" key={term}>{term}</span>)}</div>}
         {error && <p className="inline-error"><AlertCircle size={15} />{error}</p>}
         {topic.lastError && <p className="inline-error"><AlertCircle size={15} />{topic.lastError.message}</p>}
       </div>
@@ -503,10 +548,18 @@ function TopicRow({
         title="重新搜索"
         aria-label={`刷新 ${topic.keyword}`}
         aria-busy={pending}
-        disabled={pending}
+        disabled={pending || paused}
         onClick={onRefresh}
       ><RefreshCw className={pending ? 'spin' : undefined} size={17} /></button>
-      <button className="icon-button" title="编辑" aria-label={`编辑 ${topic.keyword} 关键词`} onClick={() => { setDraftKeyword(topic.keyword); setDraftTerms(topic.expandedTerms); setEditing(true); }}><Pencil size={17} /></button>
+      <button
+        className="icon-button"
+        type="button"
+        title={paused ? '恢复监控' : '暂停监控'}
+        aria-label={`${paused ? '恢复' : '暂停'} ${topic.keyword} 关键词监控`}
+        disabled={saving}
+        onClick={() => void togglePaused()}
+      >{paused ? <Play size={17} /> : <Pause size={17} />}</button>
+      <button className="icon-button" title="编辑" aria-label={`编辑 ${topic.keyword} 关键词`} onClick={() => { setDraftKeyword(topic.keyword); setEditing(true); }}><Pencil size={17} /></button>
       <button className="icon-button icon-button--danger" title="删除" aria-label={`删除 ${topic.keyword} 关键词`} onClick={() => setConfirmingDelete(true)}><Trash2 size={17} /></button></>}</div>
       {confirmingDelete && <div className="dialog-backdrop"><div className="confirm-dialog" role="dialog" aria-modal="true" aria-label="删除关键词确认">
         <h3>删除“{topic.keyword}”？</h3><p>关键词将从列表移除，历史内容仍会保留并标记为失效。</p>
@@ -541,6 +594,8 @@ function TopicsPage() {
   const [manualTopicRefreshActive, setManualTopicRefreshActive] = useState(false);
   const topics = useTopics(manualTopicRefreshActive);
   const sources = useDiscoverySources();
+  const enabledSourceCount = sources.data?.filter((source) => source.status === 'enabled').length ?? 0;
+  const notConfiguredSourceCount = sources.data?.filter((source) => source.status === 'not_configured').length ?? 0;
   const [keyword, setKeyword] = useState('');
   const [pendingKeyword, setPendingKeyword] = useState<string | null>(null);
   const refresh = useTopicRefreshManager({
@@ -572,6 +627,16 @@ function TopicsPage() {
       void client.invalidateQueries({ queryKey: ['feed'] });
     },
   });
+  const lifecycle = useMutation({
+    mutationFn: ({ id, paused }: { id: string; paused: boolean }) => (
+      paused ? api.resumeTopic(id) : api.pauseTopic(id)
+    ),
+    onSuccess: (topic) => {
+      client.setQueryData<Topic[]>(['topics'], (current = []) => current.map((item) => (
+        item.id === topic.id ? topic : item
+      )));
+    },
+  });
   const remove = useMutation({
     mutationFn: api.deleteTopic,
     onSuccess: (_result, id) => {
@@ -589,16 +654,16 @@ function TopicsPage() {
   };
 
   return (
-    <Page title="主题" description="输入关键词后自动扩展中英文查询，并按计划持续更新">
+      <Page title="关键词监控" description="输入一个关键词，自动发现重要事件与持续更新">
       <TopicRefreshResults
         notifications={refresh.notifications}
         synchronizationStaleTopicIds={refresh.synchronizationStaleTopicIds}
         retrySynchronization={refresh.retrySynchronization}
       />
       <form className="topic-create" onSubmit={submit}>
-        <label htmlFor="topic-keyword">主题关键词</label>
+        <label htmlFor="topic-keyword">监控关键词</label>
         <input id="topic-keyword" value={keyword} maxLength={100} onChange={(event) => setKeyword(event.target.value)} placeholder="例如：AI Agent" />
-        <button className="button" disabled={create.isPending || !keyword.trim()}><Plus size={17} />创建主题</button>
+        <button className="button" disabled={create.isPending || !keyword.trim()}><Plus size={17} />开始监控</button>
       </form>
       {create.error && <div className="error-banner"><AlertCircle size={18} /><span>{create.error.message}</span></div>}
       {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
@@ -607,15 +672,19 @@ function TopicsPage() {
         {(topics.data ?? []).map((topic) => <TopicRow
           key={topic.id}
           topic={topic}
-          pending={refresh.pendingTopicIds.includes(topic.id) || isRunActive(topic.runStatus)}
+          pending={topic.pausedAt === null && (refresh.pendingTopicIds.includes(topic.id) || isRunActive(topic.runStatus))}
           onRefresh={() => void refresh.startTopicRefresh(topic.id)}
           onUpdate={(input) => update.mutateAsync({ id: topic.id, input }).then(() => undefined)}
+          onTogglePaused={() => lifecycle.mutateAsync({
+            id: topic.id,
+            paused: topic.pausedAt !== null,
+          }).then(() => undefined)}
           onDelete={() => remove.mutateAsync(topic.id)}
         />)}
-        {topics.data?.length === 0 && !pendingKeyword && <div className="state"><Search />尚未创建主题</div>}
+        {topics.data?.length === 0 && !pendingKeyword && <div className="state"><Search />尚未创建关键词监控</div>}
       </div>
       <section className="source-status-section">
-        <header><h2>信息来源</h2><span>{sources.data?.filter((source) => source.status === 'enabled').length ?? 0} 个已启用</span></header>
+        <header><h2>信息来源</h2><span>{enabledSourceCount} 个已启用 · {notConfiguredSourceCount} 个未配置</span></header>
         <QueryState isLoading={sources.isLoading} error={sources.error} retry={() => void sources.refetch()} />
         <div className="source-status-list">
           {(sources.data ?? []).map((source: DiscoverySourceStatus) => (
@@ -623,12 +692,480 @@ function TopicsPage() {
               <div><strong>{source.label}</strong><span>{sourceTypeLabel[source.category]}</span></div>
               <span className={`source-state source-state--${source.status}`}>
                 {source.status === 'enabled' ? <CheckCircle2 size={15} /> : <CircleDashed size={15} />}
-                {source.status === 'enabled' ? '已启用' : '待配置'}
+                {source.status === 'enabled' ? '已启用' : '未配置'}
               </span>
             </div>
           ))}
         </div>
       </section>
+    </Page>
+  );
+}
+
+function CreatorRow({
+  creator,
+  pending,
+  onRefresh,
+  onTogglePaused,
+  onDelete,
+}: {
+  creator: Creator;
+  pending: boolean;
+  onRefresh: () => void;
+  onTogglePaused: () => void;
+  onDelete: () => void;
+}) {
+  const paused = creator.pausedAt !== null;
+  const active = isRunActive(creator.runStatus);
+  const sourceUrl = creator.feedUrl ?? creator.profileUrl;
+  return (
+    <article className={`topic-row ${pending ? 'topic-row--pending' : ''}`}>
+      <div className="topic-row__main">
+        <div className="topic-row__title">
+          <h2>{creator.displayName}</h2>
+          <span className={`run-state run-state--${paused ? 'paused' : creator.runStatus}`}>
+            {paused ? '已暂停' : statusLabel[creator.runStatus]}
+          </span>
+        </div>
+        <a className="text-link creator-feed-url" href={sourceUrl} target="_blank" rel="noreferrer noopener">
+          <ExternalLink size={14} />{creatorPlatformLabels[creator.platform]} · {sourceUrl}
+        </a>
+        <p className="topic-schedule"><Clock3 size={14} />{
+          paused
+            ? '已停止每日同步'
+            : creator.nextRunAt
+              ? `下次同步 ${new Date(creator.nextRunAt).toLocaleString('zh-CN')}`
+              : active ? '首次同步已入队' : '等待下次同步'
+        }</p>
+        {creator.lastError && <p className="inline-error"><AlertCircle size={14} />{creator.lastError.message}</p>}
+      </div>
+      <div className="topic-row__actions">
+        <Link className="icon-button" to={`/creators/${encodeURIComponent(creator.id)}`} title="查看内容" aria-label={`查看 ${creator.displayName} 的内容`}>
+          <Newspaper size={17} />
+        </Link>
+        <button className="icon-button" title={paused ? '恢复关注' : '暂停关注'} aria-label={paused ? `恢复关注 ${creator.displayName}` : `暂停关注 ${creator.displayName}`} disabled={pending} onClick={onTogglePaused}>
+          {paused ? <Play size={17} /> : <Pause size={17} />}
+        </button>
+        <button className="icon-button" title="立即同步" aria-label={`立即同步 ${creator.displayName}`} disabled={pending || paused || active} onClick={onRefresh}>
+          <RefreshCw className={pending ? 'spin' : undefined} size={17} />
+        </button>
+        <button className="icon-button icon-button--danger" title="取消关注" aria-label={`取消关注 ${creator.displayName}`} disabled={pending} onClick={onDelete}>
+          <Trash2 size={17} />
+        </button>
+      </div>
+    </article>
+  );
+}
+
+const creatorContentTypeLabels: Record<CreatorItem['contentType'], string> = {
+  original: '原创',
+  repost: '转发',
+  reply: '回复',
+};
+
+function CreatorContentCard({ item }: { item: CreatorItem }) {
+  const author = [item.authorName, item.authorHandle ? `@${item.authorHandle}` : null]
+    .filter(Boolean)
+    .join(' · ');
+  const originalAuthor = [
+    item.originalAuthorName,
+    item.originalAuthorHandle ? `@${item.originalAuthorHandle}` : null,
+  ].filter(Boolean).join(' · ');
+  return (
+    <article className="discovery-card creator-content-card">
+      <div className="discovery-card__topline">
+        <div className="creator-content-card__labels">
+          <span className={`classification classification--${item.kind}`}>{discoveryKindLabels[item.kind]}</span>
+          <span className="creator-content-type">{creatorContentTypeLabels[item.contentType]}</span>
+          <span className={`archive-state ${item.feedEligible ? 'archive-state--eligible' : ''}`}>
+            {item.feedEligible ? '已进入发现' : '仅博主档案'}
+          </span>
+        </div>
+        <div className="discovery-card__meta">
+          <span>{item.platform}</span>
+          <span className="meta"><Clock3 size={14} />{new Date(item.publishedAt ?? item.discoveredAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+        </div>
+      </div>
+      {author && <div className="source-author">{author}</div>}
+      <h2>{item.title}</h2>
+      <p>{item.summary}</p>
+      <p className="discovery-card__reason"><strong>推荐理由</strong>{item.reason}</p>
+      {item.contentType === 'repost' && (originalAuthor || item.originalContentUrl) && (
+        <div className="creator-content-context">
+          <strong>转发原帖</strong>
+          {originalAuthor && <span>{originalAuthor}</span>}
+          {item.originalContentUrl && <a href={item.originalContentUrl} target="_blank" rel="noreferrer noopener"><ExternalLink size={14} />查看原帖</a>}
+        </div>
+      )}
+      {item.contentType === 'reply' && (item.parentContentText || item.parentContentUrl) && (
+        <div className="creator-content-context">
+          <strong>回复原帖</strong>
+          {item.parentContentText && <blockquote>{item.parentContentText}</blockquote>}
+          {item.parentContentUrl && <a href={item.parentContentUrl} target="_blank" rel="noreferrer noopener"><ExternalLink size={14} />查看原帖</a>}
+        </div>
+      )}
+      <div className="discovery-card__footer">
+        <div className="source-links">
+          {item.sourceUrls.map((url) => <a key={url} className="text-link" href={url} target="_blank" rel="noreferrer noopener"><ExternalLink size={15} />查看原文</a>)}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function CreatorItemsPage() {
+  const { id = '' } = useParams();
+  const creators = useQuery({ queryKey: ['creators'], queryFn: api.creators });
+  const items = useQuery({
+    queryKey: ['creator-items', id],
+    queryFn: () => api.creatorItems(id),
+    enabled: Boolean(id),
+  });
+  const creator = creators.data?.find((candidate) => candidate.id === id);
+  return (
+    <Page
+      title={creator?.displayName ?? '博主内容'}
+      description="该账号已同步的全部有效公开内容"
+      action={<Link className="button button--secondary" to="/creators"><ChevronLeft size={16} />返回关注列表</Link>}
+    >
+      {creator && (
+        <div className="creator-archive-summary">
+          <span>{creatorPlatformLabels[creator.platform]}</span>
+          <a href={creator.profileUrl} target="_blank" rel="noreferrer noopener"><ExternalLink size={14} />打开账号主页</a>
+        </div>
+      )}
+      <QueryState isLoading={items.isLoading} error={items.error} retry={() => void items.refetch()} />
+      {items.data?.length === 0 && <div className="state"><Inbox />该博主还没有已同步的公开内容</div>}
+      <div className="creator-content-list">
+        {(items.data ?? []).map((item) => <CreatorContentCard key={item.id} item={item} />)}
+      </div>
+    </Page>
+  );
+}
+
+function CreatorCandidateRow({
+  candidate,
+  selected,
+  onChange,
+}: {
+  candidate: CreatorIdentityCandidate;
+  selected: boolean;
+  onChange: (selected: boolean) => void;
+}) {
+  const [avatarFailed, setAvatarFailed] = useState(false);
+
+  return (
+    <article className={`creator-candidate ${selected ? 'creator-candidate--selected' : ''}`}>
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={(event) => onChange(event.target.checked)}
+        aria-label={`选择 ${candidate.displayName} ${creatorPlatformLabels[candidate.platform]}`}
+      />
+      {candidate.avatarUrl && !avatarFailed
+        ? <img
+            src={candidate.avatarUrl}
+            alt=""
+            width={44}
+            height={44}
+            referrerPolicy="no-referrer"
+            onError={() => setAvatarFailed(true)}
+          />
+        : <div className="creator-candidate__avatar" aria-hidden="true">
+          {candidate.platform === 'rss' ? <Rss size={20} /> : <UserSearch size={20} />}
+        </div>}
+      <div className="creator-candidate__identity">
+        <div>
+          <strong>{candidate.displayName}</strong>
+          {candidate.verified && <BadgeCheck size={15} aria-label="平台认证" />}
+          <span>{creatorPlatformLabels[candidate.platform]}</span>
+        </div>
+        {candidate.handle && <small>{candidate.handle}</small>}
+        {candidate.bio && <p>{candidate.bio}</p>}
+        <a href={candidate.profileUrl} target="_blank" rel="noreferrer noopener">
+          <ExternalLink size={13} />{candidate.profileUrl}
+        </a>
+      </div>
+    </article>
+  );
+}
+
+function CreatorsPage() {
+  const client = useQueryClient();
+  const [input, setInput] = useState('');
+  const [candidates, setCandidates] = useState<CreatorIdentityCandidate[]>([]);
+  const [selectedTokens, setSelectedTokens] = useState<string[]>([]);
+  const [hasResolved, setHasResolved] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const creators = useQuery({
+    queryKey: ['creators'],
+    queryFn: api.creators,
+    refetchInterval: (query) => query.state.data?.some((creator) => isRunActive(creator.runStatus)) ? 1_500 : false,
+  });
+  const platforms = useQuery({
+    queryKey: ['creator-platforms'],
+    queryFn: api.creatorPlatforms,
+  });
+  const refreshData = async () => {
+    await Promise.all([
+      client.invalidateQueries({ queryKey: ['creators'] }),
+      client.invalidateQueries({ queryKey: ['feed'] }),
+    ]);
+  };
+  const resolveCreators = useMutation({
+    mutationFn: api.resolveCreators,
+    onSuccess: ({ candidates: resolved }) => {
+      setCandidates(resolved);
+      setSelectedTokens(resolved.length === 1 ? [resolved[0]!.resolutionToken] : []);
+      setHasResolved(true);
+      setFormError(null);
+    },
+    onError: (error: Error) => {
+      setCandidates([]);
+      setSelectedTokens([]);
+      setHasResolved(true);
+      setFormError(error.message);
+    },
+  });
+  const createCreators = useMutation({
+    mutationFn: api.createCreators,
+    onSuccess: async () => {
+      setInput('');
+      setCandidates([]);
+      setSelectedTokens([]);
+      setHasResolved(false);
+      setFormError(null);
+      await refreshData();
+    },
+    onError: (error: Error) => setFormError(error.message),
+  });
+  const refreshCreator = useMutation({
+    mutationFn: api.refreshCreator,
+    onSuccess: refreshData,
+  });
+  const updateCreator = useMutation({
+    mutationFn: ({ id, paused }: { id: string; paused: boolean }) => api.updateCreator(id, { paused }),
+    onSuccess: refreshData,
+  });
+  const deleteCreator = useMutation({
+    mutationFn: api.deleteCreator,
+    onSuccess: refreshData,
+  });
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const value = input.trim();
+    if (!value) return;
+    setFormError(null);
+    resolveCreators.mutate({ input: value });
+  };
+  const confirm = () => {
+    if (selectedTokens.length === 0) return;
+    setFormError(null);
+    createCreators.mutate({ resolutionTokens: selectedTokens });
+  };
+  const toggleCandidate = (token: string, selected: boolean) => {
+    setSelectedTokens((current) => selected
+      ? [...current, token]
+      : current.filter((candidateToken) => candidateToken !== token));
+  };
+  const pendingId = refreshCreator.isPending
+    ? refreshCreator.variables
+    : updateCreator.isPending
+      ? updateCreator.variables?.id ?? null
+      : deleteCreator.isPending
+        ? deleteCreator.variables
+        : null;
+
+  return (
+    <Page title="博主关注" description="查找并确认公开账号，每日同步新内容">
+      <form className="topic-create" onSubmit={submit}>
+        <label htmlFor="creator-input">博主或主页</label>
+        <input id="creator-input" required maxLength={500} placeholder="名字、Handle 或公开主页 URL" value={input} onChange={(event) => setInput(event.target.value)} />
+        <button className="button" type="submit" disabled={resolveCreators.isPending || createCreators.isPending || !input.trim()}>
+          {resolveCreators.isPending ? <RefreshCw className="spin" size={16} /> : <UserSearch size={16} />}查找
+        </button>
+      </form>
+      {formError && <p className="inline-error"><AlertCircle size={14} />{formError}</p>}
+      {hasResolved && candidates.length === 0 && !formError && (
+        <div className="creator-resolution-empty"><Search size={18} />未找到匹配账号</div>
+      )}
+      {candidates.length > 0 && (
+        <section className="creator-candidates" aria-label="账号候选">
+          <header><div><h2>确认账号</h2><span>{candidates.length} 个候选</span></div>
+            <button className="button" type="button" onClick={confirm} disabled={createCreators.isPending || selectedTokens.length === 0}>
+              {createCreators.isPending ? <RefreshCw className="spin" size={16} /> : <Plus size={16} />}
+              关注{selectedTokens.length > 0 ? ` ${selectedTokens.length}` : ''}
+            </button>
+          </header>
+          <div className="creator-candidate-list">
+            {candidates.map((candidate) => <CreatorCandidateRow
+              key={candidate.resolutionToken}
+              candidate={candidate}
+              selected={selectedTokens.includes(candidate.resolutionToken)}
+              onChange={(selected) => toggleCandidate(candidate.resolutionToken, selected)}
+            />)}
+          </div>
+        </section>
+      )}
+      {!creators.data && <QueryState isLoading={creators.isLoading} error={creators.error} retry={() => void creators.refetch()} />}
+      {creators.data?.length === 0 && <div className="state"><Rss />还没有关注博主</div>}
+      <div className="topic-list">
+        {(creators.data ?? []).map((creator) => (
+          <CreatorRow
+            key={creator.id}
+            creator={creator}
+            pending={pendingId === creator.id}
+            onRefresh={() => refreshCreator.mutate(creator.id)}
+            onTogglePaused={() => updateCreator.mutate({ id: creator.id, paused: !creator.pausedAt })}
+            onDelete={() => deleteCreator.mutate(creator.id)}
+          />
+        ))}
+      </div>
+      <section className="source-status-section">
+        <header><h2>关注平台</h2><span>{platforms.data?.filter((platform) => platform.status === 'enabled').length ?? 0} 个可用</span></header>
+        <QueryState isLoading={platforms.isLoading} error={platforms.error} retry={() => void platforms.refetch()} />
+        <div className="source-status-list">
+          {(platforms.data ?? []).map((platform: CreatorPlatformStatus) => (
+            <div className="source-status-row" key={platform.id}>
+              <div><strong>{platform.label}</strong><span>博主关注</span></div>
+              <span className={`source-state source-state--${platform.status}`}>
+                {platform.status === 'enabled' ? <CheckCircle2 size={15} /> : <CircleDashed size={15} />}
+                {platform.status === 'enabled' ? '可用' : '未配置'}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+    </Page>
+  );
+}
+
+const interestSourceLabels: Record<InterestMemoryTheme['sources'][number], string> = {
+  keyword: '关键词',
+  creator: '博主',
+  feedback: '主动反馈',
+};
+
+function InterestThemeSection({
+  title,
+  themes,
+  pendingId,
+  onForget,
+}: {
+  title: string;
+  themes: InterestMemoryTheme[];
+  pendingId: string | null;
+  onForget: (id: string) => void;
+}) {
+  return (
+    <section className="interest-group">
+      <header><h2>{title}</h2><span>{themes.length}</span></header>
+      {themes.length === 0
+        ? <p className="interest-empty">暂无主题</p>
+        : <div className="interest-theme-list">{themes.map((theme) => (
+            <div className="interest-theme" key={theme.id}>
+              <div className="interest-theme__main">
+                <strong>{theme.name}</strong>
+                <div className="interest-theme__meta">
+                  {theme.sources.map((source) => <span key={source}>{interestSourceLabels[source]}</span>)}
+                  <time dateTime={theme.updatedAt}>{new Date(theme.updatedAt).toLocaleDateString('zh-CN')}</time>
+                </div>
+              </div>
+              <button
+                className="icon-button"
+                type="button"
+                title="忘记主题"
+                aria-label={`忘记兴趣主题 ${theme.name}`}
+                disabled={pendingId !== null}
+                onClick={() => onForget(theme.id)}
+              >{pendingId === theme.id
+                ? <RefreshCw className="spin" size={17} />
+                : <EyeOff size={17} />}</button>
+            </div>
+          ))}</div>}
+    </section>
+  );
+}
+
+function InterestsPage() {
+  const client = useQueryClient();
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const interests = useQuery({ queryKey: ['interests'], queryFn: api.interests });
+  const updateCached = (data: InterestMemory) => {
+    client.setQueryData(['interests'], data);
+    void client.invalidateQueries({ queryKey: ['feed'] });
+  };
+  const settings = useMutation({
+    mutationFn: api.setInterestSettings,
+    onSuccess: updateCached,
+  });
+  const forget = useMutation({
+    mutationFn: api.forgetInterest,
+    onSuccess: updateCached,
+  });
+  const clear = useMutation({
+    mutationFn: api.clearInterestHistory,
+    onSuccess: (data) => {
+      updateCached(data);
+      setConfirmingClear(false);
+    },
+  });
+  const mutationError = settings.error ?? forget.error ?? clear.error;
+
+  return (
+    <Page title="兴趣记忆" description="近期兴趣、长期兴趣与减少推荐">
+      {!interests.data && (
+        <QueryState
+          isLoading={interests.isLoading}
+          error={interests.error}
+          retry={() => void interests.refetch()}
+        />
+      )}
+      {mutationError && <p className="inline-error"><AlertCircle size={15} />{mutationError.message}</p>}
+      {interests.data && <>
+        <section className="interest-settings">
+          <div><h2>个性化排序</h2><p>{interests.data.personalizationEnabled ? '已开启' : '已暂停'}</p></div>
+          <label className="toggle-control">
+            <input
+              type="checkbox"
+              aria-label="个性化排序"
+              checked={interests.data.personalizationEnabled}
+              disabled={settings.isPending}
+              onChange={(event) => settings.mutate({ personalizationEnabled: event.target.checked })}
+            />
+            <span aria-hidden="true" />
+          </label>
+          <button
+            className="button button--secondary interest-clear"
+            type="button"
+            onClick={() => setConfirmingClear(true)}
+          ><Trash2 size={16} />清空历史</button>
+        </section>
+        <div className="interest-groups">
+          <InterestThemeSection
+            title="近期兴趣"
+            themes={interests.data.recent}
+            pendingId={forget.isPending ? forget.variables : null}
+            onForget={(id) => forget.mutate(id)}
+          />
+          <InterestThemeSection
+            title="长期兴趣"
+            themes={interests.data.longTerm}
+            pendingId={forget.isPending ? forget.variables : null}
+            onForget={(id) => forget.mutate(id)}
+          />
+          <InterestThemeSection
+            title="减少推荐"
+            themes={interests.data.reduced}
+            pendingId={forget.isPending ? forget.variables : null}
+            onForget={(id) => forget.mutate(id)}
+          />
+        </div>
+        {confirmingClear && <div className="dialog-backdrop"><div className="confirm-dialog" role="dialog" aria-modal="true" aria-label="清空兴趣历史确认">
+          <h3>清空兴趣历史？</h3><p>主动反馈和博主内容形成的兴趣会重新学习，正在关注的关键词仍会保留。</p>
+          <div><button className="text-button" disabled={clear.isPending} onClick={() => setConfirmingClear(false)}>取消</button><button className="button button--danger" autoFocus disabled={clear.isPending} onClick={() => clear.mutate()}>{clear.isPending && <RefreshCw className="spin" size={16} />}确认清空</button></div>
+        </div></div>}
+      </>}
     </Page>
   );
 }
@@ -680,7 +1217,7 @@ export default function App() {
     </aside>
     <div className="workspace">
       <header className="mobile-header"><button className="icon-button" title="菜单" aria-label="菜单" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={20} /></button><strong>LetterMate</strong><span className="live-dot" /></header>
-      <Routes><Route path="/" element={<FeedPage />} /><Route path="/topics" element={<TopicsPage />} /><Route path="/items/:id" element={<ItemPage />} /></Routes>
+      <Routes><Route path="/" element={<FeedPage />} /><Route path="/topics" element={<TopicsPage />} /><Route path="/creators" element={<CreatorsPage />} /><Route path="/creators/:id" element={<CreatorItemsPage />} /><Route path="/interests" element={<InterestsPage />} /><Route path="/items/:id" element={<ItemPage />} /></Routes>
     </div>
     <nav className="bottom-nav">{navigation.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'}><Icon size={19} /><span>{label}</span></NavLink>)}</nav>
   </div>;

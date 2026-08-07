@@ -46,7 +46,7 @@ describe('multi-source Prisma schema', () => {
   it('stores topic scheduling state and source-aware discovery items', () => {
     expect(fieldNames('Topic')).toEqual(expect.arrayContaining([
       'nextRunAt', 'scheduleIntervalHours', 'productiveRunStreak', 'emptyRunStreak', 'runs',
-      'deletedAt', 'variantsInitialized',
+      'deletedAt', 'pausedAt', 'variantsInitialized', 'keywordProfile',
     ]));
     expect(fieldNames('DiscoveryItem')).toEqual(expect.arrayContaining([
       'sourceType', 'platform', 'authorName', 'authorHandle', 'externalId', 'provenanceKind',
@@ -59,7 +59,7 @@ describe('multi-source Prisma schema', () => {
     expect(fieldNames('DiscoveryRun')).toEqual(expect.arrayContaining([
       'topicId', 'trigger', 'status', 'startedAt', 'finishedAt', 'connectorSummary',
       'candidateCount', 'acceptedCount', 'newItemCount', 'error', 'keywordSnapshot',
-      'expandedTermsSnapshot',
+      'expandedTermsSnapshot', 'keywordProfileSnapshot',
     ]));
   });
 
@@ -262,5 +262,190 @@ describe('multi-source Prisma schema', () => {
     expect(normalizedMigration).toContain('DROP INDEX "Topic_userId_normalizedKeyword_key";');
     expect(normalizedMigration).toContain('CREATE UNIQUE INDEX "Topic_userId_normalizedKeyword_active_key" ON "Topic"("userId", "normalizedKeyword") WHERE "deletedAt" IS NULL;');
     expect(normalizedMigration).toContain('CREATE INDEX "Topic_userId_deletedAt_createdAt_idx" ON "Topic"("userId", "deletedAt", "createdAt");');
+  });
+
+  it('supports stable X creator accounts and content relationships', () => {
+    expect(schema).toContain('enum CreatorPlatform {\n  rss\n  x\n  bilibili\n}');
+    expect(fieldLine('CreatorSubscription', 'feedUrl')).toMatch(/^String\?/);
+    expect(fieldNames('CreatorItem')).toEqual(expect.arrayContaining([
+      'contentType', 'originalAuthorName', 'originalAuthorHandle', 'originalContentId',
+      'originalContentUrl', 'parentContentId', 'parentContentUrl', 'parentContentText',
+    ]));
+    const migrationPath = join(process.cwd(), 'prisma', 'migrations', '20260807_x_creator_support', 'migration.sql');
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('ALTER TYPE "CreatorPlatform" ADD VALUE \'x\';');
+    expect(migration).toContain('CREATE TYPE "CreatorContentType" AS ENUM');
+    const bilibiliMigrationPath = join(process.cwd(), 'prisma', 'migrations', '20260807_bilibili_creator_support', 'migration.sql');
+    const bilibiliMigration = existsSync(bilibiliMigrationPath) ? readFileSync(bilibiliMigrationPath, 'utf8') : '';
+    expect(bilibiliMigration).toContain('ALTER TYPE "CreatorPlatform" ADD VALUE \'bilibili\';');
+  });
+
+  it('stores one user-owned feedback value per normalized content key', () => {
+    expect(schema).toContain("enum FeedbackValue {\n  interested\n  less\n}");
+    expect(fieldNames('ContentFeedback')).toEqual(expect.arrayContaining([
+      'id', 'userId', 'contentKey', 'value', 'createdAt', 'updatedAt', 'user',
+    ]));
+    expect(uniqueConstraints('ContentFeedback')).toContainEqual(['userId', 'contentKey']);
+    expect(relation('ContentFeedback', 'user')).toMatchObject({
+      relationFromFields: ['userId'],
+      relationOnDelete: 'Cascade',
+    });
+    expect(fieldNames('User')).toContain('feedback');
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260808_content_feedback', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain(
+      'CREATE UNIQUE INDEX "ContentFeedback_userId_contentKey_key" ON "ContentFeedback"("userId", "contentKey");',
+    );
+    expect(migration).toContain(
+      'ALTER TABLE "ContentFeedback" ADD CONSTRAINT "ContentFeedback_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;',
+    );
+  });
+
+  it('persists the inferred keyword profile and snapshots it for each run', () => {
+    expect(fieldLine('Topic', 'keywordProfile')).toContain('KeywordProfileKind');
+    expect(fieldLine('Topic', 'keywordProfile')).toContain('@default(unknown)');
+    expect(fieldLine('DiscoveryRun', 'keywordProfileSnapshot')).toContain('KeywordProfileKind');
+    expect(fieldLine('DiscoveryRun', 'keywordProfileSnapshot')).toContain('@default(unknown)');
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260806_keyword_monitoring_profile', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    const normalizedMigration = migration.replace(/\s+/g, ' ').trim();
+
+    expect(normalizedMigration).toContain(
+      `CREATE TYPE "KeywordProfileKind" AS ENUM ('entity', 'domain', 'unknown');`,
+    );
+    expect(normalizedMigration).toContain(
+      `ADD COLUMN "keywordProfile" "KeywordProfileKind" NOT NULL DEFAULT 'unknown';`,
+    );
+    expect(normalizedMigration).toContain(
+      `ADD COLUMN "keywordProfileSnapshot" "KeywordProfileKind" NOT NULL DEFAULT 'unknown';`,
+    );
+  });
+
+  it('persists Topic pause state and indexes it with the next run time', () => {
+    expect(fieldLine('Topic', 'pausedAt')).toMatch(/^DateTime\?/);
+    expect(modelSource('Topic')).toContain('@@index([pausedAt, nextRunAt])');
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260806_topic_monitor_pause', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    const normalizedMigration = migration.replace(/\s+/g, ' ').trim();
+
+    expect(normalizedMigration).toContain('ADD COLUMN "pausedAt" TIMESTAMP(3);');
+    expect(normalizedMigration).toContain(
+      'CREATE INDEX "Topic_pausedAt_nextRunAt_idx" ON "Topic"("pausedAt", "nextRunAt");',
+    );
+  });
+
+  it('stores versioned interest tags and an auditable current-state event ledger', () => {
+    expect(modelNames()).toEqual(expect.arrayContaining([
+      'InterestTag', 'ContentInterestTag', 'InterestEvent',
+    ]));
+    expect(fieldNames('InterestTag')).toEqual(expect.arrayContaining([
+      'slug', 'displayName', 'parentId', 'kind', 'status', 'taxonomyVersion',
+    ]));
+    expect(uniqueConstraints('InterestTag')).toContainEqual(['slug', 'taxonomyVersion']);
+    expect(fieldNames('ContentInterestTag')).toEqual(expect.arrayContaining([
+      'contentKey', 'tagId', 'confidence', 'extractorVersion', 'createdAt',
+    ]));
+    expect(fieldNames('InterestEvent')).toEqual(expect.arrayContaining([
+      'userId', 'eventType', 'sourceRef', 'activeKey', 'payload',
+      'occurredAt', 'recordedAt', 'supersededAt',
+    ]));
+    expect(uniqueConstraints('InterestEvent')).toContainEqual(['userId', 'eventType', 'activeKey']);
+    expect(relation('InterestEvent', 'user')).toMatchObject({
+      relationFromFields: ['userId'],
+      relationOnDelete: 'Cascade',
+    });
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260808_interest_memory_a1', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TABLE "InterestTag"');
+    expect(migration).toContain('CREATE TABLE "ContentInterestTag"');
+    expect(migration).toContain('CREATE TABLE "InterestEvent"');
+    expect(migration).toContain(
+      'CREATE UNIQUE INDEX "InterestEvent_userId_eventType_activeKey_key" ON "InterestEvent"("userId", "eventType", "activeKey");',
+    );
+  });
+
+  it('stores rebuildable profiles and versioned shadow recommendation decisions', () => {
+    expect(modelNames()).toEqual(expect.arrayContaining([
+      'UserInterestProfile', 'InterestProfileVersion',
+      'RecommendationDecision', 'RecommendationDecisionItem',
+    ]));
+    expect(fieldNames('UserInterestProfile')).toEqual(expect.arrayContaining([
+      'userId', 'tagId', 'shortScore', 'longScore', 'negativeScore',
+      'evidenceUpdatedAt', 'computedAt', 'profileVersion',
+    ]));
+    expect(fieldNames('InterestProfileVersion')).toEqual(expect.arrayContaining([
+      'userId', 'version', 'throughEventId', 'computedAt', 'policyVersion',
+    ]));
+    expect(fieldNames('RecommendationDecision')).toEqual(expect.arrayContaining([
+      'userId', 'surface', 'requestKey', 'profileVersion', 'rankingVersion',
+      'candidateVersion', 'asOf', 'createdAt',
+    ]));
+    expect(uniqueConstraints('RecommendationDecision')).toContainEqual([
+      'userId', 'surface', 'requestKey',
+    ]);
+    expect(fieldNames('RecommendationDecisionItem')).toEqual(expect.arrayContaining([
+      'decisionId', 'contentKey', 'position', 'lane', 'isExploration', 'reasonCodes',
+    ]));
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260808_interest_memory_a2_shadow', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TABLE "UserInterestProfile"');
+    expect(migration).toContain('CREATE TABLE "InterestProfileVersion"');
+    expect(migration).toContain('CREATE TABLE "RecommendationDecision"');
+    expect(migration).toContain('CREATE TABLE "RecommendationDecisionItem"');
+    expect(migration).toContain(
+      'CREATE UNIQUE INDEX "RecommendationDecision_userId_surface_requestKey_key"',
+    );
+  });
+
+  it('stores user-owned personalization controls separately from interest history', () => {
+    expect(modelNames()).toEqual(expect.arrayContaining([
+      'InterestMemorySettings', 'ForgottenInterestTag',
+    ]));
+    expect(fieldNames('InterestMemorySettings')).toEqual(expect.arrayContaining([
+      'userId', 'personalizationEnabled', 'resetAt', 'updatedAt',
+    ]));
+    expect(fieldNames('ForgottenInterestTag')).toEqual(expect.arrayContaining([
+      'userId', 'tagId', 'createdAt',
+    ]));
+    expect(fieldNames('UserInterestProfile')).toContain('sourceKinds');
+    expect(relation('ForgottenInterestTag', 'user')).toMatchObject({
+      relationFromFields: ['userId'], relationOnDelete: 'Cascade',
+    });
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260808_interest_memory_a3_controls', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TABLE "InterestMemorySettings"');
+    expect(migration).toContain('CREATE TABLE "ForgottenInterestTag"');
+    expect(migration).toContain(
+      'ALTER TABLE "UserInterestProfile" ADD COLUMN "sourceKinds" TEXT[]',
+    );
+    const backfillPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260808_interest_memory_a3_fact_backfill', 'migration.sql',
+    );
+    const backfill = existsSync(backfillPath) ? readFileSync(backfillPath, 'utf8') : '';
+    expect(backfill).toContain("'backfill-topic-' || topic.\"id\"");
+    expect(backfill).toContain("'backfill-creator-' || creator.\"id\"");
+    expect(backfill).toContain("'backfill-feedback-' || feedback.\"id\"");
+    expect(backfill.match(/ON CONFLICT \("userId", "eventType", "activeKey"\) DO NOTHING;/g))
+      .toHaveLength(3);
   });
 });

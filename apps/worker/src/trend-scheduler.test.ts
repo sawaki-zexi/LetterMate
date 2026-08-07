@@ -344,7 +344,11 @@ describe('TrendScheduleService', () => {
     expect(queue.add).toHaveBeenCalledTimes(2);
     expect(repository.releaseClaim).toHaveBeenCalledOnce();
     expect(repository.releaseClaim).toHaveBeenCalledWith(claims[0]);
-    expect(logger.error).toHaveBeenCalledWith('Trend scheduler enqueue failed; claim released');
+    expect(logger.error).toHaveBeenCalledWith(JSON.stringify({
+      code: 'TREND_SCHEDULER_REDIS_UNAVAILABLE',
+      dependency: 'redis',
+      message: 'Trend scheduler enqueue failed; claim released',
+    }));
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('secret');
   });
 });
@@ -385,7 +389,11 @@ describe('startTrendScheduler', () => {
     const scheduler = startTrendScheduler(service, { logger });
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(logger.error).toHaveBeenCalledWith('Trend scheduler scan failed');
+    expect(logger.error).toHaveBeenCalledWith(JSON.stringify({
+      code: 'TREND_SCHEDULER_SCAN_FAILED',
+      dependency: 'database',
+      message: 'Worker runtime dependency is temporarily unavailable',
+    }));
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('secret');
     scheduler.close();
   });

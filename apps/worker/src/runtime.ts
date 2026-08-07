@@ -9,8 +9,9 @@ import { HackerNewsConnector } from './connectors/hacker-news.js';
 import { OpenRouterSearchConnector } from './connectors/openrouter-search.js';
 import { RedditConnector } from './connectors/reddit.js';
 import { RssConnector } from './connectors/rss.js';
-import { TavilyConnector } from './connectors/tavily.js';
 import { SearchProviderConnector } from './connectors/search-provider.js';
+import { StackExchangeConnector } from './connectors/stack-exchange.js';
+import { TavilyConnector } from './connectors/tavily.js';
 import { TwitterApiIoConnector } from './connectors/twitterapi-io.js';
 import type { SourceConnector } from './connectors/types.js';
 import { YouTubeConnector } from './connectors/youtube.js';
@@ -34,8 +35,12 @@ export function createSourceConnectors(
       timeoutMs: config.AI_TIMEOUT_MS,
     }, fetcher),
     new TwitterApiIoConnector({ apiKey: config.TWITTERAPI_IO_API_KEY }, fetcher),
-    new RssConnector({ feedUrls: config.DISCOVERY_RSS_FEED_URLS }, fetcher),
+    new RssConnector(
+      { feedUrls: config.DISCOVERY_RSS_FEED_URLS },
+      new ContentFetcher({ maxBytes: 512_000 }, fetcher),
+    ),
     new HackerNewsConnector(fetcher),
+    new StackExchangeConnector(fetcher),
     new ArxivConnector(fetcher),
     new GitHubConnector({ token: config.GITHUB_TOKEN }, fetcher),
     new SearchProviderConnector({

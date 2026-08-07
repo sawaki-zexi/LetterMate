@@ -19,7 +19,7 @@ export type QualityAiGateway = Pick<AiGateway, 'evaluateCandidates' | 'composeIt
 export type { QualityAssessment, QualityAssessmentCandidate } from './ai-gateway.js';
 export interface QualityPipelineInput {
   keyword: string; candidates: ValidatedSourceCandidate[]; historyUrls: string[];
-  windowStart: string; windowEnd: string; matchPolicy: KeywordPolicy; signal?: AbortSignal;
+  windowStart: string; windowEnd: string; matchPolicy?: KeywordPolicy; signal?: AbortSignal;
 }
 interface ContentFetcherLike { fetchText(url: string, signal?: AbortSignal): Promise<FetchedText> }
 
@@ -65,10 +65,9 @@ export class QualityPipeline {
       });
       return !rejection.rejected || rejection.reason === 'INSUFFICIENT_CONTENT';
     });
-    const preferredUrlDuplicates = preferPolicyMatchingUrlDuplicates(
-      preliminarilyEligible,
-      input.matchPolicy,
-    );
+    const preferredUrlDuplicates = input.matchPolicy
+      ? preferPolicyMatchingUrlDuplicates(preliminarilyEligible, input.matchPolicy)
+      : preliminarilyEligible;
     const deduplicated = deduplicateCandidates(
       preferredUrlDuplicates,
       { includeFingerprint: false },
@@ -91,9 +90,9 @@ export class QualityPipeline {
         // High precision mode drops candidates whose required body cannot be fetched safely.
       }
     }
-    const policyMatched = enriched.filter(
-      (item) => candidateMatchesKeyword(item, input.matchPolicy),
-    );
+    const policyMatched = input.matchPolicy
+      ? enriched.filter((item) => candidateMatchesKeyword(item, input.matchPolicy!))
+      : enriched;
     const qualified = policyMatched.filter((item) => !rejectCandidate(item, {
       windowStart: input.windowStart,
       windowEnd: input.windowEnd,
