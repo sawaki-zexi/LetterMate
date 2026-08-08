@@ -39,10 +39,16 @@ const tweetSchema = z.object({
 }).passthrough();
 
 const timelineResponseSchema = z.object({
-  tweets: z.array(z.unknown()),
+  tweets: z.array(z.unknown()).optional(),
+  data: z.object({ tweets: z.array(z.unknown()) }).passthrough().optional(),
   has_next_page: z.boolean().optional(),
   next_cursor: z.string().optional().nullable(),
-}).passthrough();
+}).passthrough()
+  .refine((response) => response.tweets !== undefined || response.data?.tweets !== undefined)
+  .transform((response) => ({
+    ...response,
+    tweets: response.tweets ?? response.data?.tweets ?? [],
+  }));
 
 const tweetsResponseSchema = z.object({ tweets: z.array(z.unknown()) }).passthrough();
 const threadResponseSchema = z.object({

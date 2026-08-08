@@ -520,9 +520,9 @@ describe('topic store multi-source mappings', () => {
       ranked: [...candidates].reverse().map((item, position) => ({
         contentKey: item.contentKey,
         position,
-        lane: 'subscription',
-        isExploration: false,
-        reasonCodes: ['FOLLOWED_TOPIC'],
+        lane: position === 0 ? 'exploration' : 'subscription',
+        isExploration: position === 0,
+        reasonCodes: position === 0 ? ['ADJACENT_EXPLORATION'] : ['FOLLOWED_TOPIC'],
       })),
     }));
     const store = new MemoryTopicStore(
@@ -540,6 +540,9 @@ describe('topic store multi-source mappings', () => {
     const feed = await store.listFeed('user-1', { origin: 'all', since: null });
     expect(feed.map((item) => item.id)).toEqual([older.id, newer.id]);
     expect(feed[0]?.recommendation).toEqual({
+      lane: 'exploration', reason: 'exploration', isExploration: true,
+    });
+    expect(feed[1]?.recommendation).toEqual({
       lane: 'subscription', reason: 'followed_topic', isExploration: false,
     });
     expect(select).toHaveBeenCalledWith(expect.objectContaining({

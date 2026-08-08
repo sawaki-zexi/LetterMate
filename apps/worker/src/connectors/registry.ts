@@ -15,6 +15,7 @@ interface ValidatedConnectorResult {
 export interface ConnectorRegistryOptions {
   concurrency: number;
   timeoutMs: number;
+  onFailure?: (failure: ConnectorFailure) => void;
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> => {
@@ -238,6 +239,7 @@ export class ConnectorRegistry {
       }
       if (!added) break;
     }
+    for (const failure of failures) this.options.onFailure?.(failure);
 
     return {
       candidates,

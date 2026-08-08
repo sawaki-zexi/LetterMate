@@ -88,6 +88,16 @@ describe('DiscoveryCard', () => {
     expect(screen.queryByText(/score|权重|置信度|tag-/i)).not.toBeInTheDocument();
   });
 
+  it('clearly labels exploration without exposing internal adjacency data', () => {
+    render(<DiscoveryCard item={{
+      ...topicItem,
+      recommendation: { lane: 'exploration', reason: 'exploration', isExploration: true },
+    }} />);
+
+    expect(screen.getByText('拓展发现')).toBeVisible();
+    expect(screen.queryByText(/adjacen|tag-|置信度|权重|score/i)).not.toBeInTheDocument();
+  });
+
   it('shows every merged discovery and distinguishes creator reposts', () => {
     render(<DiscoveryCard item={{
       ...topicItem,

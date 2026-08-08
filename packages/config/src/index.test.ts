@@ -12,7 +12,40 @@ describe('configuration', () => {
     expect(parseConfig({ NODE_ENV: 'development' })).toMatchObject({
       PORT: 3000,
       WEB_ORIGIN: 'http://localhost:5173',
+      ALLOW_DEV_IDENTITY: true,
+      SMTP_ENABLED: false,
+      SMTP_PORT: 587,
+      SMTP_SECURE: false,
+      SMTP_REQUIRE_TLS: true,
     });
+  });
+
+  it('validates complete SMTP configuration without exposing credentials', () => {
+    expect(parseConfig({
+      SMTP_ENABLED: 'true',
+      SMTP_HOST: 'smtp.example.com',
+      SMTP_PORT: '465',
+      SMTP_SECURE: 'true',
+      SMTP_USER: 'mailer',
+      SMTP_PASSWORD: 'secret',
+      SMTP_FROM: 'LetterMate <digest@example.com>',
+      SMTP_MESSAGE_ID_DOMAIN: 'mail.example.com',
+    })).toMatchObject({
+      SMTP_ENABLED: true,
+      SMTP_HOST: 'smtp.example.com',
+      SMTP_PORT: 465,
+      SMTP_SECURE: true,
+      SMTP_USER: 'mailer',
+      SMTP_PASSWORD: 'secret',
+      SMTP_FROM: 'LetterMate <digest@example.com>',
+      SMTP_MESSAGE_ID_DOMAIN: 'mail.example.com',
+    });
+    expect(() => parseConfig({ SMTP_ENABLED: 'true' })).toThrow(/SMTP_HOST, SMTP_FROM/);
+    expect(() => parseConfig({
+      SMTP_ENABLED: 'true', SMTP_HOST: 'smtp.example.com', SMTP_FROM: 'digest@example.com',
+      SMTP_USER: 'mailer',
+    })).toThrow(/configured together/);
+    expect(() => parseConfig({ SMTP_MESSAGE_ID_DOMAIN: 'https://mail.example.com' })).toThrow();
   });
 
   it('provides bounded discovery execution defaults', () => {
@@ -182,7 +215,22 @@ describe('configuration', () => {
         NODE_ENV: 'production',
         SESSION_SECRET: 's'.repeat(32),
         CSRF_SECRET: 'c'.repeat(32),
+        ALLOW_DEV_IDENTITY: 'false',
       }),
     ).not.toThrow();
+  });
+
+  it('requires production to disable the development identity', () => {
+    expect(() => parseConfig({
+      NODE_ENV: 'production',
+      SESSION_SECRET: 's'.repeat(32),
+      CSRF_SECRET: 'c'.repeat(32),
+    })).toThrow(/ALLOW_DEV_IDENTITY/);
+    expect(parseConfig({
+      NODE_ENV: 'production',
+      SESSION_SECRET: 's'.repeat(32),
+      CSRF_SECRET: 'c'.repeat(32),
+      ALLOW_DEV_IDENTITY: 'false',
+    }).ALLOW_DEV_IDENTITY).toBe(false);
   });
 });

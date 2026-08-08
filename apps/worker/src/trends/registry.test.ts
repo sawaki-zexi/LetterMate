@@ -126,11 +126,12 @@ describe('TrendSourceRegistry', () => {
   });
 
   it('isolates safe failures and never exposes private errors', async () => {
+    const onFailure = vi.fn();
     const registry = new TrendSourceRegistry([
       source('safe', { collect: async () => { throw new TrendSourceError('TREND_RATE_LIMITED', 'Trend source rate limited', true); } }),
       source('private', { collect: async () => { throw new Error('secret upstream body and stack'); } }),
       source('working', { collect: async () => ({ candidates: [candidate('working', 'ok')], requestCount: 1 }) }),
-    ], { concurrency: 3, timeoutMs: 1_000 });
+    ], { concurrency: 3, timeoutMs: 1_000, onFailure });
 
     const result = await registry.collect(window);
 
@@ -140,6 +141,10 @@ describe('TrendSourceRegistry', () => {
       { sourceId: 'private', code: 'TREND_SOURCE_UNAVAILABLE', message: 'Trend source is temporarily unavailable', retryable: true },
     ]);
     expect(JSON.stringify(result)).not.toContain('secret');
+    expect(onFailure).toHaveBeenCalledTimes(2);
+    expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({
+      sourceId: 'private', code: 'TREND_SOURCE_UNAVAILABLE',
+    }));
   });
 
   it('aborts timed-out sources without waiting for late rejections', async () => {

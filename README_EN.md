@@ -20,7 +20,7 @@
 LetterMate combines exact-keyword tracking and automatic technology-trend discovery in one Feed. It searches multiple external sources, enriches candidate content, checks support for core claims, deduplicates results, and uses AI review to produce Chinese summaries and recommendation reasons with original links.
 
 > [!WARNING]
-> LetterMate is currently alpha software. The core discovery, scheduling, Feed, and refresh flows are implemented, but identity still uses a fixed `x-user-id: user-a` development header. Production login, server-side sessions, and CSRF are not implemented. Do not expose the current version to an untrusted network.
+> LetterMate is currently alpha software. Real login, server-side Session Cookies, CSRF protection, single-instance login throttling, and session revocation are implemented. Development still defaults to `ALLOW_DEV_IDENTITY=true`; production must configure strong random `SESSION_SECRET` and `CSRF_SECRET` values and set `ALLOW_DEV_IDENTITY=false`.
 
 ## Table of Contents
 
@@ -151,6 +151,23 @@ BING_SEARCH_ENABLED=true
 
 Brave remains available through `SEARCH_PROVIDER=brave` and `SEARCH_API_KEY`. Restart the Worker after changing `.env`.
 
+Daily email is disabled until SMTP is configured. A minimal production configuration is:
+
+```env
+SMTP_ENABLED=true
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_REQUIRE_TLS=true
+SMTP_FROM=LetterMate <digest@example.com>
+SMTP_USER=
+SMTP_PASSWORD=
+```
+
+Leave both authentication values empty for an unauthenticated local relay. If SMTP is not configured, discovery and Feed remain available and digest scheduling is not started.
+
+To rotate credentials, update the server-side secret and restart the Worker, verify the new live smoke, then revoke the old credential. Set `SMTP_ENABLED=false` and restart the Worker to disable delivery.
+
 ### 3. Start infrastructure and apply migrations
 
 ```powershell
@@ -182,7 +199,7 @@ See [`.env.example`](./.env.example) for the complete definition and non-sensiti
 | Group | Variables | Purpose |
 | --- | --- | --- |
 | Infrastructure | `DATABASE_URL`, `REDIS_URL`, `WEB_ORIGIN` | PostgreSQL, Redis, and Web origin |
-| Reserved auth | `SESSION_SECRET`, `CSRF_SECRET` | Reserved for the future production identity layer; full auth is not active |
+| Authentication | `SESSION_SECRET`, `CSRF_SECRET`, `ALLOW_DEV_IDENTITY` | Session HMAC, CSRF, and the development identity switch; production must disable it |
 | AI | `AI_API_KEY`, `AI_MODEL`, `AI_WEB_SEARCH`, `AI_TIMEOUT_MS` | OpenRouter search, assessment, and composition |
 | Optional sources | `TWITTERAPI_IO_API_KEY`, `GITHUB_TOKEN`, `YOUTUBE_API_KEY` | X, GitHub, and YouTube |
 | Reddit | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth |
@@ -193,6 +210,8 @@ See [`.env.example`](./.env.example) for the complete definition and non-sensiti
 | Discovery scheduling | `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | Timeout, concurrency, and Topic scheduling |
 | Trend scheduling | `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | Trend switch and initial interval for a missing monitor |
 | Trend scope | `TREND_X_WOEIDS`, `TREND_YOUTUBE_REGION`, `TREND_REDDIT_COMMUNITIES` | Regions and communities |
+| Daily email | `SMTP_ENABLED`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_REQUIRE_TLS`, `SMTP_FROM` | Production SMTP delivery and TLS |
+| Email authentication | `SMTP_USER`, `SMTP_PASSWORD` | Optional SMTP authentication; configure both together |
 
 Missing optional credentials disable only the corresponding connectors. `TREND_INTERVAL_HOURS` is used only when provisioning a missing TrendMonitor; existing records always use their persisted `intervalHours`.
 
@@ -202,6 +221,10 @@ All business endpoints are under `/api/v1`:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| `POST` | `/auth/register` | Create an account and issue Session Cookies |
+| `POST` | `/auth/login` | Throttled login and Session Cookie issuance |
+| `POST` | `/auth/logout` | Validate CSRF, revoke the session, and clear cookies |
+| `GET` | `/auth/session` | Read the current user and CSRF token |
 | `POST` | `/topics` | Create an exact-keyword Topic and enqueue its initial run |
 | `GET` | `/topics` | Read Topics, schedules, and latest run summaries |
 | `POST` | `/topics/:id/refresh` | Register a manual Topic refresh |
@@ -226,6 +249,9 @@ The Feed supports `range=1d|3d|7d|30d|90d|all`, `origin=all|topic|trend`, `kind=
 | `npm run test:e2e` | Run Playwright desktop, tablet, and mobile flows |
 | `npm run db:migrate` | Create a local Prisma development migration |
 | `npm run db:deploy` | Apply committed migrations |
+| `npm run db:backup` | Create a PostgreSQL custom-format backup and SHA-256 manifest, then apply retention |
+| `npm run db:backup:verify -- <backup-path>` | Verify the backup size, SHA-256 digest, and manifest |
+| `npm run db:restore:verify -- <backup-path>` | Restore into a temporary isolated database and verify tables and migrations |
 
 Default tests do not access external services. Live smoke tests require an explicit flag and matching key:
 
@@ -235,23 +261,36 @@ npm test -- apps/worker/src/openrouter.live.test.ts
 
 $env:RUN_LIVE_TWITTERAPI_IO_TESTS='1'
 npm test -- apps/worker/src/twitterapi-io.live.test.ts
+
+$env:RUN_LIVE_EMAIL_TESTS='1'
+npm test -- apps/worker/src/smtp-email.live.test.ts
 ```
+
+The SMTP smoke test also requires complete SMTP configuration and `SMTP_SMOKE_RECIPIENT`. A deterministic `Message-ID` provides best-effort retry deduplication, but standard SMTP cannot guarantee strict idempotency after an ambiguous accepted delivery.
+
+Database backups default to `.backups/postgres`. Retention keeps every backup for the latest 14 days, the newest backup from each of the following 8 weeks, and the newest backup from each of the following 12 months. Invalid or incomplete backups are never deleted automatically. Restore verification always uses an isolated database and rejects `lettermate`, `postgres`, `template0`, and `template1`. There is intentionally no command that overwrites the production database; a production restore requires downtime, a verified external copy, and manual approval.
 
 ## Project Status
 
 Implemented:
 
 - Persisted Topic and trend discovery pipelines.
+- RSS/Atom, X, and Bilibili video creator subscriptions.
+- Interest memory, personalized ranking, adjacent-interest exploration, and explicit feedback.
+- Daily digest preview, scheduling, retry recovery, and optional production SMTP delivery.
 - 14 main discovery connectors and 6 trend inputs.
 - Scheduling, lease recovery, idempotent refresh, and run summaries.
+- Unified API `x-trace-id`, redacted structured request logs, Worker queue snapshots, and safe job/connector failure events.
+- PostgreSQL custom-format backups, SHA-256 manifests, 14-day/8-week/12-month retention, and isolated restore verification.
 - Unified Feed, time/origin filters, calendar grouping, and responsive UI.
 - Offline default automation and credential-gated live smoke-test entry points.
 
 Required before production use:
 
-- Replace the fixed `x-user-id` development identity with real login, server-side sessions, and CSRF protection.
+- Configure `SESSION_SECRET`, `CSRF_SECRET`, and `ALLOW_DEV_IDENTITY=false`; real login, server-side sessions, and CSRF protection are implemented.
 - Validate external connectors, quotas, rate limits, and failure recovery in the target environment.
-- Establish deployment, monitoring, backup, key rotation, and security response procedures.
+- Connect structured logs and queue snapshots to target-environment aggregation and alerts.
+- Schedule database backups, maintain encrypted off-site copies, run periodic restore drills, and establish deployment, production-restore approval, key rotation, and security response procedures.
 
 See [Product Requirements](./docs/requirements.md) and [Technical Design](./docs/design.md) for detailed scope and decisions.
 

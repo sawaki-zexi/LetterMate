@@ -4,8 +4,12 @@ import type {
   CreatorItem,
   CreatorIdentityCandidate,
   CreatorPlatformStatus,
+  AuthSession,
   DiscoveryKind,
   DiscoverySourceStatus,
+  DigestPreference,
+  DigestRecentRun,
+  DigestStatus,
   FeedItem,
   FeedRange,
   FeedbackValue,
@@ -29,6 +33,9 @@ import {
   EyeOff,
   Inbox,
   Menu,
+  Mail,
+  LogIn,
+  LogOut,
   Newspaper,
   Pause,
   Play,
@@ -39,6 +46,7 @@ import {
   Search,
   Trash2,
   UserSearch,
+  UserPlus,
   X,
 } from 'lucide-react';
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
@@ -65,7 +73,12 @@ const navigation = [
   { to: '/topics', label: '关键词监控', icon: Search },
   { to: '/creators', label: '博主关注', icon: Rss },
   { to: '/interests', label: '兴趣记忆', icon: BrainCircuit },
+  { to: '/digest', label: '每日邮件', icon: Mail },
 ];
+
+const timeZones = typeof Intl.supportedValuesOf === 'function'
+  ? Intl.supportedValuesOf('timeZone')
+  : ['Asia/Shanghai', 'Asia/Tokyo', 'UTC', 'Europe/London', 'America/New_York'];
 
 const creatorPlatformLabels = {
   rss: 'RSS/Atom',
@@ -789,7 +802,9 @@ function CreatorContentCard({ item }: { item: CreatorItem }) {
       {author && <div className="source-author">{author}</div>}
       <h2>{item.title}</h2>
       <p>{item.summary}</p>
-      <p className="discovery-card__reason"><strong>推荐理由</strong>{item.reason}</p>
+      {item.feedEligible && (
+        <p className="discovery-card__reason"><strong>推荐理由</strong>{item.reason}</p>
+      )}
       {item.contentType === 'repost' && (originalAuthor || item.originalContentUrl) && (
         <div className="creator-content-context">
           <strong>转发原帖</strong>
@@ -1170,6 +1185,200 @@ function InterestsPage() {
   );
 }
 
+function DigestPage() {
+  const client = useQueryClient();
+  const preference = useQuery({
+    queryKey: ['digest-preference'], queryFn: api.digestPreference,
+  });
+  const preview = useQuery({ queryKey: ['digest-preview'], queryFn: api.digestPreview });
+  const status = useQuery({ queryKey: ['digest-status'], queryFn: api.digestStatus });
+  const [draft, setDraft] = useState<DigestPreference | null>(null);
+  useEffect(() => {
+    if (preference.data) setDraft(preference.data);
+  }, [preference.data]);
+  const save = useMutation({
+    mutationFn: api.setDigestPreference,
+    onSuccess: (data) => {
+      client.setQueryData(['digest-preference'], data);
+      setDraft(data);
+      void client.invalidateQueries({ queryKey: ['digest-status'] });
+    },
+  });
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (draft) save.mutate(draft);
+  };
+
+  return (
+    <Page title="每日邮件" description="设置本地发送时间并预览下一封摘要">
+      <DigestDeliveryStatusView
+        status={status.data}
+        loading={status.isLoading}
+        error={status.error}
+        retry={() => void status.refetch()}
+      />
+      {!draft && (
+        <QueryState
+          isLoading={preference.isLoading}
+          error={preference.error}
+          retry={() => void preference.refetch()}
+        />
+      )}
+      {save.error && <p className="inline-error"><AlertCircle size={15} />{save.error.message}</p>}
+      {draft && <form className="digest-settings" onSubmit={submit}>
+        <div className="digest-settings__toggle">
+          <div><h2>每日邮件</h2><p>{draft.enabled ? '已开启' : '已暂停'}</p></div>
+          <label className="toggle-control">
+            <input
+              type="checkbox"
+              aria-label="每日邮件"
+              checked={draft.enabled}
+              disabled={save.isPending}
+              onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+            />
+            <span aria-hidden="true" />
+          </label>
+        </div>
+        <label className="digest-field">
+          <span>发送时间</span>
+          <input
+            type="time"
+            aria-label="发送时间"
+            value={draft.localTime}
+            disabled={save.isPending}
+            onChange={(event) => setDraft({ ...draft, localTime: event.target.value })}
+          />
+        </label>
+        <label className="digest-field">
+          <span>时区</span>
+          <select
+            aria-label="时区"
+            value={draft.timezone}
+            disabled={save.isPending}
+            onChange={(event) => setDraft({ ...draft, timezone: event.target.value })}
+          >
+            {!timeZones.includes(draft.timezone) && (
+              <option value={draft.timezone}>{draft.timezone}</option>
+            )}
+            {timeZones.map((timezone) => <option value={timezone} key={timezone}>{timezone}</option>)}
+          </select>
+        </label>
+        <button className="button" type="submit" disabled={save.isPending}>
+          {save.isPending ? <RefreshCw className="spin" size={16} /> : <Check size={16} />}
+          保存设置
+        </button>
+      </form>}
+
+      <DigestRunStatusView
+        run={status.data?.recentRun}
+        loading={status.isLoading}
+        error={status.error}
+        retry={() => void status.refetch()}
+      />
+
+      <section className="digest-preview">
+        <header>
+          <div><h2>下一封邮件预览</h2><span>{preview.data?.items.length ?? 0} / 10</span></div>
+          <button
+            className="icon-button"
+            type="button"
+            title="刷新邮件预览"
+            aria-label="刷新邮件预览"
+            disabled={preview.isFetching}
+            onClick={() => void preview.refetch()}
+          ><RefreshCw className={preview.isFetching ? 'spin' : undefined} size={17} /></button>
+        </header>
+        {!preview.data && (
+          <QueryState
+            isLoading={preview.isLoading}
+            error={preview.error}
+            retry={() => void preview.refetch()}
+          />
+        )}
+        {preview.data?.items.length === 0 && (
+          <div className="state digest-preview__empty"><Inbox />暂无符合条件的新内容</div>
+        )}
+        {preview.data && preview.data.items.length > 0 && (
+          <div className="digest-preview-list">{preview.data.items.map((item) => (
+            <article className="digest-preview-item" key={item.contentKey}>
+              <h3>{item.title}</h3>
+              <p>{item.summary}</p>
+              <p className="digest-preview-item__reason"><strong>推荐理由</strong>{item.reason}</p>
+              <a href={item.sourceUrl} target="_blank" rel="noreferrer noopener">
+                <ExternalLink size={15} />查看原文
+              </a>
+            </article>
+          ))}</div>
+        )}
+      </section>
+    </Page>
+  );
+}
+
+function DigestDeliveryStatusView({
+  status,
+  loading,
+  error,
+  retry,
+}: {
+  status: DigestStatus | undefined;
+  loading: boolean;
+  error: Error | null;
+  retry: () => void;
+}) {
+  return <section className="digest-delivery-status">
+    <header><h2>投递能力</h2></header>
+    {!status && <QueryState isLoading={loading} error={error} retry={retry} />}
+    {status && <div className="digest-delivery-status__row">
+      <span className={`digest-delivery-status__state digest-delivery-status__state--${status.deliveryCapability}`}>
+        {status.deliveryCapability === 'configured' ? '已配置' : '未配置'}
+      </span>
+      {status.deliveryCapability === 'not_configured' && (
+        <span>服务器尚未配置邮件服务，当前不会创建发送任务</span>
+      )}
+      {status.nextLocalSend && (
+        <span>下次发送：{status.nextLocalSend.localDate} {status.nextLocalSend.localTime}（{status.nextLocalSend.timezone}）</span>
+      )}
+    </div>}
+  </section>;
+}
+
+const digestRunLabels: Record<NonNullable<DigestRecentRun>['status'], string> = {
+  queued: '等待发送',
+  running: '正在发送',
+  succeeded: '已发送',
+  skipped: '无内容，已跳过',
+  failed: '发送失败',
+};
+
+function DigestRunStatusView({
+  run,
+  loading,
+  error,
+  retry,
+}: {
+  run: DigestRecentRun | undefined;
+  loading: boolean;
+  error: Error | null;
+  retry: () => void;
+}) {
+  return <section className="digest-run-status">
+    <header><h2>最近运行</h2></header>
+    {run === undefined && <QueryState isLoading={loading} error={error} retry={retry} />}
+    {run === null && <div className="digest-run-status__empty">尚无运行记录</div>}
+    {run && <div className="digest-run-status__row">
+      <span className={`digest-run-status__state digest-run-status__state--${run.status}`}>
+        {digestRunLabels[run.status]}
+      </span>
+      <span>{run.scheduledLocalDate}</span>
+      <span>{run.itemCount} 条内容</span>
+      {run.finishedAt && <time dateTime={run.finishedAt}>{new Intl.DateTimeFormat('zh-CN', {
+        month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+      }).format(new Date(run.finishedAt))}</time>}
+    </div>}
+  </section>;
+}
+
 function ItemPage() {
   const { id = '' } = useParams();
   const item = useQuery({ queryKey: ['item', id], queryFn: () => api.item(id) });
@@ -1205,7 +1414,44 @@ function Page({
   return <main className="page" {...containerProps}><header className="page-header"><div><h1>{title}</h1><p>{description}</p></div>{action}</header>{children}</main>;
 }
 
-export default function App() {
+function AuthPage({ onAuthenticated }: { onAuthenticated: (session: AuthSession) => void }) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [timezone, setTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  const authenticate = useMutation({
+    mutationFn: () => mode === 'login'
+      ? api.login({ email, password })
+      : api.register({ email, password, timezone }),
+    onSuccess: onAuthenticated,
+  });
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    authenticate.mutate();
+  };
+
+  return <main className="auth-page">
+    <section className="auth-panel" aria-labelledby="auth-title">
+      <div className="auth-brand"><span>LM</span><h1 id="auth-title">LetterMate</h1></div>
+      <div className="auth-tabs" role="tablist" aria-label="账户操作">
+        <button type="button" role="tab" aria-selected={mode === 'login'} onClick={() => setMode('login')}>登录</button>
+        <button type="button" role="tab" aria-selected={mode === 'register'} onClick={() => setMode('register')}>注册</button>
+      </div>
+      <form onSubmit={submit}>
+        <label><span>邮箱</span><input type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+        <label><span>密码</span><input type="password" autoComplete={mode === 'login' ? 'current-password' : 'new-password'} minLength={8} required value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        {mode === 'register' && <label><span>时区</span><select value={timezone} onChange={(event) => setTimezone(event.target.value)}>{timeZones.map((value) => <option value={value} key={value}>{value}</option>)}</select></label>}
+        {authenticate.error && <p className="inline-error"><AlertCircle size={15} />{authenticate.error.message}</p>}
+        <button className="button auth-submit" type="submit" disabled={authenticate.isPending}>
+          {authenticate.isPending ? <RefreshCw className="spin" size={17} /> : mode === 'login' ? <LogIn size={17} /> : <UserPlus size={17} />}
+          {mode === 'login' ? '登录' : '创建账户'}
+        </button>
+      </form>
+    </section>
+  </main>;
+}
+
+function Workspace({ session, onLogout }: { session: AuthSession; onLogout: () => void }) {
   const [mobileMenu, setMobileMenu] = useState(false);
   const sources = useDiscoverySources();
   const enabledSourceCount = sources.data?.filter((source) => source.status === 'enabled').length ?? 0;
@@ -1214,11 +1460,43 @@ export default function App() {
       <div className="brand"><span>LM</span><div><strong>LetterMate</strong><small>AI 信息发现工作台</small></div></div>
       <nav>{navigation.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} onClick={() => setMobileMenu(false)}><Icon size={19} />{label}</NavLink>)}</nav>
       <div className="sidebar-note"><span className="live-dot" /><div><strong>多源发现</strong><small>{enabledSourceCount} 个来源已启用</small></div></div>
+      {session.user && <div className="sidebar-account"><div><strong>{session.user.email}</strong><small>{session.user.timezone}</small></div>{session.csrfToken && <button className="icon-button" type="button" title="退出登录" aria-label="退出登录" onClick={onLogout}><LogOut size={17} /></button>}</div>}
     </aside>
     <div className="workspace">
       <header className="mobile-header"><button className="icon-button" title="菜单" aria-label="菜单" onClick={() => setMobileMenu(!mobileMenu)}><Menu size={20} /></button><strong>LetterMate</strong><span className="live-dot" /></header>
-      <Routes><Route path="/" element={<FeedPage />} /><Route path="/topics" element={<TopicsPage />} /><Route path="/creators" element={<CreatorsPage />} /><Route path="/creators/:id" element={<CreatorItemsPage />} /><Route path="/interests" element={<InterestsPage />} /><Route path="/items/:id" element={<ItemPage />} /></Routes>
+      <Routes><Route path="/" element={<FeedPage />} /><Route path="/topics" element={<TopicsPage />} /><Route path="/creators" element={<CreatorsPage />} /><Route path="/creators/:id" element={<CreatorItemsPage />} /><Route path="/interests" element={<InterestsPage />} /><Route path="/digest" element={<DigestPage />} /><Route path="/items/:id" element={<ItemPage />} /></Routes>
     </div>
     <nav className="bottom-nav">{navigation.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'}><Icon size={19} /><span>{label}</span></NavLink>)}</nav>
   </div>;
+}
+
+export default function App() {
+  const client = useQueryClient();
+  const session = useQuery({
+    queryKey: ['auth-session'],
+    queryFn: api.session,
+    retry: false,
+    // Keep the existing development workspace responsive while the real
+    // session endpoint is checked in the background.
+    ...(import.meta.env.DEV ? {
+      initialData: {
+        authenticated: true,
+        user: { id: 'user-a', email: 'user-a@example.local', timezone: 'Asia/Shanghai' },
+        csrfToken: null,
+      } satisfies AuthSession,
+    } : {}),
+  });
+  const logout = useMutation({
+    mutationFn: api.logout,
+    onSuccess: () => client.setQueryData<AuthSession>(['auth-session'], {
+      authenticated: false, user: null, csrfToken: null,
+    }),
+  });
+  if (!session.data) {
+    return <main className="auth-page"><QueryState isLoading={session.isLoading} error={session.error} retry={() => void session.refetch()} /></main>;
+  }
+  if (!session.data.authenticated || !session.data.user) {
+    return <AuthPage onAuthenticated={(value) => client.setQueryData(['auth-session'], value)} />;
+  }
+  return <Workspace session={session.data} onLogout={() => logout.mutate()} />;
 }

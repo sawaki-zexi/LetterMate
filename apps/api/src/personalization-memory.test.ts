@@ -161,4 +161,58 @@ describe('personalization memory adapters', () => {
     expect(await memory.inspect('user-1')).toMatchObject({ recent: [], longTerm: [], reduced: [] });
     expect((await memory.inspect('user-2')).recent[0]).toMatchObject({ id: 'tag-agents' });
   });
+
+  it('replays adjacent exploration per user and never enables it for digest', async () => {
+    const facts: MemoryPersonalizationFacts = {
+      events: [feedbackEvent('user-1', 'event-1'), feedbackEvent('user-2', 'event-2')],
+      tags: [
+        {
+          tagId: 'tag-core', slug: 'core', displayName: 'Core', kind: 'topic',
+          confidence: 0.95, contentKey: 'https://example.com/evidence',
+          createdAt: '2026-08-08T08:00:00.000Z',
+        },
+        ...Array.from({ length: 10 }, (_, index) => ({
+          tagId: index === 0 ? 'tag-edge' : `tag-unrelated-${index}`,
+          slug: index === 0 ? 'edge' : `unrelated-${index}`,
+          displayName: index === 0 ? 'Edge' : `Unrelated ${index}`,
+          kind: 'topic' as const,
+          confidence: 0.9,
+          contentKey: `https://example.com/candidate-${index}`,
+          createdAt: '2026-08-08T08:00:00.000Z',
+        })),
+      ],
+      creatorContent: [],
+      settings: {},
+      forgottenTagIds: {},
+      adjacencies: [{
+        leftTagId: 'tag-core', rightTagId: 'tag-edge',
+        relationVersion: 'qualified-content-cooccurrence-v1',
+      }],
+    };
+    const memory = new MemoryPersonalizationMemory(() => facts);
+    const candidates = Array.from({ length: 10 }, (_, index) => (
+      candidate(`https://example.com/candidate-${index}`)
+    ));
+    const input = {
+      userId: 'user-1', surface: 'feed' as const, candidates,
+      asOf: new Date('2026-08-08T08:30:00.000Z'),
+    };
+
+    const first = await memory.select(input);
+    expect(first.ranked.filter((item) => item.isExploration)).toEqual([
+      expect.objectContaining({
+        contentKey: 'https://example.com/candidate-0',
+        lane: 'exploration',
+        reasonCodes: ['ADJACENT_EXPLORATION'],
+      }),
+    ]);
+    expect(await memory.select(input)).toEqual(first);
+    const digest = await memory.select({ ...input, surface: 'digest' });
+    expect(digest.ranked.some((item) => item.isExploration)).toBe(false);
+    expect(digest.ranked.some((item) => (
+      item.contentKey === 'https://example.com/candidate-0'
+    ))).toBe(false);
+    expect((await memory.select({ ...input, userId: 'user-3' }))
+      .ranked.some((item) => item.isExploration)).toBe(false);
+  });
 });

@@ -13,6 +13,7 @@ import {
 export interface TrendSourceRegistryOptions {
   concurrency: number;
   timeoutMs: number;
+  onFailure?: (failure: TrendSourceFailure) => void;
 }
 
 const isoTimestamp = z.string().refine((value) => {
@@ -279,11 +280,15 @@ export class TrendSourceRegistry {
         if (candidates.length >= window.maxCandidates) break;
       }
     }
+    const failures = failuresByIndex.filter(
+      (failure): failure is TrendSourceFailure => failure !== undefined,
+    );
+    for (const failure of failures) this.options.onFailure?.(failure);
     return {
       candidates,
       successfulSourceIds,
       skippedSourceIds,
-      failures: failuresByIndex.filter((failure): failure is TrendSourceFailure => failure !== undefined),
+      failures,
       requestCount: Object.values(requestCounts).reduce((sum, count) => sum + count, 0),
       requestCounts,
     };

@@ -51,6 +51,10 @@ const baseConfigSchema = z.object({
   REDIS_URL: z.string().min(1).default('redis://localhost:6379'),
   SESSION_SECRET: z.string().min(32).optional(),
   CSRF_SECRET: z.string().min(32).optional(),
+  ALLOW_DEV_IDENTITY: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
   AI_API_KEY: optionalNonEmptyString,
   AI_MODEL: z.string().trim().min(1).default('openrouter/auto'),
   AI_WEB_SEARCH: z
@@ -94,10 +98,40 @@ const baseConfigSchema = z.object({
   TREND_YOUTUBE_REGION: z.string().regex(/^[A-Z]{2}$/).default('US'),
   TREND_REDDIT_COMMUNITIES: trendRedditCommunities,
   TREND_GOOGLE_RSS_URLS: trendGoogleRssUrls,
+  SMTP_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  SMTP_HOST: optionalNonEmptyString,
+  SMTP_PORT: z.coerce.number().int().min(1).max(65_535).default(587),
+  SMTP_SECURE: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  SMTP_REQUIRE_TLS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  SMTP_USER: optionalNonEmptyString,
+  SMTP_PASSWORD: optionalNonEmptyString,
+  SMTP_FROM: optionalNonEmptyString,
+  SMTP_MESSAGE_ID_DOMAIN: z.string().trim().regex(
+    /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i,
+  ).default('lettermate.local'),
+  SMTP_CONNECTION_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(10_000),
+  SMTP_SOCKET_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(300_000).default(30_000),
   RUN_LIVE_AI_TESTS: z
     .enum(['0', '1'])
     .default('0')
     .transform((value) => value === '1'),
+  RUN_LIVE_EMAIL_TESTS: z
+    .enum(['0', '1'])
+    .default('0')
+    .transform((value) => value === '1'),
+  SMTP_SMOKE_RECIPIENT: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.email().optional(),
+  ),
 });
 
 export type AppConfig = z.infer<typeof baseConfigSchema>;
@@ -105,12 +139,28 @@ export type AppConfig = z.infer<typeof baseConfigSchema>;
 export function parseConfig(environment: Record<string, string | undefined>): AppConfig {
   const parsed = baseConfigSchema.parse(environment);
 
+  if (parsed.SMTP_ENABLED) {
+    const missing = [
+      ['SMTP_HOST', parsed.SMTP_HOST],
+      ['SMTP_FROM', parsed.SMTP_FROM],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length > 0) {
+      throw new Error(`Missing required SMTP configuration: ${missing.join(', ')}`);
+    }
+    if (Boolean(parsed.SMTP_USER) !== Boolean(parsed.SMTP_PASSWORD)) {
+      throw new Error('SMTP_USER and SMTP_PASSWORD must be configured together');
+    }
+  }
+
   if (parsed.NODE_ENV === 'production') {
     const missing = ['SESSION_SECRET', 'CSRF_SECRET'].filter(
       (name) => !parsed[name as keyof AppConfig],
     );
     if (missing.length > 0) {
       throw new Error(`Missing required production configuration: ${missing.join(', ')}`);
+    }
+    if (parsed.ALLOW_DEV_IDENTITY) {
+      throw new Error('ALLOW_DEV_IDENTITY must be false in production');
     }
   }
 

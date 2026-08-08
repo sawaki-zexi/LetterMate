@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const discoveryQueueName = 'topic-discovery';
 export const trendQueueName = 'trend-discovery';
 export const creatorQueueName = 'creator-discovery';
+export const digestQueueName = 'daily-digest';
 export const maxTopicExpandedTerms = 32;
 
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
@@ -368,6 +369,93 @@ export const interestMemorySettingsInputSchema = z.strictObject({
   personalizationEnabled: z.boolean(),
 });
 
+export const localSendTimeSchema = z.string().regex(
+  /^(?:[01]\d|2[0-3]):[0-5]\d$/,
+  '发送时间必须使用 24 小时制 HH:mm 格式',
+);
+
+export const ianaTimeZoneSchema = z.string().trim().min(1).max(100).refine((value) => {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}, '时区必须是有效的 IANA 时区');
+
+export const digestPreferenceInputSchema = z.strictObject({
+  enabled: z.boolean(),
+  localTime: localSendTimeSchema,
+  timezone: ianaTimeZoneSchema,
+});
+
+export const digestPreferenceSchema = digestPreferenceInputSchema;
+
+export const digestPreviewItemSchema = z.strictObject({
+  contentKey: httpUrlSchema,
+  title: z.string().trim().min(1),
+  summary: z.string().trim().min(1),
+  reason: z.string().trim().min(1),
+  sourceUrl: httpUrlSchema,
+  publishedAt: z.iso.datetime().nullable(),
+});
+
+export const digestPreviewSchema = z.strictObject({
+  generatedAt: z.iso.datetime(),
+  items: z.array(digestPreviewItemSchema).max(10),
+});
+
+export const digestJobDataSchema = z.strictObject({
+  runId: z.string().min(1),
+  userId: z.string().min(1),
+});
+
+export const digestRunStatusSchema = z.enum([
+  'queued', 'running', 'succeeded', 'skipped', 'failed',
+]);
+
+export const digestRecentRunSchema = z.strictObject({
+  status: digestRunStatusSchema,
+  scheduledLocalDate: z.iso.date(),
+  finishedAt: z.iso.datetime().nullable(),
+  itemCount: z.number().int().min(0).max(10),
+}).nullable();
+
+export const digestDeliveryCapabilitySchema = z.enum(['configured', 'not_configured']);
+
+export const digestNextLocalSendSchema = z.strictObject({
+  localDate: z.iso.date(),
+  localTime: localSendTimeSchema,
+  timezone: ianaTimeZoneSchema,
+}).nullable();
+
+export const digestStatusSchema = z.strictObject({
+  deliveryCapability: digestDeliveryCapabilitySchema,
+  nextLocalSend: digestNextLocalSendSchema,
+  recentRun: digestRecentRunSchema,
+});
+
+export const authLoginInputSchema = z.strictObject({
+  email: z.email(),
+  password: z.string().min(8).max(200),
+});
+
+export const authRegisterInputSchema = authLoginInputSchema.extend({
+  timezone: ianaTimeZoneSchema.default('Asia/Shanghai'),
+});
+
+export const authUserSchema = z.strictObject({
+  id: z.string().min(1),
+  email: z.email(),
+  timezone: ianaTimeZoneSchema,
+});
+
+export const authSessionSchema = z.strictObject({
+  authenticated: z.boolean(),
+  user: authUserSchema.nullable(),
+  csrfToken: z.string().min(16).nullable(),
+});
+
 export const topicFeedItemSchema = discoveryItemSchema.extend({
   origin: z.literal('topic'),
   topicId: z.string().min(1),
@@ -458,6 +546,31 @@ export const readinessSchema = z.strictObject({
   dependencies: z.record(z.string().min(1), healthDependencySchema),
 });
 
+export const operationalLogSchema = z.strictObject({
+  timestamp: z.iso.datetime(),
+  level: z.enum(['info', 'warn', 'error']),
+  service: z.enum(['api', 'worker']),
+  event: z.string().trim().min(1).max(100),
+  component: z.string().trim().min(1).max(100).optional(),
+  traceId: z.string().trim().min(1).max(100).optional(),
+  runId: z.string().trim().min(1).max(100).optional(),
+  jobId: z.string().trim().min(1).max(200).optional(),
+  queue: z.string().trim().min(1).max(100).optional(),
+  method: z.string().trim().min(1).max(20).optional(),
+  path: z.string().trim().min(1).max(500).optional(),
+  statusCode: z.number().int().min(100).max(599).optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+  attempt: z.number().int().positive().optional(),
+  code: z.string().trim().min(1).max(100).optional(),
+  dependency: z.enum(['database', 'redis', 'external']).optional(),
+  counts: z.strictObject({
+    waiting: z.number().int().nonnegative(),
+    active: z.number().int().nonnegative(),
+    delayed: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+  }).optional(),
+});
+
 export type TopicInput = z.infer<typeof topicInputSchema>;
 export type TopicUpdateInput = z.infer<typeof topicUpdateInputSchema>;
 export type Topic = z.infer<typeof topicSchema>;
@@ -493,6 +606,20 @@ export type FeedRecommendation = z.infer<typeof feedRecommendationSchema>;
 export type InterestMemory = z.infer<typeof interestMemorySchema>;
 export type InterestMemoryTheme = z.infer<typeof interestMemoryThemeSchema>;
 export type InterestMemorySettingsInput = z.infer<typeof interestMemorySettingsInputSchema>;
+export type DigestPreference = z.infer<typeof digestPreferenceSchema>;
+export type DigestPreferenceInput = z.infer<typeof digestPreferenceInputSchema>;
+export type DigestPreview = z.infer<typeof digestPreviewSchema>;
+export type DigestPreviewItem = z.infer<typeof digestPreviewItemSchema>;
+export type DigestJobData = z.infer<typeof digestJobDataSchema>;
+export type DigestRunStatus = z.infer<typeof digestRunStatusSchema>;
+export type DigestRecentRun = z.infer<typeof digestRecentRunSchema>;
+export type DigestDeliveryCapability = z.infer<typeof digestDeliveryCapabilitySchema>;
+export type DigestNextLocalSend = z.infer<typeof digestNextLocalSendSchema>;
+export type DigestStatus = z.infer<typeof digestStatusSchema>;
+export type AuthLoginInput = z.infer<typeof authLoginInputSchema>;
+export type AuthRegisterInput = z.infer<typeof authRegisterInputSchema>;
+export type AuthUser = z.infer<typeof authUserSchema>;
+export type AuthSession = z.infer<typeof authSessionSchema>;
 export type RecommendationLane = z.infer<typeof recommendationLaneSchema>;
 export type RecommendationReason = z.infer<typeof recommendationReasonSchema>;
 export type FeedOrigin = z.infer<typeof feedOriginSchema>;
@@ -503,6 +630,7 @@ export type FeedRange = z.infer<typeof feedRangeSchema>;
 export type HealthDependency = z.infer<typeof healthDependencySchema>;
 export type ProvenanceKind = z.infer<typeof provenanceKindSchema>;
 export type Readiness = z.infer<typeof readinessSchema>;
+export type OperationalLog = z.infer<typeof operationalLogSchema>;
 export type RunSummary = z.infer<typeof runSummarySchema>;
 export type SafeError = z.infer<typeof safeErrorSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;

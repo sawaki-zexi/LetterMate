@@ -9,7 +9,7 @@ import {
 } from './ai-gateway.js';
 import { OpenRouterAiGateway } from './openrouter-gateway.js';
 
-const openRouterResponse = (content: string, annotations: unknown[] = []) =>
+const openRouterResponse = (content: string | null, annotations: unknown[] = []) =>
   new Response(
     JSON.stringify({
       id: 'generation-1',
@@ -311,6 +311,51 @@ describe('OpenRouterAiGateway', () => {
     expect(repairBody.messages.some((message: { content: string }) => message.content.includes('Simplified Chinese'))).toBe(true);
   });
 
+  it('localizes creator archive items with exact IDs and Chinese fields', async () => {
+    const candidates = [{
+      id: 'https://x.com/example/status/1',
+      title: 'A practical guide to agent evaluation',
+      text: 'The post explains a repeatable evaluation workflow with concrete examples.',
+      platform: 'X',
+      authorName: 'Example Author',
+      authorHandle: 'example',
+      publishedAt: '2026-08-06T07:00:00.000Z',
+    }];
+    const localized = [{
+      id: candidates[0]!.id,
+      title: '智能体评估实践指南',
+      summary: '这篇内容用具体示例介绍了一套可重复执行的评估流程。',
+    }];
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ items: localized })));
+
+    await expect(makeGateway(fetcher).localizeCreatorItems({
+      creatorName: 'Example Author', candidates,
+    })).resolves.toEqual(localized);
+
+    const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
+    const schemaMessage = body.messages.find((message: { content: string }) => (
+      message.content.includes('creator_archive_localization')
+    ));
+    expect(schemaMessage.content).toContain('"additionalProperties":false');
+    expect(body.messages[0].content).toContain('exactly one item for every supplied ID');
+    expect(body.messages[0].content).toContain('Simplified Chinese');
+    expect(body.messages[0].content).toContain('never merge or misattribute');
+    expect(body.messages[0].content).toContain('only facts supported by the supplied source');
+  });
+
+  it('rejects incomplete creator archive localization output', async () => {
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ items: [] })));
+
+    await expect(makeGateway(fetcher).localizeCreatorItems({
+      creatorName: 'Example Author',
+      candidates: [{
+        id: 'https://x.com/example/status/1', title: 'English title', text: 'English body',
+        platform: 'X', authorName: 'Example Author', authorHandle: 'example', publishedAt: null,
+      }],
+    })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it('drops an item when its one allowed language repair is still invalid', async () => {
     const source = validateSourceCandidate({
       connectorId: 'github', sourceType: 'code', platform: 'GitHub', externalId: 'node-drop',
@@ -405,6 +450,38 @@ describe('OpenRouterAiGateway', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
     const secondBody = JSON.parse(String((fetcher.mock.calls[1] as [string, RequestInit])[1].body));
     expect(secondBody.messages.at(-1).content).toContain('JSON');
+  });
+
+  it('retries a completion whose assistant content is null', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(openRouterResponse(null))
+      .mockResolvedValueOnce(openRouterResponse(JSON.stringify({
+        terms: ['AI agent'],
+        searchQueries: ['AI agent latest'],
+      })));
+
+    await expect(makeGateway(fetcher).expandTopic({ keyword: 'AI Agent' })).resolves.toMatchObject({
+      terms: ['AI agent'],
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('disables reasoning so structured output tokens are reserved for JSON', async () => {
+    const fetcher = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      return body.reasoning?.effort === 'none'
+        ? openRouterResponse(JSON.stringify({
+            terms: ['AI agent'],
+            searchQueries: ['AI agent latest'],
+          }))
+        : openRouterResponse(null);
+    });
+
+    await expect(makeGateway(fetcher as typeof fetch).expandTopic({ keyword: 'AI Agent' })).resolves.toMatchObject({
+      terms: ['AI agent'],
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it('fails with AI_RESPONSE_INVALID after the correction response is invalid', async () => {

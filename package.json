@@ -23,7 +23,10 @@
     "test:e2e": "playwright test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:deploy": "prisma migrate deploy"
+    "db:deploy": "prisma migrate deploy",
+    "db:backup": "tsx apps/api/src/postgres-backup-cli.ts",
+    "db:backup:verify": "tsx apps/api/src/postgres-backup-cli.ts --verify",
+    "db:restore:verify": "tsx apps/api/src/postgres-restore-cli.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.31.0",

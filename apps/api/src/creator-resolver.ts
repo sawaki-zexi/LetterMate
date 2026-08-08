@@ -377,6 +377,20 @@ const xUserSchema = z.object({
 const xUserInfoResponseSchema = z.object({ data: z.unknown(), status: z.string().optional() }).passthrough();
 const xUserSearchResponseSchema = z.object({ users: z.array(z.unknown()), status: z.string().optional() }).passthrough();
 
+function xAvatarUrl(value: unknown): string | null {
+  const source = httpUrl(value, 'https://x.com/');
+  if (!source) return null;
+  const sourceUrl = new URL(source);
+  if (!['pbs.twimg.com', 'abs.twimg.com'].includes(sourceUrl.hostname.toLowerCase())) return source;
+  const proxy = new URL('https://wsrv.nl/');
+  proxy.searchParams.set('url', sourceUrl.toString());
+  proxy.searchParams.set('w', '96');
+  proxy.searchParams.set('h', '96');
+  proxy.searchParams.set('fit', 'cover');
+  proxy.searchParams.set('output', 'webp');
+  return proxy.toString();
+}
+
 function xHandle(input: string): string | null {
   const trimmed = input.trim();
   const explicitHandle = trimmed.match(/^@([A-Za-z0-9_]{1,15})$/);
@@ -449,7 +463,7 @@ export class XCreatorIdentityResolver implements CreatorIdentityResolver {
         resolutionInput: `@${normalizedHandle}`,
         displayName: user.name.slice(0, 200),
         handle: `@${normalizedHandle}`,
-        avatarUrl: httpUrl(user.profilePicture ?? user.profile_image_url_https, 'https://x.com/'),
+        avatarUrl: xAvatarUrl(user.profilePicture ?? user.profile_image_url_https),
         bio: user.description?.trim().slice(0, 1_000) || null,
         verified: Boolean(user.isBlueVerified || user.verifiedType?.trim()),
         profileUrl: `https://x.com/${normalizedHandle}`,

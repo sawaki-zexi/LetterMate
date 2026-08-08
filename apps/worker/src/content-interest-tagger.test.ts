@@ -1,10 +1,14 @@
 import type { DiscoveryCandidate, InterestTagExtraction } from '@lettermate/contracts';
+import { INTEREST_ADJACENCY_VERSION } from '@lettermate/domain';
+import type { PrismaClient } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ContentInterestTagger,
   INTEREST_EXTRACTOR_VERSION,
   INTEREST_TAXONOMY_VERSION,
+  interestTagAdjacencyPairs,
   normalizeInterestTags,
+  PrismaContentInterestTagRepository,
   type ContentInterestTagRepository,
   type InterestTagGateway,
 } from './content-interest-tagger.js';
@@ -59,6 +63,61 @@ describe('content interest tagger', () => {
       tags: extraction.tags,
       taxonomyVersion: INTEREST_TAXONOMY_VERSION,
       extractorVersion: INTEREST_EXTRACTOR_VERSION,
+    });
+  });
+
+  it('builds canonical adjacency pairs only from strong topic and entity tags', () => {
+    expect(interestTagAdjacencyPairs([
+      { tagId: 'tag-z', kind: 'entity', confidence: 0.9 },
+      { tagId: 'tag-a', kind: 'topic', confidence: 0.75 },
+      { tagId: 'tag-a', kind: 'topic', confidence: 0.95 },
+      { tagId: 'tag-low', kind: 'entity', confidence: 0.74 },
+      { tagId: 'tag-type', kind: 'content_type', confidence: 1 },
+    ])).toEqual([{ leftTagId: 'tag-a', rightTagId: 'tag-z' }]);
+  });
+
+  it('persists adjacency alongside the current content tag snapshot', async () => {
+    const transaction = {
+      contentInterestTag: {
+        deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+        create: vi.fn().mockResolvedValue({}),
+      },
+      interestTag: {
+        upsert: vi.fn().mockImplementation(async ({ create }) => ({ id: `id-${create.slug}` })),
+      },
+      interestTagAdjacency: { upsert: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = {
+      $transaction: vi.fn().mockImplementation(async (operation) => operation(transaction)),
+    } as unknown as PrismaClient;
+    const repository = new PrismaContentInterestTagRepository(prisma);
+
+    await repository.save({
+      contentKey: 'https://example.com/qualified',
+      taxonomyVersion: INTEREST_TAXONOMY_VERSION,
+      extractorVersion: INTEREST_EXTRACTOR_VERSION,
+      tags: [
+        { slug: 'agents', displayName: 'Agents', kind: 'topic', confidence: 0.9 },
+        { slug: 'openai', displayName: 'OpenAI', kind: 'entity', confidence: 0.85 },
+        { slug: 'release', displayName: 'Release', kind: 'content_type', confidence: 1 },
+      ],
+    });
+
+    expect(transaction.interestTagAdjacency.upsert).toHaveBeenCalledOnce();
+    expect(transaction.interestTagAdjacency.upsert).toHaveBeenCalledWith({
+      where: {
+        leftTagId_rightTagId_relationVersion: {
+          leftTagId: 'id-agents',
+          rightTagId: 'id-openai',
+          relationVersion: INTEREST_ADJACENCY_VERSION,
+        },
+      },
+      create: {
+        leftTagId: 'id-agents',
+        rightTagId: 'id-openai',
+        relationVersion: INTEREST_ADJACENCY_VERSION,
+      },
+      update: {},
     });
   });
 

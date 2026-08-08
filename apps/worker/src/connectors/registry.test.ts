@@ -258,6 +258,7 @@ describe('ConnectorRegistry', () => {
   });
 
   it('isolates one connector failure from successful candidates', async () => {
+    const onFailure = vi.fn();
     const registry = new ConnectorRegistry([
       connector('failing', {
         search: async () => {
@@ -267,7 +268,7 @@ describe('ConnectorRegistry', () => {
       connector('working', {
         search: async () => ({ candidates: [candidate('working')] }),
       }),
-    ], { concurrency: 2, timeoutMs: 1_000 });
+    ], { concurrency: 2, timeoutMs: 1_000, onFailure });
 
     await expect(registry.search(plan)).resolves.toEqual({
       candidates: [normalizedCandidate('working')],
@@ -279,7 +280,10 @@ describe('ConnectorRegistry', () => {
         message: 'Connector rate limited',
         retryable: true,
       }],
-    });
+      });
+    expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({
+      connectorId: 'failing', code: 'CONNECTOR_RATE_LIMITED',
+    }));
   });
 
   it('maps unknown errors to a generic safe failure', async () => {

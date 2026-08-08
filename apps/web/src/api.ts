@@ -1,5 +1,8 @@
 import {
   apiErrorSchema,
+  authLoginInputSchema,
+  authRegisterInputSchema,
+  authSessionSchema,
   creatorConfirmationInputSchema,
   creatorInputSchema,
   creatorPlatformStatusSchema,
@@ -8,6 +11,10 @@ import {
   creatorItemSchema,
   creatorSchema,
   creatorUpdateInputSchema,
+  digestPreferenceInputSchema,
+  digestPreferenceSchema,
+  digestPreviewSchema,
+  digestStatusSchema,
   discoverySourceStatusSchema,
   contentFeedbackSchema,
   feedbackInputSchema,
@@ -28,10 +35,24 @@ import {
   type TopicInput,
   type TopicUpdateInput,
   type InterestMemorySettingsInput,
+  type DigestPreferenceInput,
+  type AuthLoginInput,
+  type AuthRegisterInput,
 } from '@lettermate/contracts';
 import { z } from 'zod';
 
-const headers = { 'content-type': 'application/json', 'x-user-id': 'user-a' };
+let csrfToken: string | null = null;
+
+const requestHeaders = (init?: RequestInit): Headers => {
+  const headers = new Headers(init?.headers);
+  if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+  if (import.meta.env.DEV) headers.set('x-user-id', 'user-a');
+  const method = (init?.method ?? 'GET').toUpperCase();
+  if (csrfToken && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    headers.set('x-csrf-token', csrfToken);
+  }
+  return headers;
+};
 
 export class ApiError extends Error {
   constructor(
@@ -59,7 +80,8 @@ async function apiRequest<T>(
 ): Promise<T> {
   const response = await fetch(`/api/v1${path}`, {
     ...init,
-    headers: { ...headers, ...init?.headers },
+    credentials: 'include',
+    headers: requestHeaders(init),
   });
   if (!response.ok) {
     const raw = await response.json().catch(() => null);
@@ -73,7 +95,10 @@ async function apiRequest<T>(
 }
 
 async function apiDelete(path: string): Promise<void> {
-  const response = await fetch(`/api/v1${path}`, { method: 'DELETE', headers });
+  const init = { method: 'DELETE' } satisfies RequestInit;
+  const response = await fetch(`/api/v1${path}`, {
+    ...init, credentials: 'include', headers: requestHeaders(init),
+  });
   if (!response.ok) {
     const raw = await response.json().catch(() => null);
     const parsed = apiErrorSchema.safeParse(raw);
@@ -84,7 +109,10 @@ async function apiDelete(path: string): Promise<void> {
 }
 
 async function apiDeleteResponse<T>(path: string, schema: z.ZodType<T>): Promise<T> {
-  const response = await fetch(`/api/v1${path}`, { method: 'DELETE', headers });
+  const init = { method: 'DELETE' } satisfies RequestInit;
+  const response = await fetch(`/api/v1${path}`, {
+    ...init, credentials: 'include', headers: requestHeaders(init),
+  });
   if (!response.ok) {
     const raw = await response.json().catch(() => null);
     const parsed = apiErrorSchema.safeParse(raw);
@@ -95,7 +123,40 @@ async function apiDeleteResponse<T>(path: string, schema: z.ZodType<T>): Promise
   return schema.parse(await response.json());
 }
 
+async function apiVoid(path: string, init: RequestInit): Promise<void> {
+  const response = await fetch(`/api/v1${path}`, {
+    ...init, credentials: 'include', headers: requestHeaders(init),
+  });
+  if (!response.ok) {
+    const raw = await response.json().catch(() => null);
+    const parsed = apiErrorSchema.safeParse(raw);
+    throw parsed.success
+      ? new ApiError(parsed.data.code, parsed.data.message, response.status)
+      : new ApiError('HTTP_ERROR', `请求失败 (${response.status})`, response.status);
+  }
+}
+
+const rememberSession = <T extends { csrfToken: string | null }>(session: T): T => {
+  csrfToken = session.csrfToken;
+  return session;
+};
+
 export const api = {
+  session: async () => rememberSession(await apiRequest('/auth/session', authSessionSchema)),
+  login: async (input: AuthLoginInput) => rememberSession(await apiRequest(
+    '/auth/login',
+    authSessionSchema,
+    { method: 'POST', body: JSON.stringify(authLoginInputSchema.parse(input)) },
+  )),
+  register: async (input: AuthRegisterInput) => rememberSession(await apiRequest(
+    '/auth/register',
+    authSessionSchema,
+    { method: 'POST', body: JSON.stringify(authRegisterInputSchema.parse(input)) },
+  )),
+  logout: async () => {
+    await apiVoid('/auth/logout', { method: 'POST' });
+    csrfToken = null;
+  },
   topics: () => apiRequest('/topics', z.array(topicSchema)),
   createTopic: (input: TopicInput) => apiRequest('/topics', topicSchema, {
     method: 'POST',
@@ -173,5 +234,16 @@ export const api = {
     interestMemorySchema,
   ),
   clearInterestHistory: () => apiDeleteResponse('/interests', interestMemorySchema),
+  digestPreference: () => apiRequest('/digest-preference', digestPreferenceSchema),
+  setDigestPreference: (input: DigestPreferenceInput) => apiRequest(
+    '/digest-preference',
+    digestPreferenceSchema,
+    {
+      method: 'PUT',
+      body: JSON.stringify(digestPreferenceInputSchema.parse(input)),
+    },
+  ),
+  digestPreview: () => apiRequest('/digest-preview', digestPreviewSchema),
+  digestStatus: () => apiRequest('/digest-status', digestStatusSchema),
   item: (id: string) => apiRequest(`/items/${encodeURIComponent(id)}`, feedItemSchema),
 };

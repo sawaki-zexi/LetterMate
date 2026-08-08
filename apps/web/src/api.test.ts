@@ -46,6 +46,38 @@ const interestMemory = {
 describe('web API client', () => {
   afterEach(() => vi.unstubAllGlobals());
 
+  it('uses cookie credentials, persists CSRF from login, protects writes, and clears it on logout', async () => {
+    const responses = [
+      Response.json({
+        authenticated: true,
+        user: { id: 'user-1', email: 'student@example.com', timezone: 'Asia/Shanghai' },
+        csrfToken: 'csrf-token-with-sufficient-length',
+      }),
+      Response.json({ contentKey: feedItem.contentKey, value: 'interested' }),
+      new Response(null, { status: 204 }),
+      Response.json({ contentKey: feedItem.contentKey, value: 'interested' }),
+    ];
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => (
+      responses.shift() ?? Response.json([])
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.login({ email: 'student@example.com', password: 'correct horse battery staple' });
+    await api.setFeedback(feedItem.contentKey, { value: 'interested' });
+    await api.logout();
+    await api.setFeedback(feedItem.contentKey, { value: 'interested' });
+
+    const loginInit = fetchMock.mock.calls[0]?.[1];
+    const protectedInit = fetchMock.mock.calls[1]?.[1];
+    const clearedInit = fetchMock.mock.calls[3]?.[1];
+    expect(loginInit).toEqual(expect.objectContaining({ credentials: 'include' }));
+    expect(protectedInit).toEqual(expect.objectContaining({ credentials: 'include' }));
+    expect(new Headers(protectedInit?.headers).get('x-csrf-token'))
+      .toBe('csrf-token-with-sufficient-length');
+    expect(clearedInit).toEqual(expect.objectContaining({ credentials: 'include' }));
+    expect(new Headers(clearedInit?.headers).get('x-csrf-token')).toBeNull();
+  });
+
   it('validates and sends all Feed filters with a 30d default, then parses FeedItem', async () => {
     const fetchMock = vi.fn(async () => Response.json([feedItem]));
     vi.stubGlobal('fetch', fetchMock);

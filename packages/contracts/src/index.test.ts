@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  authLoginInputSchema,
+  authRegisterInputSchema,
+  authSessionSchema,
   creatorInputSchema,
   creatorIdentityCandidateSchema,
   creatorPlatformStatusSchema,
@@ -18,6 +21,14 @@ import {
   interestTagExtractionSchema,
   interestMemorySchema,
   interestMemorySettingsInputSchema,
+  operationalLogSchema,
+  digestPreferenceInputSchema,
+  digestPreferenceSchema,
+  digestJobDataSchema,
+  digestPreviewSchema,
+  digestQueueName,
+  digestRecentRunSchema,
+  digestStatusSchema,
   feedItemSchema,
   feedOriginSchema,
   feedQuerySchema,
@@ -623,6 +634,76 @@ describe('AI discovery contracts', () => {
     })).toThrow();
   });
 
+  it('accepts only safe daily digest preferences and persisted preview fields', () => {
+    const preference = { enabled: true, localTime: '08:30', timezone: 'Asia/Shanghai' };
+    expect(digestPreferenceInputSchema.parse(preference)).toEqual(preference);
+    expect(digestPreferenceSchema.parse(preference)).toEqual(preference);
+    expect(() => digestPreferenceInputSchema.parse({
+      ...preference, localTime: '24:00',
+    })).toThrow();
+    expect(() => digestPreferenceInputSchema.parse({
+      ...preference, timezone: 'Shanghai',
+    })).toThrow();
+    expect(() => digestPreferenceInputSchema.parse({
+      ...preference, recipientEmail: 'other@example.com',
+    })).toThrow();
+
+    const preview = {
+      generatedAt: '2026-08-08T08:00:00.000Z',
+      items: [{
+        contentKey: 'https://example.com/article',
+        title: '技术更新',
+        summary: '已经持久化的中文摘要。',
+        reason: '包含重要且可回溯的变化。',
+        sourceUrl: 'https://example.com/article',
+        publishedAt: '2026-08-08T07:00:00.000Z',
+      }],
+    };
+    expect(digestPreviewSchema.parse(preview)).toEqual(preview);
+    expect(() => digestPreviewSchema.parse({
+      ...preview, items: [{ ...preview.items[0], score: 9 }],
+    })).toThrow();
+
+    expect(digestQueueName).toBe('daily-digest');
+    expect(digestJobDataSchema.parse({ runId: 'run-1', userId: 'user-a' })).toEqual({
+      runId: 'run-1', userId: 'user-a',
+    });
+    const recentRun = {
+      status: 'succeeded' as const,
+      scheduledLocalDate: '2026-08-08',
+      finishedAt: '2026-08-08T00:01:00.000Z',
+      itemCount: 3,
+    };
+    expect(digestRecentRunSchema.parse(recentRun)).toEqual(recentRun);
+    const status = {
+      deliveryCapability: 'configured' as const,
+      nextLocalSend: {
+        localDate: '2026-08-09', localTime: '08:30', timezone: 'Asia/Shanghai',
+      },
+      recentRun: null,
+    };
+    expect(digestStatusSchema.parse(status)).toEqual(status);
+    expect(() => digestStatusSchema.parse({
+      ...status, smtpHost: 'smtp.example.com',
+    })).toThrow();
+    expect(() => digestRecentRunSchema.parse({
+      ...recentRun, providerMessageId: 'provider-secret',
+    })).toThrow();
+
+    expect(authLoginInputSchema.parse({
+      email: 'student@example.com', password: 'correct horse battery staple',
+    })).toEqual({ email: 'student@example.com', password: 'correct horse battery staple' });
+    expect(authRegisterInputSchema.parse({
+      email: 'student@example.com', password: 'correct horse battery staple',
+    })).toEqual({
+      email: 'student@example.com', password: 'correct horse battery staple',
+      timezone: 'Asia/Shanghai',
+    });
+    expect(authSessionSchema.parse({
+      authenticated: false, user: null, csrfToken: null,
+    })).toEqual({ authenticated: false, user: null, csrfToken: null });
+  });
+
   it('accepts only safe readiness dependency states', () => {
     expect(readinessSchema.parse({
       status: 'degraded',
@@ -637,6 +718,27 @@ describe('AI discovery contracts', () => {
       status: 'ok',
       timestamp: '2026-08-05T00:00:00.000Z',
       dependencies: { redis: { status: 'error', message: 'secret' } },
+    })).toThrow();
+  });
+
+  it('accepts bounded operational logs without arbitrary sensitive fields', () => {
+    expect(operationalLogSchema.parse({
+      timestamp: '2026-08-08T08:00:00.000Z',
+      level: 'error',
+      service: 'worker',
+      event: 'queue.job.failed',
+      runId: 'run-1',
+      jobId: 'job-1',
+      queue: 'topic-discovery',
+      attempt: 3,
+      code: 'JOB_FAILED',
+    })).toMatchObject({ event: 'queue.job.failed', runId: 'run-1' });
+    expect(() => operationalLogSchema.parse({
+      timestamp: '2026-08-08T08:00:00.000Z',
+      level: 'info',
+      service: 'api',
+      event: 'request.completed',
+      email: 'student@example.com',
     })).toThrow();
   });
 });

@@ -1,6 +1,7 @@
 import type { FeedItem } from '@lettermate/contracts';
 import { describe, expect, it } from 'vitest';
 import {
+  applyExplorationEligibility,
   evaluateRecommendationGates,
   interestSlugFromText,
   projectInterestProfile,
@@ -93,6 +94,92 @@ describe('personalization domain module', () => {
     ]);
     expect(first[0]).toMatchObject({ lane: 'subscription', isExploration: false });
     expect(rankShadowSlate(input)).toEqual(first);
+  });
+
+  it('marks at most ten percent of an ordinary Feed as adjacent exploration', () => {
+    const profile = [{
+      tagId: 'core', shortScore: 5, longScore: 3, negativeScore: 0,
+      evidenceUpdatedAt: '2026-08-08T08:00:00.000Z', sourceKinds: ['interested' as const],
+    }];
+    const candidates = Array.from({ length: 10 }, (_, index) => ({
+      item: feedItem(`https://example.com/${index}`),
+      tags: [{ tagId: index === 0 ? 'adjacent' : `unrelated-${index}`, confidence: 0.9 }],
+    }));
+    const eligible = applyExplorationEligibility({
+      candidates,
+      profile,
+      adjacencies: [{ leftTagId: 'adjacent', rightTagId: 'core' }],
+      forgottenTagIds: [],
+      surface: 'feed',
+    });
+    const first = rankShadowSlate({
+      candidates: eligible, profile, asOf: new Date('2026-08-08T08:00:00.000Z'),
+    });
+
+    expect(first.filter((item) => item.isExploration)).toEqual([
+      expect.objectContaining({
+        contentKey: 'https://example.com/0',
+        lane: 'exploration',
+        reasonCodes: ['ADJACENT_EXPLORATION'],
+      }),
+    ]);
+    expect(rankShadowSlate({
+      candidates: eligible, profile, asOf: new Date('2026-08-08T08:00:00.000Z'),
+    })).toEqual(first);
+    expect(rankShadowSlate({
+      candidates: eligible.slice(0, 9), profile, asOf: new Date('2026-08-08T08:00:00.000Z'),
+    }).some((item) => item.isExploration)).toBe(false);
+  });
+
+  it('excludes subscriptions, direct interests, forgotten and negative content from exploration', () => {
+    const profile = [
+      {
+        tagId: 'core', shortScore: 5, longScore: 3, negativeScore: 0,
+        evidenceUpdatedAt: '2026-08-08T08:00:00.000Z', sourceKinds: ['interested' as const],
+      },
+      {
+        tagId: 'negative', shortScore: 0, longScore: 0, negativeScore: 4,
+        evidenceUpdatedAt: '2026-08-08T08:00:00.000Z', sourceKinds: ['less' as const],
+      },
+    ];
+    const adjacent = (contentKey: string, tagId: string, overrides: Partial<FeedItem> = {}) => ({
+      item: feedItem(contentKey, overrides),
+      tags: [{ tagId, confidence: 0.9 }],
+    });
+    const candidates = [
+      adjacent('eligible', 'edge'),
+      adjacent('direct', 'core'),
+      adjacent('forgotten', 'forgotten'),
+      adjacent('negative', 'negative'),
+      adjacent('less', 'edge', { feedback: 'less' }),
+      adjacent('topic', 'edge', {
+        origin: 'topic', topicId: 'topic-1',
+        origins: [{
+          origin: 'topic', topicId: 'topic-1', topicKeyword: 'Core', topicKeywordActive: true,
+        }],
+      } as Partial<FeedItem>),
+      adjacent('creator', 'edge', {
+        origin: 'creator',
+        origins: [{
+          origin: 'creator', creatorId: 'creator-1', creatorName: 'Creator',
+          platform: 'X', contentType: 'original',
+        }],
+      } as Partial<FeedItem>),
+    ];
+    const adjacencies = [
+      { leftTagId: 'core', rightTagId: 'edge' },
+      { leftTagId: 'core', rightTagId: 'forgotten' },
+      { leftTagId: 'core', rightTagId: 'negative' },
+    ];
+
+    expect(applyExplorationEligibility({
+      candidates, profile, adjacencies, forgottenTagIds: ['forgotten'], surface: 'feed',
+    }).map((candidate) => candidate.explorationEligible)).toEqual([
+      true, false, false, false, false, false, false,
+    ]);
+    expect(applyExplorationEligibility({
+      candidates, profile, adjacencies, forgottenTagIds: [], surface: 'digest',
+    }).every((candidate) => !candidate.explorationEligible)).toBe(true);
   });
 
   it('preserves exact version slugs and evaluates chronological gates', () => {

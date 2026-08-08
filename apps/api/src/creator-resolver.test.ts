@@ -174,6 +174,12 @@ describe('creator identity resolution', () => {
         url: '',
         profile_image_url_https: 'https://pbs.twimg.com/profile_images/karpathy.jpg',
         isBlueVerified: true,
+      }, {
+        id: '2',
+        screen_name: 'defaultavatar',
+        name: 'Default Avatar',
+        url: '',
+        profile_image_url_https: 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
       }],
       has_next_page: false,
       next_cursor: '',
@@ -185,7 +191,12 @@ describe('creator identity resolution', () => {
       expect.objectContaining({
         accountKey: '1',
         handle: '@karpathy',
-        avatarUrl: 'https://pbs.twimg.com/profile_images/karpathy.jpg',
+        avatarUrl: 'https://wsrv.nl/?url=https%3A%2F%2Fpbs.twimg.com%2Fprofile_images%2Fkarpathy.jpg&w=96&h=96&fit=cover&output=webp',
+      }),
+      expect.objectContaining({
+        accountKey: '2',
+        handle: '@defaultavatar',
+        avatarUrl: 'https://wsrv.nl/?url=https%3A%2F%2Fabs.twimg.com%2Fsticky%2Fdefault_profile_images%2Fdefault_profile_normal.png&w=96&h=96&fit=cover&output=webp',
       }),
     ]);
     expect(new URL(String(fetcher.mock.calls[0]![0])).pathname).toBe('/twitter/user/search');

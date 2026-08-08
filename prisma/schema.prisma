@@ -94,6 +94,14 @@ enum RecommendationLane {
   exploration
 }
 
+enum DigestRunStatus {
+  queued
+  running
+  succeeded
+  skipped
+  failed
+}
+
 model User {
   id           String       @id @default(uuid())
   email        String       @unique
@@ -116,6 +124,8 @@ model User {
   recommendationDecisions RecommendationDecision[]
   interestMemorySettings InterestMemorySettings?
   forgottenInterestTags ForgottenInterestTag[]
+  digestPreference DigestPreference?
+  digestRuns DigestRun[]
 }
 
 model Session {
@@ -404,6 +414,8 @@ model InterestTag {
   parent          InterestTag?      @relation("InterestTagHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
   children        InterestTag[]     @relation("InterestTagHierarchy")
   contentTags     ContentInterestTag[]
+  adjacentLeft    InterestTagAdjacency[] @relation("InterestTagAdjacencyLeft")
+  adjacentRight   InterestTagAdjacency[] @relation("InterestTagAdjacencyRight")
   userProfiles    UserInterestProfile[]
   forgottenBy     ForgottenInterestTag[]
 
@@ -423,6 +435,19 @@ model ContentInterestTag {
   @@id([contentKey, tagId, extractorVersion])
   @@index([contentKey, extractorVersion])
   @@index([tagId, createdAt])
+}
+
+model InterestTagAdjacency {
+  leftTagId       String
+  rightTagId      String
+  relationVersion String
+  createdAt       DateTime    @default(now())
+  leftTag         InterestTag @relation("InterestTagAdjacencyLeft", fields: [leftTagId], references: [id], onDelete: Cascade)
+  rightTag        InterestTag @relation("InterestTagAdjacencyRight", fields: [rightTagId], references: [id], onDelete: Cascade)
+
+  @@id([leftTagId, rightTagId, relationVersion])
+  @@index([leftTagId, relationVersion])
+  @@index([rightTagId, relationVersion])
 }
 
 model InterestEvent {
@@ -526,4 +551,50 @@ model ForgottenInterestTag {
 
   @@id([userId, tagId])
   @@index([userId, createdAt])
+}
+
+model DigestPreference {
+  userId        String   @id
+  enabled       Boolean  @default(false)
+  localSendTime String   @default("08:00")
+  updatedAt     DateTime @updatedAt
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model DigestRun {
+  id                 String          @id @default(uuid())
+  userId             String
+  scheduledLocalDate String
+  windowStart        DateTime
+  windowEnd          DateTime
+  status             DigestRunStatus @default(queued)
+  createdAt          DateTime        @default(now())
+  startedAt          DateTime?
+  finishedAt         DateTime?
+  sentAt             DateTime?
+  providerMessageId  String?
+  error              Json?
+  runLeaseUntil      DateTime?
+  attemptCount       Int             @default(0)
+  user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items              DigestItem[]
+
+  @@unique([userId, scheduledLocalDate])
+  @@index([status, runLeaseUntil])
+  @@index([userId, windowEnd])
+}
+
+model DigestItem {
+  runId      String
+  contentKey String
+  position   Int
+  title      String
+  summary    String
+  reason     String
+  sourceUrl  String
+  run        DigestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, contentKey])
+  @@unique([runId, position])
+  @@index([contentKey])
 }

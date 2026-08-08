@@ -19,7 +19,11 @@
     "fast-xml-parser": "^5.2.5",
     "ioredis": "^5.6.1",
     "ipaddr.js": "^1.9.1",
+    "nodemailer": "^9.0.5",
     "undici": "^7.28.0",
     "zod": "^4.0.10"
+  },
+  "devDependencies": {
+    "@types/nodemailer": "^8.0.1"
   }
 }

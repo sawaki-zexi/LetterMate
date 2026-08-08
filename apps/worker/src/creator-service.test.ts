@@ -1,7 +1,9 @@
 import type { CreatorJobData, DiscoveryCandidate } from '@lettermate/contracts';
+import { validateSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CreatorDiscoveryService,
+  PrismaCreatorRepository,
   type CreatorRepository,
 } from './creator-service.js';
 
@@ -24,8 +26,21 @@ function repository(): CreatorRepository {
       },
     }),
     listHistoryUrls: vi.fn().mockResolvedValue([]),
+    listArchiveItemsNeedingLocalization: vi.fn().mockResolvedValue([]),
     saveSuccess: vi.fn().mockResolvedValue(1),
     saveFailure: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+function archiveLocalizer() {
+  return {
+    localizeCreatorItems: vi.fn().mockImplementation(async ({ candidates }) => (
+      candidates.map((candidate: { id: string }) => ({
+        id: candidate.id,
+        title: '中文归档标题',
+        summary: '这是一段基于原始内容生成的中文摘要。',
+      }))
+    )),
   };
 }
 
@@ -73,6 +88,7 @@ describe('creator discovery service', () => {
     const service = new CreatorDiscoveryService({
       repository: repo,
       qualityPipeline,
+      archiveLocalizer: archiveLocalizer(),
       createConnector: () => ({
         search: vi.fn().mockResolvedValue({ candidates: [sourceCandidate], requestCount: 1 }),
       }),
@@ -100,6 +116,7 @@ describe('creator discovery service', () => {
     const service = new CreatorDiscoveryService({
       repository: repo,
       qualityPipeline: { run: vi.fn() },
+      archiveLocalizer: archiveLocalizer(),
       createConnector: () => ({ search: vi.fn().mockRejectedValue(new Error('feed unavailable')) }),
       now: () => new Date(now),
     });
@@ -132,6 +149,7 @@ describe('creator discovery service', () => {
     const service = new CreatorDiscoveryService({
       repository: repo,
       qualityPipeline: { run: vi.fn().mockResolvedValue([item]) },
+      archiveLocalizer: archiveLocalizer(),
       createConnector,
       now: () => new Date(now),
     });
@@ -142,5 +160,218 @@ describe('creator discovery service', () => {
       platform: 'x', accountKey: '44196397', feedUrl: null,
     }));
     expect(search.mock.calls[0]?.[0]).toMatchObject({ sourceTypes: ['social'] });
+  });
+
+  it('localizes a valid archive-only creator item before saving it', async () => {
+    const repo = repository();
+    const localizer = archiveLocalizer();
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn().mockResolvedValue([]) },
+      archiveLocalizer: localizer,
+      createConnector: () => ({
+        search: vi.fn().mockResolvedValue({ candidates: [sourceCandidate], requestCount: 1 }),
+      }),
+      now: () => new Date(now),
+    });
+
+    await service.run(job);
+
+    expect(localizer.localizeCreatorItems).toHaveBeenCalledWith(expect.objectContaining({
+      creatorName: 'Example Author',
+      candidates: [expect.objectContaining({
+        id: sourceCandidate.url,
+        title: sourceCandidate.title,
+        text: sourceCandidate.content,
+      })],
+    }));
+    expect(repo.saveSuccess).toHaveBeenCalledWith(expect.objectContaining({
+      items: [],
+      archiveLocalizations: [{
+        id: sourceCandidate.url,
+        title: '中文归档标题',
+        summary: '这是一段基于原始内容生成的中文摘要。',
+      }],
+    }));
+    expect(repo.saveFailure).not.toHaveBeenCalled();
+  });
+
+  it('splits a failed localization batch and skips only the item that still fails alone', async () => {
+    const repo = repository();
+    const good = sourceCandidate;
+    const bad = {
+      ...sourceCandidate,
+      externalId: 'entry-2',
+      url: 'https://example.com/posts/bad-localization',
+      title: 'Another substantive post',
+    };
+    const localizeCreatorItems = vi.fn().mockImplementation(async ({ candidates }) => {
+      if (candidates.length > 1) throw new Error('incomplete batch');
+      const [candidate] = candidates;
+      if (candidate.id === bad.url) throw new Error('single item failed');
+      return [{ id: candidate.id, title: '可用的中文标题', summary: '该内容成功生成了中文摘要。' }];
+    });
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn().mockResolvedValue([]) },
+      archiveLocalizer: { localizeCreatorItems },
+      createConnector: () => ({
+        search: vi.fn().mockResolvedValue({ candidates: [good, bad], requestCount: 1 }),
+      }),
+      now: () => new Date(now),
+    });
+
+    await service.run(job);
+
+    expect(localizeCreatorItems.mock.calls.map(([input]) => input.candidates.length)).toEqual([2, 1, 1]);
+    expect(repo.saveSuccess).toHaveBeenCalledWith(expect.objectContaining({
+      archiveLocalizations: [{
+        id: good.url,
+        title: '可用的中文标题',
+        summary: '该内容成功生成了中文摘要。',
+      }],
+    }));
+    expect(repo.saveFailure).not.toHaveBeenCalled();
+  });
+
+  it('requests at most 30 existing archive items for localization backfill', async () => {
+    const repo = repository();
+    const backfill = Array.from({ length: 30 }, (_, index) => ({
+      id: `https://example.com/archive/${index}`,
+      title: `English title ${index}`,
+      text: `English summary ${index}`,
+      platform: 'Example Blog',
+      authorName: 'Example Author',
+      authorHandle: null,
+      publishedAt: null,
+    }));
+    vi.mocked(repo.listArchiveItemsNeedingLocalization).mockResolvedValue(backfill);
+    const localizer = archiveLocalizer();
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn().mockResolvedValue([]) },
+      archiveLocalizer: localizer,
+      createConnector: () => ({
+        search: vi.fn().mockResolvedValue({ candidates: [], requestCount: 1 }),
+      }),
+      now: () => new Date(now),
+    });
+
+    await service.run(job);
+
+    expect(repo.listArchiveItemsNeedingLocalization).toHaveBeenCalledWith('creator-1', 30);
+    expect(repo.saveSuccess).toHaveBeenCalledWith(expect.objectContaining({
+      archiveLocalizations: expect.arrayContaining([
+        expect.objectContaining({ id: 'https://example.com/archive/0' }),
+        expect.objectContaining({ id: 'https://example.com/archive/29' }),
+      ]),
+    }));
+  });
+});
+
+describe('PrismaCreatorRepository archive localization', () => {
+  it('returns no more than the requested number of non-Chinese archive items', async () => {
+    const rows = Array.from({ length: 35 }, (_, index) => ({
+      id: `item-${index}`,
+      canonicalPrimaryUrl: `https://example.com/archive/${index}`,
+      title: `English title ${index}`,
+      summary: `English summary ${index}`,
+      platform: 'Example Blog',
+      authorName: 'Example Author',
+      authorHandle: null,
+      publishedAt: null,
+    }));
+    const prisma = { creatorItem: { findMany: vi.fn().mockResolvedValue(rows) } };
+
+    const result = await new PrismaCreatorRepository(prisma as never)
+      .listArchiveItemsNeedingLocalization('creator-1', 30);
+
+    expect(result).toHaveLength(30);
+    expect(result[0]?.id).toBe('https://example.com/archive/0');
+    expect(result[29]?.id).toBe('https://example.com/archive/29');
+  });
+
+  it('does not overwrite an existing localized item with raw connector fields on a repeated sync', async () => {
+    const candidate = validateSourceCandidate(sourceCandidate);
+    const transaction = {
+      creatorSubscription: {
+        findFirst: vi.fn().mockResolvedValue({ id: 'creator-1' }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      creatorItem: {
+        findMany: vi.fn().mockResolvedValue([{ canonicalPrimaryUrl: candidate.canonicalUrl }]),
+        upsert: vi.fn(),
+        updateMany: vi.fn(),
+      },
+      creatorRun: { update: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+
+    await new PrismaCreatorRepository(prisma as never).saveSuccess({
+      runId: 'run-1', creatorId: 'creator-1', userId: 'user-1', trigger: 'manual',
+      candidates: [candidate], items: [], archiveLocalizations: [], finishedAt: now,
+    });
+
+    expect(transaction.creatorItem.upsert).not.toHaveBeenCalled();
+    expect(transaction.creatorItem.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('keeps feed eligibility separate and preserves original reply context', async () => {
+    const archiveSource = validateSourceCandidate({
+      ...sourceCandidate,
+      externalId: 'reply-1',
+      url: 'https://example.com/posts/reply-1',
+      creatorContext: {
+        contentType: 'reply' as const,
+        originalAuthorName: null,
+        originalAuthorHandle: null,
+        originalContentId: null,
+        originalContentUrl: null,
+        parentContentId: 'parent-1',
+        parentContentUrl: 'https://example.com/posts/parent-1',
+        parentContentText: 'The parent post remains original evidence.',
+      },
+    });
+    const acceptedSource = validateSourceCandidate(sourceCandidate);
+    const transaction = {
+      creatorSubscription: {
+        findFirst: vi.fn().mockResolvedValue({ id: 'creator-1' }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      creatorItem: {
+        findMany: vi.fn().mockResolvedValue([]),
+        upsert: vi.fn().mockResolvedValue({}),
+        updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+      },
+      creatorRun: { update: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+
+    await new PrismaCreatorRepository(prisma as never).saveSuccess({
+      runId: 'run-1', creatorId: 'creator-1', userId: 'user-1', trigger: 'manual',
+      candidates: [acceptedSource, archiveSource],
+      items: [item],
+      archiveLocalizations: [{
+        id: archiveSource.canonicalUrl,
+        title: '归档回复标题',
+        summary: '这条回复保留了原始父帖作为证据。',
+      }],
+      finishedAt: now,
+    });
+
+    const creates = transaction.creatorItem.upsert.mock.calls.map(([input]) => input.create);
+    expect(creates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        canonicalPrimaryUrl: acceptedSource.canonicalUrl,
+        feedEligible: true,
+        reason: item.reason,
+      }),
+      expect.objectContaining({
+        canonicalPrimaryUrl: archiveSource.canonicalUrl,
+        feedEligible: false,
+        reason: '未进入本次精选',
+        parentContentText: 'The parent post remains original evidence.',
+      }),
+    ]));
   });
 });

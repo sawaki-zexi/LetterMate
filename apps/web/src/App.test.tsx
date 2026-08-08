@@ -9,7 +9,11 @@ import type {
   CreatorItem,
   CreatorIdentityCandidate,
   CreatorPlatformStatus,
+  AuthSession,
   DiscoverySourceStatus,
+  DigestPreference,
+  DigestPreview,
+  DigestStatus,
   FeedItem,
   InterestMemory,
   RunSummary,
@@ -122,6 +126,10 @@ interface FetchMockOptions {
   topicCompletionAfterPolls?: number;
   trendStatus?: TrendStatus;
   interests?: InterestMemory;
+  digestPreference?: DigestPreference;
+  digestPreview?: DigestPreview;
+  digestStatus?: DigestStatus;
+  authSession?: AuthSession;
 }
 
 function installFetchMock({
@@ -149,6 +157,18 @@ function installFetchMock({
   interests: initialInterests = {
     personalizationEnabled: true, resetAt: null, recent: [], longTerm: [], reduced: [],
   },
+  digestPreference: initialDigestPreference = {
+    enabled: false, localTime: '08:00', timezone: 'Asia/Shanghai',
+  },
+  digestPreview = { generatedAt: now.toISOString(), items: [] },
+  digestStatus = {
+    deliveryCapability: 'not_configured', nextLocalSend: null, recentRun: null,
+  },
+  authSession: initialAuthSession = {
+    authenticated: true,
+    user: { id: 'user-a', email: 'user-a@example.local', timezone: 'Asia/Shanghai' },
+    csrfToken: null,
+  },
 }: FetchMockOptions = {}) {
   const refreshedTopicIds = new Set<string>();
   let currentCreators = initialCreators;
@@ -165,6 +185,32 @@ function installFetchMock({
     const method = init?.method ?? 'GET';
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     requests.push({ url, method, body });
+
+    if (url.endsWith('/auth/session')) return Response.json(initialAuthSession);
+    if ((url.endsWith('/auth/login') || url.endsWith('/auth/register')) && method === 'POST') {
+      initialAuthSession = {
+        authenticated: true,
+        user: {
+          id: 'authenticated-user',
+          email: body.email,
+          timezone: body.timezone ?? 'Asia/Shanghai',
+        },
+        csrfToken: 'csrf-token-with-sufficient-length',
+      };
+      return Response.json(initialAuthSession);
+    }
+    if (url.endsWith('/auth/logout') && method === 'POST') {
+      initialAuthSession = { authenticated: false, user: null, csrfToken: null };
+      return new Response(null, { status: 204 });
+    }
+
+    if (url.endsWith('/digest-preference') && method === 'PUT') {
+      initialDigestPreference = body as DigestPreference;
+      return Response.json(initialDigestPreference);
+    }
+    if (url.endsWith('/digest-preference')) return Response.json(initialDigestPreference);
+    if (url.endsWith('/digest-preview')) return Response.json(digestPreview);
+    if (url.endsWith('/digest-status')) return Response.json(digestStatus);
 
     if (url.endsWith('/interests/settings') && method === 'PUT') {
       initialInterests = { ...initialInterests, personalizationEnabled: body.personalizationEnabled };
@@ -1006,6 +1052,8 @@ describe('discovery workspace', () => {
     expect(screen.getByText('已进入发现')).toBeVisible();
     expect(screen.getByText('Original Author · @original')).toBeVisible();
     expect(screen.getByText('这是需要保留的原帖内容。')).toBeVisible();
+    expect(screen.getAllByText('推荐理由')).toHaveLength(1);
+    expect(screen.getAllByText('与关注方向相关')).toHaveLength(1);
     expect(requests).toContainEqual(expect.objectContaining({
       url: '/api/v1/creators/creator-1/items',
       method: 'GET',
@@ -1029,6 +1077,32 @@ describe('discovery workspace', () => {
     }));
     expect(requests.some(({ url, method }) => url.endsWith('/creators') && method === 'POST'))
       .toBe(false);
+  });
+
+  it('renders the proxied avatar returned for an X creator candidate', async () => {
+    const avatarUrl = 'https://wsrv.nl/?url=https%3A%2F%2Fpbs.twimg.com%2Fprofile_images%2Fkarpathy.jpg&w=96&h=96&fit=cover&output=webp';
+    installFetchMock({
+      creatorCandidates: [{
+        resolutionToken: 'x'.repeat(32),
+        platform: 'x',
+        displayName: 'Andrej Karpathy',
+        handle: '@karpathy',
+        avatarUrl,
+        bio: 'Building AI systems',
+        verified: true,
+        profileUrl: 'https://x.com/karpathy',
+        feedUrl: null,
+      }],
+    });
+    renderApp('/creators');
+
+    fireEvent.change(await screen.findByLabelText('博主或主页'), {
+      target: { value: 'Karpathy' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '查找' }));
+
+    expect(await screen.findByText('Andrej Karpathy')).toBeVisible();
+    expect(document.querySelector<HTMLImageElement>(`img[src="${avatarUrl}"]`)).toBeVisible();
   });
 
   it('labels Bilibili creator candidates and platform capability correctly', async () => {
@@ -1177,6 +1251,79 @@ describe('discovery workspace', () => {
     await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({
       url: '/api/v1/interests', method: 'DELETE',
     })));
+  });
+
+  it('updates daily email settings and renders a safe candidate preview', async () => {
+    installFetchMock({
+      digestStatus: {
+        deliveryCapability: 'configured',
+        nextLocalSend: {
+          localDate: '2026-08-09', localTime: '08:00', timezone: 'Asia/Shanghai',
+        },
+        recentRun: {
+          status: 'succeeded', scheduledLocalDate: '2026-08-08',
+          finishedAt: '2026-08-08T00:01:00.000Z', itemCount: 4,
+        },
+      },
+      digestPreview: {
+        generatedAt: now.toISOString(),
+        items: [{
+          contentKey: 'https://example.com/digest-item',
+          title: '模型能力更新',
+          summary: '已持久化的中文摘要。',
+          reason: '包含重要版本变化。',
+          sourceUrl: 'https://example.com/digest-item',
+          publishedAt: now.toISOString(),
+        }],
+      },
+    });
+    renderApp('/digest');
+
+    expect(await screen.findByText('模型能力更新')).toBeVisible();
+    expect(screen.getByText('已配置')).toBeVisible();
+    expect(screen.getByText(/下次发送：2026-08-09 08:00/)).toBeVisible();
+    expect(screen.getByText('已发送')).toBeVisible();
+    expect(screen.getByText('4 条内容')).toBeVisible();
+    expect(screen.getByRole('link', { name: '查看原文' })).toHaveAttribute(
+      'href', 'https://example.com/digest-item',
+    );
+    expect(screen.queryByText(/tag-|置信度|收件地址|内部排序/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '每日邮件' }));
+    fireEvent.change(screen.getByLabelText('发送时间'), { target: { value: '09:30' } });
+    fireEvent.change(screen.getByLabelText('时区'), { target: { value: 'Asia/Tokyo' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+    await waitFor(() => expect(requests).toContainEqual({
+      url: '/api/v1/digest-preference',
+      method: 'PUT',
+      body: { enabled: true, localTime: '09:30', timezone: 'Asia/Tokyo' },
+    }));
+
+    const previewRequests = requests.filter((entry) => entry.url === '/api/v1/digest-preview');
+    fireEvent.click(screen.getByRole('button', { name: '刷新邮件预览' }));
+    await waitFor(() => expect(
+      requests.filter((entry) => entry.url === '/api/v1/digest-preview'),
+    ).toHaveLength(previewRequests.length + 1));
+  });
+
+  it('shows account authentication before loading the private workspace', async () => {
+    installFetchMock({
+      authSession: { authenticated: false, user: null, csrfToken: null },
+    });
+    renderApp('/');
+
+    expect(await screen.findByRole('heading', { name: 'LetterMate' })).toBeVisible();
+    fireEvent.click(screen.getByRole('tab', { name: '注册' }));
+    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'student@example.com' } });
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'correct horse battery staple' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建账户' }));
+
+    await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({
+      url: '/api/v1/auth/register',
+      method: 'POST',
+      body: expect.objectContaining({ email: 'student@example.com' }),
+    })));
+    expect(await screen.findByText('student@example.com')).toBeVisible();
   });
 
   it('defines stable refresh dimensions and a static reduced-motion state', () => {

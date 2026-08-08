@@ -7,6 +7,7 @@ export const TREND_CLASSIFICATION_MAX_OUTPUT_TOKENS = 4_096;
 export const TREND_CLASSIFICATION_MAX_ID_LENGTH = 100;
 export const TREND_CLASSIFICATION_MAX_QUERY_LENGTH = 300;
 export const TREND_CLASSIFICATION_MAX_TERM_LENGTH = 100;
+export const CREATOR_ARCHIVE_LOCALIZATION_MAX_ITEMS = 8;
 const TREND_CLASSIFICATION_STRUCTURE_UNITS_PER_DECISION = 128;
 export const TREND_CLASSIFICATION_WORST_CASE_OUTPUT_UNITS = 32 +
   TREND_CLASSIFICATION_MAX_SEEDS * (
@@ -46,6 +47,22 @@ export interface CompositionCandidate {
   assessment: QualityAssessment;
 }
 
+export interface CreatorArchiveLocalizationCandidate {
+  id: string;
+  title: string | null;
+  text: string;
+  platform: string;
+  authorName: string | null;
+  authorHandle: string | null;
+  publishedAt: string | null;
+}
+
+export interface CreatorArchiveLocalization {
+  id: string;
+  title: string;
+  summary: string;
+}
+
 export interface TrendSeedClassificationInput {
   id: string;
   title: string;
@@ -76,6 +93,11 @@ export interface AiGateway {
     candidates: CompositionCandidate[];
     signal?: AbortSignal;
   }): Promise<DiscoveryCandidate[]>;
+  localizeCreatorItems(input: {
+    creatorName: string;
+    candidates: CreatorArchiveLocalizationCandidate[];
+    signal?: AbortSignal;
+  }): Promise<CreatorArchiveLocalization[]>;
 }
 
 export type AiGatewayErrorCode =

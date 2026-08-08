@@ -5,6 +5,8 @@ import type {
   InterestMemoryTheme,
 } from '@lettermate/contracts';
 import {
+  applyExplorationEligibility,
+  INTEREST_ADJACENCY_VERSION,
   INTEREST_DISABLED_RANKING_VERSION,
   INTEREST_EXTRACTOR_VERSION,
   INTEREST_PROFILE_POLICY_VERSION,
@@ -15,6 +17,7 @@ import {
   rankShadowSlate,
   type CandidateInterestTag,
   type InterestSignal,
+  type InterestTagAdjacency,
   type ShadowRankedItem,
 } from '@lettermate/domain';
 import type { PrismaClient } from '@prisma/client';
@@ -64,12 +67,17 @@ export interface MemoryCreatorContent {
   discoveredAt: string;
 }
 
+export interface MemoryInterestTagAdjacency extends InterestTagAdjacency {
+  relationVersion: string;
+}
+
 export interface MemoryPersonalizationFacts {
   events: InterestEvent[];
   tags: MemoryInterestTag[];
   creatorContent: MemoryCreatorContent[];
   settings: Record<string, { personalizationEnabled: boolean; resetAt: string | null }>;
   forgottenTagIds: Record<string, string[]>;
+  adjacencies?: MemoryInterestTagAdjacency[];
 }
 
 const hash = (value: unknown): string => createHash('sha256')
@@ -90,6 +98,7 @@ function buildShadow(input: {
   personalizationEnabled: boolean;
   resetAt: string | null;
   forgottenTagIds: readonly string[];
+  adjacencies: readonly MemoryInterestTagAdjacency[];
 }) {
   const events = activeEvents(input.events);
   const tagsByContent = new Map<string, MemoryInterestTag[]>();
@@ -159,31 +168,66 @@ function buildShadow(input: {
       (tagsByContent.get(candidate.contentKey) ?? []).map((tag) => ({
         tagId: tag.tagId,
         confidence: tag.confidence,
-      })),
+      })).sort((left, right) => (
+        left.tagId.localeCompare(right.tagId) || right.confidence - left.confidence
+      )),
     ]),
   );
-  const personalizedRanked = rankShadowSlate({
+  const currentAdjacencies = input.adjacencies
+    .filter((relation) => relation.relationVersion === INTEREST_ADJACENCY_VERSION)
+    .map(({ leftTagId, rightTagId }) => ({ leftTagId, rightTagId }))
+    .sort((left, right) => (
+      left.leftTagId.localeCompare(right.leftTagId)
+      || left.rightTagId.localeCompare(right.rightTagId)
+    ));
+  const explorationCandidates = applyExplorationEligibility({
     candidates: input.request.candidates.map((item) => ({
       item,
       tags: candidateTags.get(item.contentKey) ?? [],
     })),
     profile,
+    adjacencies: currentAdjacencies,
+    forgottenTagIds: input.forgottenTagIds,
+    surface: 'feed',
+  });
+  const personalizedRanked = rankShadowSlate({
+    candidates: input.request.surface === 'digest'
+      ? explorationCandidates.filter((candidate) => !candidate.explorationEligible)
+      : explorationCandidates,
+    profile,
     asOf: projectionAsOf,
   });
   const rankedByKey = new Map(personalizedRanked.map((item) => [item.contentKey, item]));
+  const explorationByKey = new Map(explorationCandidates.map((candidate) => (
+    [candidate.item.contentKey, candidate.explorationEligible ?? false]
+  )));
+  const surfaceCandidates = input.request.surface === 'digest'
+    ? input.request.candidates.filter((candidate) => (
+        !explorationByKey.get(candidate.contentKey)
+      ))
+    : input.request.candidates;
   const ranked = input.personalizationEnabled
     ? personalizedRanked
-    : input.request.candidates.map((candidate, position) => ({
-        ...(rankedByKey.get(candidate.contentKey) ?? {
-          contentKey: candidate.contentKey,
-          lane: 'trend' as const,
+    : surfaceCandidates.map((candidate, position) => {
+        const rankedItem = rankedByKey.get(candidate.contentKey);
+        return {
+          ...(rankedItem ? {
+            ...rankedItem,
+            lane: rankedItem.lane === 'exploration' ? 'trend' as const : rankedItem.lane,
+            reasonCodes: rankedItem.reasonCodes.filter((reason) => (
+              reason !== 'ADJACENT_EXPLORATION'
+            )),
+          } : {
+            contentKey: candidate.contentKey,
+            lane: 'trend' as const,
+            isExploration: false,
+            reasonCodes: [],
+            score: 0,
+          }),
+          position,
           isExploration: false,
-          reasonCodes: [],
-          score: 0,
-        }),
-        position,
-        isExploration: false,
-      }));
+        };
+      });
   const profileVersion = hash({
     policyVersion: INTEREST_PROFILE_POLICY_VERSION,
     projectionAsOf: projectionAsOf.toISOString(),
@@ -192,10 +236,15 @@ function buildShadow(input: {
     resetAt: input.resetAt,
     forgottenTagIds: [...forgotten].sort(),
   });
-  const candidateVersion = hash(input.request.candidates.map((candidate) => ({
-    contentKey: candidate.contentKey,
-    tags: candidateTags.get(candidate.contentKey) ?? [],
-  })));
+  const candidateVersion = hash({
+    adjacencyVersion: INTEREST_ADJACENCY_VERSION,
+    candidates: input.request.candidates.map((candidate) => ({
+      contentKey: candidate.contentKey,
+      tags: candidateTags.get(candidate.contentKey) ?? [],
+      explorationEligible: explorationByKey.get(candidate.contentKey) ?? false,
+    })),
+    adjacencies: currentAdjacencies,
+  });
   const requestKey = hash({
     surface: input.request.surface,
     profileVersion,
@@ -296,6 +345,7 @@ export class MemoryPersonalizationMemory implements PersonalizationMemory {
       personalizationEnabled: settings.personalizationEnabled,
       resetAt: settings.resetAt,
       forgottenTagIds: facts.forgottenTagIds[input.userId] ?? [],
+      adjacencies: facts.adjacencies ?? [],
     });
     return {
       decisionId: result.requestKey,
@@ -317,6 +367,7 @@ export class MemoryPersonalizationMemory implements PersonalizationMemory {
       personalizationEnabled: settings.personalizationEnabled,
       resetAt: settings.resetAt,
       forgottenTagIds: facts.forgottenTagIds[userId] ?? [],
+      adjacencies: facts.adjacencies ?? [],
     });
     const tags = new Map(facts.tags.map((tag) => [tag.tagId, tag]));
     return toMemoryView(settings, result.profile.flatMap((profile) => {
@@ -433,6 +484,20 @@ export class PrismaPersonalizationMemory implements PersonalizationMemory {
         createdAt: tag.createdAt.toISOString(),
       })),
     ];
+    const tagIds = [...new Set(tags.map((tag) => tag.tagId))];
+    const adjacencyRows = tagIds.length === 0
+      ? []
+      : await this.prisma.interestTagAdjacency.findMany({
+          where: {
+            relationVersion: INTEREST_ADJACENCY_VERSION,
+            OR: [
+              { leftTagId: { in: tagIds } },
+              { rightTagId: { in: tagIds } },
+            ],
+          },
+          select: { leftTagId: true, rightTagId: true, relationVersion: true },
+          orderBy: [{ leftTagId: 'asc' }, { rightTagId: 'asc' }],
+        });
     const result = buildShadow({
       request: input,
       events,
@@ -446,6 +511,7 @@ export class PrismaPersonalizationMemory implements PersonalizationMemory {
       personalizationEnabled: settings?.personalizationEnabled ?? true,
       resetAt: settings?.resetAt?.toISOString() ?? null,
       forgottenTagIds: forgottenTags.map((tag) => tag.tagId),
+      adjacencies: adjacencyRows,
     });
     const decisionId = randomUUID();
     const throughEventId = result.events.at(-1)?.id ?? null;

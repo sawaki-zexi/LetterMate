@@ -4,8 +4,9 @@ export const INTEREST_TAXONOMY_VERSION = '2026-08-08-v1';
 export const INTEREST_EXTRACTOR_VERSION = 'openrouter-theme-v1';
 export const INTEREST_PROFILE_POLICY_VERSION = 'interest-profile-v1';
 export const INTEREST_SHADOW_RANKING_VERSION = 'interest-shadow-v1';
-export const INTEREST_RULES_RANKING_VERSION = 'interest-rules-v1';
+export const INTEREST_RULES_RANKING_VERSION = 'interest-rules-v2';
 export const INTEREST_DISABLED_RANKING_VERSION = 'personalization-off-v1';
+export const INTEREST_ADJACENCY_VERSION = 'qualified-content-cooccurrence-v1';
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 
@@ -38,6 +39,11 @@ export interface ShadowCandidate {
   explorationEligible?: boolean;
 }
 
+export interface InterestTagAdjacency {
+  leftTagId: string;
+  rightTagId: string;
+}
+
 export type RecommendationLane = 'subscription' | 'interest' | 'trend' | 'exploration';
 export type RecommendationReasonCode =
   | 'FOLLOWED_TOPIC'
@@ -61,6 +67,50 @@ const decay = (ageDays: number, halfLifeDays: number): number => (
 );
 
 const rounded = (value: number): number => Number(value.toFixed(6));
+
+const isSubscriptionCandidate = (candidate: ShadowCandidate): boolean => (
+  candidate.item.origins.some((origin) => (
+    origin.origin === 'creator'
+    || origin.origin === 'topic' && origin.topicKeywordActive
+  ))
+);
+
+const hasPositiveInterest = (profile: InterestProfileEntry): boolean => (
+  profile.shortScore + profile.longScore > profile.negativeScore
+  && profile.shortScore + profile.longScore > 0
+);
+
+export function applyExplorationEligibility(input: {
+  candidates: readonly ShadowCandidate[];
+  profile: readonly InterestProfileEntry[];
+  adjacencies: readonly InterestTagAdjacency[];
+  forgottenTagIds: readonly string[];
+  surface: 'feed' | 'digest';
+}): ShadowCandidate[] {
+  const positiveTagIds = new Set(
+    input.profile.filter(hasPositiveInterest).map((entry) => entry.tagId),
+  );
+  const negativeTagIds = new Set(
+    input.profile.filter((entry) => entry.negativeScore > 0).map((entry) => entry.tagId),
+  );
+  const forgottenTagIds = new Set(input.forgottenTagIds);
+  const adjacentToPositive = new Set<string>();
+  for (const relation of input.adjacencies) {
+    if (positiveTagIds.has(relation.leftTagId)) adjacentToPositive.add(relation.rightTagId);
+    if (positiveTagIds.has(relation.rightTagId)) adjacentToPositive.add(relation.leftTagId);
+  }
+  return input.candidates.map((candidate) => {
+    const tagIds = candidate.tags.map((tag) => tag.tagId);
+    const explorationEligible = input.surface === 'feed'
+      && candidate.item.feedback !== 'less'
+      && !isSubscriptionCandidate(candidate)
+      && !tagIds.some((tagId) => forgottenTagIds.has(tagId))
+      && !tagIds.some((tagId) => negativeTagIds.has(tagId))
+      && !tagIds.some((tagId) => positiveTagIds.has(tagId))
+      && tagIds.some((tagId) => adjacentToPositive.has(tagId));
+    return { ...candidate, explorationEligible };
+  });
+}
 
 export function interestSlugFromText(value: string): string | null {
   const slug = value.normalize('NFKC').toLowerCase()

@@ -31,6 +31,25 @@ const tweet = (overrides: Record<string, unknown> = {}) => ({
 });
 
 describe('XCreatorConnector', () => {
+  it('reads timeline tweets from the provider data envelope', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 'OK',
+      status: 'success',
+      data: { tweets: [tweet()] },
+      has_next_page: false,
+      next_cursor: '',
+    }), { status: 200 }));
+    const connector = new XCreatorConnector(
+      { apiKey: 'test-key', userId: 'creator-id', pageBudget: 1 },
+      fetcher as typeof fetch,
+    );
+
+    const result = await connector.search(plan, new AbortController().signal);
+
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]).toMatchObject({ externalId: '100' });
+  });
+
   it('loads a stable user timeline and preserves repost and reply relationships', async () => {
     const original = tweet({
       id: '200',

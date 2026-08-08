@@ -6,6 +6,7 @@ import {
 } from '@lettermate/contracts';
 import {
   canonicalizeUrl,
+  INTEREST_ADJACENCY_VERSION,
   INTEREST_EXTRACTOR_VERSION,
   INTEREST_TAXONOMY_VERSION,
 } from '@lettermate/domain';
@@ -60,6 +61,23 @@ export function normalizeInterestTags(extraction: unknown): InterestTagSuggestio
   return [...selected.values()].sort((left, right) => left.slug.localeCompare(right.slug));
 }
 
+export function interestTagAdjacencyPairs(tags: ReadonlyArray<{
+  tagId: string;
+  kind: InterestTagSuggestion['kind'];
+  confidence: number;
+}>): Array<{ leftTagId: string; rightTagId: string }> {
+  const eligibleIds = [...new Set(tags
+    .filter((tag) => tag.kind !== 'content_type' && tag.confidence >= 0.75)
+    .map((tag) => tag.tagId))].sort();
+  const pairs: Array<{ leftTagId: string; rightTagId: string }> = [];
+  for (let left = 0; left < eligibleIds.length; left += 1) {
+    for (let right = left + 1; right < eligibleIds.length; right += 1) {
+      pairs.push({ leftTagId: eligibleIds[left]!, rightTagId: eligibleIds[right]! });
+    }
+  }
+  return pairs;
+}
+
 export class PrismaContentInterestTagRepository implements ContentInterestTagRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
@@ -73,6 +91,11 @@ export class PrismaContentInterestTagRepository implements ContentInterestTagRep
       await transaction.contentInterestTag.deleteMany({
         where: { contentKey: input.contentKey, extractorVersion: input.extractorVersion },
       });
+      const storedTags: Array<{
+        tagId: string;
+        kind: InterestTagSuggestion['kind'];
+        confidence: number;
+      }> = [];
       for (const tag of input.tags) {
         const stored = await transaction.interestTag.upsert({
           where: {
@@ -100,6 +123,19 @@ export class PrismaContentInterestTagRepository implements ContentInterestTagRep
             confidence: tag.confidence,
             extractorVersion: input.extractorVersion,
           },
+        });
+        storedTags.push({ tagId: stored.id, kind: tag.kind, confidence: tag.confidence });
+      }
+      for (const pair of interestTagAdjacencyPairs(storedTags)) {
+        await transaction.interestTagAdjacency.upsert({
+          where: {
+            leftTagId_rightTagId_relationVersion: {
+              ...pair,
+              relationVersion: INTEREST_ADJACENCY_VERSION,
+            },
+          },
+          create: { ...pair, relationVersion: INTEREST_ADJACENCY_VERSION },
+          update: {},
         });
       }
     });

@@ -21,5 +21,8 @@
     "ipaddr.js": "^1.9.1",
     "undici": "^7.28.0",
     "zod": "^4.0.10"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6"
   }
 }

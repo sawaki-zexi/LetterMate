@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 const forbiddenPublicLanguage = /可信|已核实|证据数量|已确认|待核实|已驳回|证据链|来源排名|评分|\b(?:trust|trusted|trustworthy|verified|confirmed|unverified|rejected|rank|ranking|score|scoring|rating)\b|\b(?:pending verification|evidence (?:chain|count)|source (?:rank|ranking))\b/iu;
 
-test('controls interest memory and keeps the four-way navigation stable', async ({ page }, testInfo) => {
+test('controls interest memory and keeps the five-way navigation stable', async ({ page }, testInfo) => {
   const userId = `e2e-interests-${testInfo.project.name}-${randomUUID()}`;
   await page.route('**/api/v1/**', async (route) => route.continue({
     headers: { ...route.request().headers(), 'x-user-id': userId },
@@ -35,7 +35,7 @@ test('controls interest memory and keeps the four-way navigation stable', async 
 
   if (testInfo.project.name === 'mobile' || testInfo.project.name === 'compact-mobile') {
     const navItems = page.locator('.bottom-nav a');
-    await expect(navItems).toHaveCount(4);
+    await expect(navItems).toHaveCount(5);
     const boxes = await navItems.evaluateAll((links) => links.map((link) => {
       const box = link.getBoundingClientRect();
       return { left: box.left, right: box.right, width: box.width };
@@ -200,6 +200,7 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
 
   await page.getByRole('link', { name: '发现' }).last().click();
   await expect(page.getByText('gpt-5.7 Agent 工程实践指南').first()).toBeVisible();
+  await expect(page.getByText('拓展发现').first()).toBeVisible();
   await expect.poll(() => feedRequests.some((url) =>
     url.searchParams.get('range') === '30d' && url.searchParams.get('origin') === 'all',
   )).toBe(true);
@@ -383,6 +384,24 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
     await expect(completion).toHaveText('刷新完成，暂无新增内容');
     await expect(refreshButton).toHaveAttribute('aria-busy', 'false');
   }
+
+  await page.getByRole('link', { name: '每日邮件' }).last().click();
+  await expect(page.getByRole('heading', {
+    name: '每日邮件', exact: true, level: 1,
+  })).toBeVisible();
+  await expect(page.getByText('服务器尚未配置邮件服务，当前不会创建发送任务')).toBeVisible();
+  await expect(page.getByText('尚无运行记录')).toBeVisible();
+  await expect(page.getByText('gpt-5.7 Agent 工程实践指南')).toBeVisible();
+  await expect(page.getByText('AI tooling release gains attention')).toHaveCount(0);
+  await expect(page.locator('.digest-preview-item')).toHaveCount(10);
+  await page.getByRole('checkbox', { name: '每日邮件' }).check();
+  await page.getByLabel('发送时间').fill('09:30');
+  const digestPreferenceResponse = page.waitForResponse((response) => (
+    response.request().method() === 'PUT'
+      && new URL(response.url()).pathname === '/api/v1/digest-preference'
+  ));
+  await page.getByRole('button', { name: '保存设置' }).click();
+  expect((await digestPreferenceResponse).ok()).toBe(true);
 
   expect(feedRequests.some((url) =>
     url.searchParams.get('origin') === 'trend' && url.searchParams.has('topicId'),

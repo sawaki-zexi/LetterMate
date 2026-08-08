@@ -21,6 +21,7 @@ import {
   CreatorResolutionService,
   type CreatorIdentityResolver,
 } from './creator-resolver.js';
+import { AuthService, MemoryAuthStore } from './auth-service.js';
 
 class RecordingQueue implements TopicQueue {
   jobs: DiscoveryJobData[] = [];
@@ -166,6 +167,23 @@ describe('AI discovery API', () => {
     await app.close();
   });
 
+  it('returns one validated trace ID in both headers and error bodies', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/api/v1/interests')
+      .set('x-trace-id', 'trace-request-1')
+      .expect(401);
+    expect(response.headers['x-trace-id']).toBe('trace-request-1');
+    expect(response.body.traceId).toBe('trace-request-1');
+
+    const unsafe = await request(app.getHttpServer())
+      .get('/api/v1/interests')
+      .set('x-trace-id', 'student@example.com secret')
+      .expect(401);
+    expect(unsafe.headers['x-trace-id']).toEqual(expect.any(String));
+    expect(unsafe.headers['x-trace-id']).not.toBe('student@example.com secret');
+    expect(unsafe.body.traceId).toBe(unsafe.headers['x-trace-id']);
+  });
+
   it('reads and controls only the authenticated user interest memory', async () => {
     const initial = await request(app.getHttpServer())
       .get('/api/v1/interests')
@@ -196,6 +214,98 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(200);
     await request(app.getHttpServer()).get('/api/v1/interests').expect(401);
+  });
+
+  it('updates owned digest settings and previews at most ten non-exploration items', async () => {
+    const initial = await request(app.getHttpServer())
+      .get('/api/v1/digest-preference')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(initial.body).toEqual({
+      enabled: false, localTime: '08:00', timezone: 'Asia/Shanghai',
+    });
+    expect(initial.body).not.toHaveProperty('recipientEmail');
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-status')
+      .set('x-user-id', 'user-a')
+      .expect(200, {
+        deliveryCapability: 'not_configured', nextLocalSend: null, recentRun: null,
+      });
+
+    const updated = await request(app.getHttpServer())
+      .put('/api/v1/digest-preference')
+      .set('x-user-id', 'user-a')
+      .send({ enabled: true, localTime: '09:30', timezone: 'Asia/Tokyo' })
+      .expect(200);
+    expect(updated.body).toEqual({
+      enabled: true, localTime: '09:30', timezone: 'Asia/Tokyo',
+    });
+    await request(app.getHttpServer())
+      .put('/api/v1/digest-preference')
+      .set('x-user-id', 'user-a')
+      .send({ enabled: true, localTime: '24:00', timezone: 'Asia/Tokyo' })
+      .expect(400);
+    await request(app.getHttpServer())
+      .put('/api/v1/digest-preference')
+      .set('x-user-id', 'user-a')
+      .send({ enabled: true, localTime: '09:30', timezone: 'Tokyo' })
+      .expect(400);
+    await request(app.getHttpServer())
+      .put('/api/v1/digest-preference')
+      .set('x-user-id', 'user-a')
+      .send({
+        enabled: true, localTime: '09:30', timezone: 'Asia/Tokyo',
+        recipientEmail: 'other@example.com',
+      })
+      .expect(400);
+
+    const userB = await request(app.getHttpServer())
+      .get('/api/v1/digest-preference')
+      .set('x-user-id', 'user-b')
+      .expect(200);
+    expect(userB.body.enabled).toBe(false);
+
+    const items = Array.from({ length: 12 }, (_, index) => store.seedRadarItem(
+      'user-a',
+      'quality',
+      {
+        sourceUrl: `https://example.com/digest-${index}`,
+        discoveredAt: `2026-07-27T${String(index).padStart(2, '0')}:00:00.000Z`,
+      },
+    ));
+    personalizationFacts.tags.push({
+      tagId: 'tag-edge', slug: 'edge', displayName: 'Edge', kind: 'topic',
+      confidence: 0.9, contentKey: items[0]!.contentKey,
+      createdAt: '2026-07-27T08:00:00.000Z',
+    });
+    personalizationFacts.adjacencies = [{
+      leftTagId: 'tag-agents', rightTagId: 'tag-edge',
+      relationVersion: 'qualified-content-cooccurrence-v1',
+    }];
+    store.seedRadarItem('user-b', 'quality', {
+      sourceUrl: 'https://example.com/user-b-only',
+    });
+
+    const preview = await request(app.getHttpServer())
+      .get('/api/v1/digest-preview')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(preview.body.items).toHaveLength(10);
+    expect(preview.body.items.some((item: { contentKey: string }) => (
+      item.contentKey === items[0]!.contentKey
+    ))).toBe(false);
+    expect(preview.body.items.every((item: Record<string, unknown>) => (
+      !('score' in item) && !('isExploration' in item) && !('tagId' in item)
+    ))).toBe(true);
+
+    const userBPreview = await request(app.getHttpServer())
+      .get('/api/v1/digest-preview')
+      .set('x-user-id', 'user-b')
+      .expect(200);
+    expect(userBPreview.body.items).toHaveLength(1);
+    expect(userBPreview.body.items[0].contentKey).toBe('https://example.com/user-b-only');
+    await request(app.getHttpServer()).get('/api/v1/digest-preview').expect(401);
+    await request(app.getHttpServer()).get('/api/v1/digest-status').expect(401);
   });
 
   it('creates one trimmed keyword topic and enqueues its first refresh', async () => {
@@ -1000,5 +1110,75 @@ describe('AI discovery API', () => {
 
     expect(response.body).toMatchObject({ code: 'VALIDATION_ERROR' });
     expect(response.body.traceId).toEqual(expect.any(String));
+  });
+});
+
+describe('production session identity', () => {
+  it('rejects spoofed identity, enforces CSRF, and revokes logout sessions', async () => {
+    let currentTime = new Date('2026-08-08T00:00:00.000Z');
+    const auth = new AuthService(
+      new MemoryAuthStore(),
+      'session-secret-with-at-least-32-characters',
+      'csrf-secret-with-at-least-32-characters',
+      () => currentTime,
+    );
+    const localApp = await createApiApp({
+      store: new MemoryTopicStore(),
+      queue: new RecordingQueue(),
+      trendQueue: new RecordingTrendQueue(),
+      creatorQueue: new RecordingCreatorQueue(),
+      aiConfigured: true,
+      authService: auth,
+      allowDevIdentity: false,
+      now: () => currentTime,
+    });
+    const agent = request.agent(localApp.getHttpServer());
+
+    await request(localApp.getHttpServer())
+      .get('/api/v1/topics')
+      .set('x-user-id', 'spoofed-user')
+      .expect(401);
+    await agent.get('/api/v1/auth/session').expect(200, {
+      authenticated: false, user: null, csrfToken: null,
+    });
+
+    const registered = await agent.post('/api/v1/auth/register').send({
+      email: 'student@example.com',
+      password: 'correct horse battery staple',
+      timezone: 'Asia/Shanghai',
+    }).expect(201);
+    expect(registered.body).toMatchObject({
+      authenticated: true,
+      user: { email: 'student@example.com', timezone: 'Asia/Shanghai' },
+      csrfToken: expect.any(String),
+    });
+    const setCookie = registered.headers['set-cookie'];
+    expect(Array.isArray(setCookie) ? setCookie.join(';') : setCookie).toMatch(/lettermate_session=.*HttpOnly/);
+
+    await agent.post('/api/v1/topics').send({ keyword: 'gpt-5.7' }).expect(403);
+    await agent.post('/api/v1/topics')
+      .set('x-csrf-token', 'invalid.token')
+      .send({ keyword: 'gpt-5.7' })
+      .expect(403);
+    await agent.post('/api/v1/topics')
+      .set('x-csrf-token', registered.body.csrfToken)
+      .send({ keyword: 'gpt-5.7' })
+      .expect(201);
+
+    currentTime = new Date('2026-09-02T00:00:00.000Z');
+    const session = await agent.get('/api/v1/auth/session').expect(200);
+    expect(session.body.user.email).toBe('student@example.com');
+    const renewedCookies = session.headers['set-cookie'];
+    expect(Array.isArray(renewedCookies) ? renewedCookies.join(';') : renewedCookies)
+      .toMatch(/lettermate_session=.*Max-Age=2592000/);
+    await agent.post('/api/v1/auth/logout')
+      .set('x-csrf-token', session.body.csrfToken)
+      .expect(204);
+    await agent.get('/api/v1/auth/session').expect(200, {
+      authenticated: false, user: null, csrfToken: null,
+    });
+    await agent.get('/api/v1/topics').expect(401);
+
+    await localApp.close();
   });
 });

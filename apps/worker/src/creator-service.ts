@@ -9,6 +9,10 @@ import { canonicalizeUrl, validateSourceCandidate, type ValidatedSourceCandidate
 import { Prisma, type CreatorSubscription, type PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import type { AiGateway } from './ai-gateway.js';
+import type {
+  CreatorArchiveLocalization,
+  CreatorArchiveLocalizationCandidate,
+} from './ai-gateway.js';
 import { RssConnector } from './connectors/rss.js';
 import type { ConnectorResult, SourceQueryPlan } from './connectors/types.js';
 import { XCreatorConnector } from './connectors/x-creator.js';
@@ -17,8 +21,11 @@ import { QualityPipeline } from './quality-pipeline.js';
 import { buildKeywordPolicy } from './keyword-policy.js';
 import { ContentFetcher } from './content-fetcher.js';
 import type { ContentInterestTagger } from './content-interest-tagger.js';
+import { isChineseContent } from './chinese-content.js';
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const ARCHIVE_LOCALIZATION_BATCH_SIZE = 8;
+const ARCHIVE_LOCALIZATION_BACKFILL_LIMIT = 30;
 
 export interface CreatorRunClaim {
   state: 'claimed' | 'active' | 'missing';
@@ -29,6 +36,10 @@ export interface CreatorRunClaim {
 export interface CreatorRepository {
   claimRun(input: CreatorJobData, startedAt: Date): Promise<CreatorRunClaim>;
   listHistoryUrls(creatorId: string): Promise<string[]>;
+  listArchiveItemsNeedingLocalization(
+    creatorId: string,
+    limit: number,
+  ): Promise<CreatorArchiveLocalizationCandidate[]>;
   saveSuccess(input: {
     runId: string;
     creatorId: string;
@@ -36,6 +47,7 @@ export interface CreatorRepository {
     trigger: DiscoveryTrigger;
     candidates: ValidatedSourceCandidate[];
     items: DiscoveryCandidate[];
+    archiveLocalizations: CreatorArchiveLocalization[];
     identity?: { displayName: string; profileUrl: string; handle: string | null };
     finishedAt: Date;
   }): Promise<number>;
@@ -61,6 +73,7 @@ function safeError(error: unknown): SafeError {
 export interface CreatorDiscoveryServiceOptions {
   repository: CreatorRepository;
   qualityPipeline: Pick<QualityPipeline, 'run'>;
+  archiveLocalizer: Pick<AiGateway, 'localizeCreatorItems'>;
   createConnector?: (creator: NonNullable<CreatorRunClaim['creator']>) => {
     search(plan: SourceQueryPlan, signal: AbortSignal): Promise<ConnectorResult>;
   };
@@ -109,9 +122,13 @@ export class CreatorDiscoveryService {
         maxCandidates: 30,
         matchPolicy: buildKeywordPolicy(claim.creator.displayName),
       };
-      const [result, historyUrls] = await Promise.all([
+      const [result, historyUrls, archiveBackfill] = await Promise.all([
         this.createConnector(claim.creator).search(plan, controller.signal),
         this.options.repository.listHistoryUrls(claim.creator.id),
+        this.options.repository.listArchiveItemsNeedingLocalization(
+          claim.creator.id,
+          ARCHIVE_LOCALIZATION_BACKFILL_LIMIT,
+        ),
       ]);
       if (controller.signal.aborted) throw new Error('Creator run timed out');
       const candidates = result.candidates.map((candidate) => validateSourceCandidate(candidate));
@@ -123,6 +140,32 @@ export class CreatorDiscoveryService {
         windowEnd: plan.windowEnd,
         signal: controller.signal,
       });
+      const feedUrls = new Set(items.flatMap((item) => (
+        item.sourceUrls.map((url) => canonicalizeUrl(url))
+      )));
+      const historyUrlSet = new Set(historyUrls);
+      const newArchiveCandidates = candidates.flatMap((candidate) => {
+        if (feedUrls.has(candidate.canonicalUrl) || historyUrlSet.has(candidate.canonicalUrl)) return [];
+        const text = candidate.content ?? candidate.excerpt ?? candidate.title;
+        if (!text) return [];
+        return [{
+          id: candidate.canonicalUrl,
+          title: candidate.title,
+          text,
+          platform: candidate.platform,
+          authorName: candidate.authorName,
+          authorHandle: candidate.authorHandle,
+          publishedAt: candidate.publishedAt,
+        }];
+      });
+      const archiveCandidatesById = new Map(
+        [...archiveBackfill, ...newArchiveCandidates].map((candidate) => [candidate.id, candidate]),
+      );
+      const archiveLocalizations = await this.localizeArchiveItems(
+        claim.creator.displayName,
+        [...archiveCandidatesById.values()],
+        controller.signal,
+      );
       const finishedAt = this.now();
       await this.options.repository.saveSuccess({
         runId: claim.runId,
@@ -131,6 +174,7 @@ export class CreatorDiscoveryService {
         trigger: parsed.trigger,
         candidates,
         items,
+        archiveLocalizations,
         ...(result.identity ? { identity: result.identity } : {}),
         finishedAt,
       });
@@ -148,6 +192,58 @@ export class CreatorDiscoveryService {
       throw error;
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  private async localizeArchiveItems(
+    creatorName: string,
+    candidates: CreatorArchiveLocalizationCandidate[],
+    signal: AbortSignal,
+  ): Promise<CreatorArchiveLocalization[]> {
+    const results: CreatorArchiveLocalization[] = [];
+    for (let index = 0; index < candidates.length; index += ARCHIVE_LOCALIZATION_BATCH_SIZE) {
+      const batch = candidates.slice(index, index + ARCHIVE_LOCALIZATION_BATCH_SIZE);
+      results.push(...await this.localizeArchiveBatch(creatorName, batch, signal));
+    }
+    return results;
+  }
+
+  private async localizeArchiveBatch(
+    creatorName: string,
+    candidates: CreatorArchiveLocalizationCandidate[],
+    signal: AbortSignal,
+  ): Promise<CreatorArchiveLocalization[]> {
+    if (candidates.length === 0) return [];
+    try {
+      const items = await this.options.archiveLocalizer.localizeCreatorItems({
+        creatorName,
+        candidates,
+        signal,
+      });
+      const inputIds = new Set(candidates.map(({ id }) => id));
+      const outputIds = new Set<string>();
+      for (const item of items) {
+        if (
+          !inputIds.has(item.id)
+          || outputIds.has(item.id)
+          || !isChineseContent(item.title)
+          || !isChineseContent(item.summary)
+        ) {
+          throw new Error('Creator archive localization returned invalid items');
+        }
+        outputIds.add(item.id);
+      }
+      if (outputIds.size !== inputIds.size) {
+        throw new Error('Creator archive localization returned incomplete items');
+      }
+      return items;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (candidates.length === 1) return [];
+      const midpoint = Math.ceil(candidates.length / 2);
+      const left = await this.localizeArchiveBatch(creatorName, candidates.slice(0, midpoint), signal);
+      const right = await this.localizeArchiveBatch(creatorName, candidates.slice(midpoint), signal);
+      return [...left, ...right];
     }
   }
 }
@@ -224,9 +320,55 @@ export class PrismaCreatorRepository implements CreatorRepository {
     return [...new Set(items.flatMap((item) => item.sourceUrls.map((url) => canonicalizeUrl(url))))];
   }
 
+  async listArchiveItemsNeedingLocalization(
+    creatorId: string,
+    limit: number,
+  ): Promise<CreatorArchiveLocalizationCandidate[]> {
+    if (limit <= 0) return [];
+    const results: CreatorArchiveLocalizationCandidate[] = [];
+    let cursor: string | undefined;
+    const pageSize = 100;
+    while (results.length < limit) {
+      const rows = await this.prisma.creatorItem.findMany({
+        where: { creatorId },
+        orderBy: { id: 'asc' },
+        take: pageSize,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        select: {
+          id: true,
+          canonicalPrimaryUrl: true,
+          title: true,
+          summary: true,
+          platform: true,
+          authorName: true,
+          authorHandle: true,
+          publishedAt: true,
+        },
+      });
+      for (const row of rows) {
+        if (isChineseContent(row.title) && isChineseContent(row.summary)) continue;
+        results.push({
+          id: row.canonicalPrimaryUrl,
+          title: row.title,
+          text: row.summary,
+          platform: row.platform,
+          authorName: row.authorName,
+          authorHandle: row.authorHandle,
+          publishedAt: row.publishedAt?.toISOString() ?? null,
+        });
+        if (results.length === limit) break;
+      }
+      if (rows.length < pageSize) break;
+      cursor = rows.at(-1)?.id;
+      if (!cursor) break;
+    }
+    return results;
+  }
+
   async saveSuccess(input: {
     runId: string; creatorId: string; userId: string; trigger: DiscoveryTrigger;
-    candidates: ValidatedSourceCandidate[]; items: DiscoveryCandidate[]; finishedAt: Date;
+    candidates: ValidatedSourceCandidate[]; items: DiscoveryCandidate[];
+    archiveLocalizations: CreatorArchiveLocalization[]; finishedAt: Date;
     identity?: { displayName: string; profileUrl: string; handle: string | null };
   }): Promise<number> {
     return this.prisma.$transaction(async (transaction) => {
@@ -239,17 +381,29 @@ export class PrismaCreatorRepository implements CreatorRepository {
         where: { creatorId: input.creatorId },
         select: { canonicalPrimaryUrl: true },
       })).map((item) => item.canonicalPrimaryUrl));
+      const localizationByUrl = new Map(input.archiveLocalizations.map((item) => (
+        [canonicalizeUrl(item.id), item] as const
+      )));
+      for (const [canonicalUrl, localization] of localizationByUrl) {
+        if (!existing.has(canonicalUrl)) continue;
+        await transaction.creatorItem.updateMany({
+          where: { creatorId: input.creatorId, canonicalPrimaryUrl: canonicalUrl },
+          data: { title: localization.title.slice(0, 300), summary: localization.summary.slice(0, 1_000) },
+        });
+      }
       let inserted = 0;
       for (const source of input.candidates) {
         const item = itemByUrl.get(source.canonicalUrl);
+        if (!item && existing.has(source.canonicalUrl)) continue;
+        const localization = localizationByUrl.get(source.canonicalUrl);
+        if (!item && !localization) continue;
         const context = source.creatorContext;
-        const summary = (item?.summary ?? source.content ?? source.excerpt ?? source.title ?? '公开内容').slice(0, 1_000);
         const data = {
           userId: input.userId,
           creatorId: input.creatorId,
           kind: item?.kind ?? 'quality' as const,
-          title: (item?.title ?? source.title ?? source.excerpt ?? '公开内容').slice(0, 300),
-          summary,
+          title: (item?.title ?? localization!.title).slice(0, 300),
+          summary: (item?.summary ?? localization!.summary).slice(0, 1_000),
           reason: item?.reason ?? '未进入本次精选',
           sourceUrls: item?.sourceUrls ?? [source.canonicalUrl],
           canonicalPrimaryUrl: source.canonicalUrl,
@@ -332,7 +486,7 @@ export class PrismaCreatorRepository implements CreatorRepository {
 
 export function createCreatorDiscoveryService(
   prisma: PrismaClient,
-  gateway: Pick<AiGateway, 'evaluateCandidates' | 'composeItems'>,
+  gateway: Pick<AiGateway, 'evaluateCandidates' | 'composeItems' | 'localizeCreatorItems'>,
   timeoutMs: number,
   twitterApiKey?: string,
   interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>,
@@ -340,6 +494,7 @@ export function createCreatorDiscoveryService(
   return new CreatorDiscoveryService({
     repository: new PrismaCreatorRepository(prisma),
     qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway),
+    archiveLocalizer: gateway,
     timeoutMs,
     twitterApiKey,
     ...(interestTagger ? { interestTagger } : {}),

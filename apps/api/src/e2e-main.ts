@@ -1,10 +1,73 @@
 import 'reflect-metadata';
+import type { InterestEvent } from '@lettermate/contracts';
+import { INTEREST_ADJACENCY_VERSION } from '@lettermate/domain';
 import { createApiApp } from './app.js';
+import {
+  MemoryPersonalizationMemory,
+  type MemoryPersonalizationFacts,
+  type PersonalizationMemory,
+} from './personalization-memory.js';
 import { MemoryTopicStore } from './topic-store.js';
 import type { TopicQueue } from './topic-queue.js';
 import type { TrendQueue } from './trend-queue.js';
 
-const store = new MemoryTopicStore();
+const personalizationFacts: MemoryPersonalizationFacts = {
+  events: [],
+  tags: [
+    {
+      tagId: 'e2e-tag-gpt-5-7', slug: 'gpt-5-7', displayName: 'GPT-5.7', kind: 'entity',
+      confidence: 1, contentKey: 'topic://gpt-5-7', createdAt: '2026-08-08T00:00:00.000Z',
+    },
+    {
+      tagId: 'e2e-tag-ai-tooling', slug: 'ai-tooling', displayName: 'AI Tooling', kind: 'topic',
+      confidence: 0.9, contentKey: 'https://example.com/radar/ai-tooling-release',
+      createdAt: '2026-08-08T00:00:00.000Z',
+    },
+  ],
+  creatorContent: [],
+  settings: {},
+  forgottenTagIds: {},
+  adjacencies: [{
+    leftTagId: 'e2e-tag-ai-tooling',
+    rightTagId: 'e2e-tag-gpt-5-7',
+    relationVersion: INTEREST_ADJACENCY_VERSION,
+  }],
+};
+const basePersonalization = new MemoryPersonalizationMemory(() => personalizationFacts);
+const activeTopicUsers = new Set<string>();
+const personalization: PersonalizationMemory = {
+  async select(input) {
+    const followsGpt57 = input.candidates.some((candidate) => candidate.origins.some((origin) => (
+      origin.origin === 'topic'
+      && origin.topicKeywordActive
+      && origin.topicKeyword === 'gpt-5.7'
+    )));
+    if (followsGpt57 && !activeTopicUsers.has(input.userId)) {
+      activeTopicUsers.add(input.userId);
+      const occurredAt = new Date().toISOString();
+      personalizationFacts.events.push({
+        id: `e2e-topic-${input.userId}`,
+        userId: input.userId,
+        eventType: 'topic_state',
+        sourceRef: 'e2e-topic-gpt-5-7',
+        payload: {
+          schemaVersion: 1,
+          state: 'active',
+          topicId: 'e2e-topic-gpt-5-7',
+          keyword: 'gpt-5.7',
+          normalizedKeyword: 'gpt-5.7',
+        },
+        occurredAt,
+        recordedAt: occurredAt,
+        supersededAt: null,
+      } satisfies InterestEvent);
+    }
+    return basePersonalization.select(input);
+  },
+  inspect: (userId) => basePersonalization.inspect(userId),
+  control: (userId, command) => basePersonalization.control(userId, command),
+};
+const store = new MemoryTopicStore(() => new Date(), personalization);
 const FAKE_WORKER_START_DELAY_MS = 25;
 const FAKE_WORKER_RUN_DELAY_MS = 300;
 const scheduledRuns = new Set<Promise<void>>();
@@ -82,24 +145,42 @@ const trendQueue: TrendQueue = {
   async enqueue({ userId }) {
     scheduleFakeWorkerRun(
       () => store.startFakeTrendDiscovery(userId, 4),
-      () => store.completeFakeTrendDiscovery(userId, 4, [{
-        kind: 'hot',
-        title: 'AI tooling release gains attention',
-        summary: '多个一手来源记录了这次工具更新及其核心变化。',
-        reason: '包含官方发布与可回溯的实现信息。',
-        sourceUrls: ['https://example.com/radar/ai-tooling-release'],
-        publishedAt: relativeCalendarDay(2),
-        sourceType: 'web',
-        platform: 'Example Radar',
-        authorName: 'Example Team',
-        authorHandle: null,
-        externalId: 'radar-release-1',
-        provenanceKind: 'fetched_page',
-      }]),
+      () => store.completeFakeTrendDiscovery(userId, 4, [
+        {
+          kind: 'hot',
+          title: 'AI tooling release gains attention',
+          summary: '多个一手来源记录了这次工具更新及其核心变化。',
+          reason: '包含官方发布与可回溯的实现信息。',
+          sourceUrls: ['https://example.com/radar/ai-tooling-release'],
+          publishedAt: relativeCalendarDay(2),
+          sourceType: 'web',
+          platform: 'Example Radar',
+          authorName: 'Example Team',
+          authorHandle: null,
+          externalId: 'radar-release-1',
+          provenanceKind: 'fetched_page',
+        },
+        ...Array.from({ length: 8 }, (_, index) => ({
+          kind: 'quality' as const,
+          title: `Technology digest item ${index + 1}`,
+          summary: 'A qualified discovery used to exercise deterministic Feed composition.',
+          reason: 'Includes a traceable original source and concrete technical details.',
+          sourceUrls: [`https://example.com/radar/qualified-${index + 1}`],
+          publishedAt: relativeCalendarDay(2),
+          sourceType: 'web' as const,
+          platform: 'Example Radar',
+          authorName: 'Example Team',
+          authorHandle: null,
+          externalId: `radar-qualified-${index + 1}`,
+          provenanceKind: 'fetched_page' as const,
+        })),
+      ]),
     );
   },
   close: closeScheduledRuns,
 };
 
-const app = await createApiApp({ store, queue, trendQueue, aiConfigured: true });
+const app = await createApiApp({
+  store, queue, trendQueue, aiConfigured: true, personalizationMemory: personalization,
+});
 await app.listen(Number(process.env.PORT ?? 3001), '0.0.0.0');

@@ -2,6 +2,13 @@ import { parseConfig } from '@lettermate/config';
 import {
   creatorPlatformStatusSchema,
   creatorResolutionInputSchema,
+  authLoginInputSchema,
+  authRegisterInputSchema,
+  authSessionSchema,
+  digestPreferenceInputSchema,
+  digestPreferenceSchema,
+  digestPreviewSchema,
+  digestStatusSchema,
   discoverySourceStatusSchema,
   feedbackInputSchema,
   creatorInputSchema,
@@ -24,6 +31,7 @@ import {
   Get,
   Headers,
   HttpCode,
+  HttpException,
   Inject,
   Injectable,
   Module,
@@ -33,13 +41,16 @@ import {
   Post,
   Put,
   Query,
+  Req,
+  Res,
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import type { DynamicModule, INestApplication, NestModule, OnModuleDestroy } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { PrismaClient } from '@prisma/client';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import type { Request, Response } from 'express';
 import type { z } from 'zod';
 import { checkApiReadiness, type ApiHealthChecks, type HealthProbe } from './health.js';
 import {
@@ -77,6 +88,31 @@ import {
   type MemoryPersonalizationFacts,
   type PersonalizationMemory,
 } from './personalization-memory.js';
+import {
+  DefaultDigestService,
+  MemoryDigestPreferenceStore,
+  PrismaDigestPreferenceStore,
+  type DigestPreferenceStore,
+  type DigestService,
+  type MemoryDigestFacts,
+} from './digest-service.js';
+import {
+  AuthError,
+  AuthService,
+  MemoryAuthStore,
+  PrismaAuthStore,
+  authCookieNames,
+  clearAuthCookies,
+  createAuthMiddleware,
+  parseCookies,
+  setAuthCookies,
+  type AuthSessionResult,
+} from './auth-service.js';
+import {
+  createRequestTracingMiddleware,
+  currentTraceId,
+  type OperationalLogger,
+} from './observability.js';
 
 const STORE = Symbol('TopicStore');
 const QUEUE = Symbol('TopicQueue');
@@ -89,9 +125,13 @@ const NOW = Symbol('Now');
 const TREND_INTERVAL_HOURS = Symbol('TrendIntervalHours');
 const HEALTH_CHECKS = Symbol('HealthChecks');
 const PERSONALIZATION_MEMORY = Symbol('PersonalizationMemory');
+const DIGEST_SERVICE = Symbol('DigestService');
+const AUTH_SERVICE = Symbol('AuthService');
+const ALLOW_DEV_IDENTITY = Symbol('AllowDevIdentity');
+const SECURE_COOKIES = Symbol('SecureCookies');
 
 function errorBody(code: string, message: string) {
-  return { code, message, traceId: randomUUID() };
+  return { code, message, traceId: currentTraceId() };
 }
 
 function authenticatedUser(userId: string | undefined): string {
@@ -134,6 +174,10 @@ class ApiController {
     @Inject(TREND_INTERVAL_HOURS) private readonly trendIntervalHours: number,
     @Inject(HEALTH_CHECKS) private readonly healthChecks: ApiHealthChecks,
     @Inject(PERSONALIZATION_MEMORY) private readonly personalization: PersonalizationMemory,
+    @Inject(DIGEST_SERVICE) private readonly digest: DigestService,
+    @Inject(AUTH_SERVICE) private readonly auth: AuthService,
+    @Inject(ALLOW_DEV_IDENTITY) private readonly allowDevIdentity: boolean,
+    @Inject(SECURE_COOKIES) private readonly secureCookies: boolean,
   ) {}
 
   @Get('health')
@@ -147,9 +191,70 @@ class ApiController {
   }
 
   @Get('auth/session')
-  session(@Headers('x-user-id') userId?: string) {
-    const id = authenticatedUser(userId);
-    return { user: { id, email: `${id}@example.local`, timezone: 'Asia/Shanghai' } };
+  session(
+    @Headers('x-user-id') userId?: string,
+    @Headers('x-user-email') email?: string,
+    @Headers('x-user-timezone') timezone?: string,
+    @Headers('x-auth-csrf') csrfToken?: string,
+  ) {
+    if (!userId) return authSessionSchema.parse({ authenticated: false, user: null, csrfToken: null });
+    if (this.allowDevIdentity) {
+      return authSessionSchema.parse({
+        authenticated: true,
+        user: { id: userId, email: `${userId}@example.local`, timezone: 'Asia/Shanghai' },
+        csrfToken: null,
+      });
+    }
+    if (!email || !timezone || !csrfToken) {
+      return authSessionSchema.parse({ authenticated: false, user: null, csrfToken: null });
+    }
+    return authSessionSchema.parse({
+      authenticated: true,
+      user: { id: userId, email, timezone },
+      csrfToken: csrfToken ?? null,
+    });
+  }
+
+  @Post('auth/register')
+  async register(
+    @Body() body: unknown,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const input = parseOrThrow(authRegisterInputSchema, body, '注册信息无效');
+    try {
+      const result = await this.auth.register(input);
+      this.setAuthCookies(response, result);
+      return authSessionSchema.parse(result.session);
+    } catch (error) {
+      this.throwAuthError(error);
+    }
+  }
+
+  @Post('auth/login')
+  async login(
+    @Body() body: unknown,
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const input = parseOrThrow(authLoginInputSchema, body, '登录信息无效');
+    try {
+      const result = await this.auth.login(input.email, input.password, request.ip ?? 'unknown');
+      this.setAuthCookies(response, result);
+      return authSessionSchema.parse(result.session);
+    } catch (error) {
+      this.throwAuthError(error);
+    }
+  }
+
+  @Post('auth/logout')
+  @HttpCode(204)
+  async logout(
+    @Headers('cookie') cookieHeader: string | undefined,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<void> {
+    const cookies = parseCookies(cookieHeader);
+    await this.auth.logout(cookies[authCookieNames.session]);
+    clearAuthCookies(response, this.secureCookies);
   }
 
   @Post('topics')
@@ -521,6 +626,40 @@ class ApiController {
     }));
   }
 
+  @Get('digest-preference')
+  async getDigestPreference(@Headers('x-user-id') header?: string) {
+    return digestPreferenceSchema.parse(
+      await this.digest.getPreference(authenticatedUser(header)),
+    );
+  }
+
+  @Put('digest-preference')
+  async updateDigestPreference(
+    @Headers('x-user-id') header: string | undefined,
+    @Body() body: unknown,
+  ) {
+    const input = parseOrThrow(
+      digestPreferenceInputSchema,
+      body,
+      '每日邮件设置无效',
+    );
+    return digestPreferenceSchema.parse(
+      await this.digest.updatePreference(authenticatedUser(header), input),
+    );
+  }
+
+  @Get('digest-preview')
+  async previewDigest(@Headers('x-user-id') header?: string) {
+    return digestPreviewSchema.parse(
+      await this.digest.preview(authenticatedUser(header)),
+    );
+  }
+
+  @Get('digest-status')
+  async getDigestStatus(@Headers('x-user-id') header?: string) {
+    return digestStatusSchema.parse(await this.digest.status(authenticatedUser(header)));
+  }
+
   @Put('feedback/:contentKey')
   async setFeedback(
     @Headers('x-user-id') header: string | undefined,
@@ -559,6 +698,21 @@ class ApiController {
         errorBody('AI_NOT_CONFIGURED', '尚未配置 OpenRouter Key'),
       );
     }
+  }
+
+  private setAuthCookies(response: Response, result: AuthSessionResult): void {
+    if (!result.session.csrfToken) throw new Error('Auth session did not produce a CSRF token');
+    setAuthCookies(response, result.token, result.session.csrfToken, this.secureCookies);
+  }
+
+  private throwAuthError(error: unknown): never {
+    if (error instanceof AuthError) {
+      const body = errorBody(error.code, error.message);
+      if (error.status === 409) throw new ConflictException(body);
+      if (error.status === 429) throw new HttpException(body, 429);
+      throw new UnauthorizedException(body);
+    }
+    throw error;
   }
 
   private async createAndEnqueueCreators(
@@ -634,6 +788,10 @@ class AppModule implements NestModule {
     trendIntervalHours: number,
     healthChecks: ApiHealthChecks,
     personalization: PersonalizationMemory,
+    digest: DigestService,
+    auth: AuthService,
+    allowDevIdentity: boolean,
+    secureCookies: boolean,
   ): DynamicModule {
     return {
       module: AppModule,
@@ -650,6 +808,10 @@ class AppModule implements NestModule {
         { provide: TREND_INTERVAL_HOURS, useValue: trendIntervalHours },
         { provide: HEALTH_CHECKS, useValue: healthChecks },
         { provide: PERSONALIZATION_MEMORY, useValue: personalization },
+        { provide: DIGEST_SERVICE, useValue: digest },
+        { provide: AUTH_SERVICE, useValue: auth },
+        { provide: ALLOW_DEV_IDENTITY, useValue: allowDevIdentity },
+        { provide: SECURE_COOKIES, useValue: secureCookies },
         ResourceCloser,
       ],
     };
@@ -669,6 +831,11 @@ export interface CreateApiAppOptions {
   webOrigin?: string;
   healthChecks?: Partial<Omit<ApiHealthChecks, 'aiConfigured'>>;
   personalizationMemory?: PersonalizationMemory;
+  digestService?: DigestService;
+  emailDeliveryConfigured?: boolean;
+  authService?: AuthService;
+  allowDevIdentity?: boolean;
+  requestLogger?: OperationalLogger;
 }
 
 export function configuredDiscoverySources(
@@ -761,13 +928,33 @@ export async function createApiApp(
   const memoryFacts: MemoryPersonalizationFacts = {
     events: [], tags: [], creatorContent: [], settings: {}, forgottenTagIds: {},
   };
+  const memoryDigestFacts: MemoryDigestFacts = { preferences: {} };
   let personalization = options.personalizationMemory;
+  let prisma: PrismaClient | undefined;
+  let digestPreferences: DigestPreferenceStore | undefined;
   const store = options.store ?? (() => {
-    const prisma = new PrismaClient();
+    prisma = new PrismaClient();
     personalization ??= new PrismaPersonalizationMemory(prisma);
+    digestPreferences = new PrismaDigestPreferenceStore(prisma);
     return new PrismaTopicStore(prisma, personalization);
   })();
   personalization ??= new MemoryPersonalizationMemory(() => memoryFacts, options.now);
+  digestPreferences ??= new MemoryDigestPreferenceStore(() => memoryDigestFacts);
+  const allowDevIdentity = options.allowDevIdentity ?? config.ALLOW_DEV_IDENTITY;
+  const secureCookies = config.NODE_ENV === 'production';
+  const auth = options.authService ?? new AuthService(
+    prisma ? new PrismaAuthStore(prisma) : new MemoryAuthStore(),
+    config.SESSION_SECRET ?? randomBytes(32).toString('base64url'),
+    config.CSRF_SECRET ?? randomBytes(32).toString('base64url'),
+    options.now,
+  );
+  const digest = options.digestService ?? new DefaultDigestService(
+    digestPreferences,
+    store,
+    personalization,
+    options.now,
+    options.emailDeliveryConfigured ?? config.SMTP_ENABLED,
+  );
   const queue = options.queue ?? createBullTopicQueue(config.REDIS_URL);
   const trendQueue = options.trendQueue ?? createBullTrendQueue(config.REDIS_URL);
   const creatorQueue = options.creatorQueue ?? createBullCreatorQueue(config.REDIS_URL);
@@ -807,6 +994,10 @@ export async function createApiApp(
       options.trendIntervalHours ?? config.TREND_INTERVAL_HOURS,
       healthChecks,
       personalization,
+      digest,
+      auth,
+      allowDevIdentity,
+      secureCookies,
     ),
     { logger: false },
   );
@@ -814,6 +1005,9 @@ export async function createApiApp(
     origin: options.webOrigin ?? config.WEB_ORIGIN,
     credentials: true,
   });
+  const requestLogger = options.requestLogger ?? (config.NODE_ENV === 'test' ? undefined : console);
+  app.use(createRequestTracingMiddleware(requestLogger, options.now));
+  app.use(createAuthMiddleware(auth, { allowDevIdentity, secureCookies }));
   await app.init();
   return app;
 }

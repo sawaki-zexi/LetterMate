@@ -376,6 +376,54 @@ describe('multi-source Prisma schema', () => {
     );
   });
 
+  it('stores versioned canonical interest adjacency and backfills qualified pairs', () => {
+    expect(modelNames()).toContain('InterestTagAdjacency');
+    expect(fieldNames('InterestTagAdjacency')).toEqual(expect.arrayContaining([
+      'leftTagId', 'rightTagId', 'relationVersion', 'createdAt',
+    ]));
+    expect(relation('InterestTagAdjacency', 'leftTag')).toMatchObject({
+      relationFromFields: ['leftTagId'], relationOnDelete: 'Cascade',
+    });
+    expect(relation('InterestTagAdjacency', 'rightTag')).toMatchObject({
+      relationFromFields: ['rightTagId'], relationOnDelete: 'Cascade',
+    });
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260808_interest_adjacency', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TABLE "InterestTagAdjacency"');
+    expect(migration).toContain("'qualified-content-cooccurrence-v1'");
+    expect(migration).toContain('left_content."confidence" >= 0.75');
+    expect(migration).toContain('right_tag."kind" <> \'content_type\'');
+  });
+
+  it('stores digest preferences, run boundaries, and frozen item snapshots', () => {
+    expect(modelNames()).toEqual(expect.arrayContaining([
+      'DigestPreference', 'DigestRun', 'DigestItem',
+    ]));
+    expect(fieldNames('DigestPreference')).toEqual(expect.arrayContaining([
+      'userId', 'enabled', 'localSendTime', 'updatedAt',
+    ]));
+    expect(fieldNames('DigestRun')).toEqual(expect.arrayContaining([
+      'userId', 'scheduledLocalDate', 'windowStart', 'windowEnd', 'status',
+      'sentAt', 'providerMessageId', 'runLeaseUntil', 'attemptCount',
+    ]));
+    expect(uniqueConstraints('DigestRun')).toContainEqual(['userId', 'scheduledLocalDate']);
+    expect(fieldNames('DigestItem')).toEqual(expect.arrayContaining([
+      'runId', 'contentKey', 'position', 'title', 'summary', 'reason', 'sourceUrl',
+    ]));
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260808_digest_preferences_preview', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TABLE "DigestPreference"');
+    expect(migration).toContain('CREATE TABLE "DigestRun"');
+    expect(migration).toContain('CREATE TABLE "DigestItem"');
+  });
+
   it('stores rebuildable profiles and versioned shadow recommendation decisions', () => {
     expect(modelNames()).toEqual(expect.arrayContaining([
       'UserInterestProfile', 'InterestProfileVersion',
