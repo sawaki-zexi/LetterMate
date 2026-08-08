@@ -1,0 +1,154 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lettermate}
+      POSTGRES_USER: ${POSTGRES_USER:-lettermate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - lettermate-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    volumes:
+      - lettermate-redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: api
+    command: ["node_modules/.bin/prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: api
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      ALLOW_DEV_IDENTITY: "false"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+      WEB_ORIGIN: ${WEB_ORIGIN:?set WEB_ORIGIN}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/v1/health/ready >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: worker
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: production
+      ALLOW_DEV_IDENTITY: "false"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+      METRICS_PORT: ${METRICS_PORT:-9464}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    expose:
+      - "${METRICS_PORT:-9464}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${METRICS_PORT}/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    restart: unless-stopped
+
+  backup:
+    profiles: ["operations"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: postgres-ops
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      BACKUP_DIRECTORY: /backups
+    volumes:
+      - lettermate-backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  restore-drill:
+    profiles: ["operations"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: postgres-ops
+    command:
+      - node
+      - --import
+      - tsx
+      - apps/api/dist/postgres-restore-cli.js
+      - direct
+      - ${BACKUP_PATH:-/backups/backup-path-required.dump}
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+    volumes:
+      - lettermate-backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  lettermate-postgres:
+  lettermate-redis:
+  lettermate-backups:

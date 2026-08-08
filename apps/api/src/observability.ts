@@ -2,6 +2,7 @@ import { operationalLogSchema, type OperationalLog } from '@lettermate/contracts
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
+import type { ApiRequestMetricsSink } from './metrics.js';
 
 const traceStorage = new AsyncLocalStorage<{ traceId: string }>();
 const traceIdPattern = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -38,14 +39,25 @@ export function writeOperationalLog(
 export function createRequestTracingMiddleware(
   logger?: OperationalLogger,
   now: () => Date = () => new Date(),
+  metrics?: ApiRequestMetricsSink,
 ): (request: Request, response: Response, next: NextFunction) => void {
   return (request, response, next) => {
     const traceId = selectTraceId(request.headers['x-trace-id']);
     const startedAt = Date.now();
     response.setHeader('x-trace-id', traceId);
     response.once('finish', () => {
-      if (!logger) return;
       const statusCode = response.statusCode;
+      const routePath = request.route && typeof request.route.path === 'string'
+        ? request.route.path
+        : 'unmatched';
+      const durationMs = Math.max(0, Date.now() - startedAt);
+      metrics?.recordRequest({
+        method: request.method,
+        route: routePath,
+        statusCode,
+        durationMs,
+      });
+      if (!logger) return;
       writeOperationalLog(logger, {
         level: statusCode >= 500 ? 'error' : statusCode >= 400 ? 'warn' : 'info',
         event: 'request.completed',
@@ -53,7 +65,7 @@ export function createRequestTracingMiddleware(
         method: request.method.toUpperCase(),
         path: request.path,
         statusCode,
-        durationMs: Math.max(0, Date.now() - startedAt),
+        durationMs,
       }, now());
     });
     traceStorage.run({ traceId }, next);

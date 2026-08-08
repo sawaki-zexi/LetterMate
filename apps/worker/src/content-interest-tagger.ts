@@ -11,6 +11,7 @@ import {
   INTEREST_TAXONOMY_VERSION,
 } from '@lettermate/domain';
 import type { PrismaClient } from '@prisma/client';
+import type { AiExecutionContext } from './ai-runtime.js';
 
 export { INTEREST_EXTRACTOR_VERSION, INTEREST_TAXONOMY_VERSION };
 
@@ -26,6 +27,7 @@ export interface InterestTagGateway {
   extractInterestTags(
     input: ContentForInterestTagging,
     signal?: AbortSignal,
+    execution?: AiExecutionContext,
   ): Promise<InterestTagExtraction>;
 }
 
@@ -151,6 +153,7 @@ export class ContentInterestTagger {
   async tagCandidate(
     candidate: ContentForInterestTagging,
     signal?: AbortSignal,
+    execution?: AiExecutionContext,
   ): Promise<ContentTaggingResult> {
     let contentKey = candidate.contentKey;
     try {
@@ -158,7 +161,7 @@ export class ContentInterestTagger {
       const tags = normalizeInterestTags(await this.gateway.extractInterestTags({
         ...candidate,
         contentKey,
-      }, signal));
+      }, signal, execution));
       await this.repository.save({
         contentKey,
         tags,
@@ -174,6 +177,7 @@ export class ContentInterestTagger {
   async tagCandidates(
     candidates: DiscoveryCandidate[],
     signal?: AbortSignal,
+    execution?: AiExecutionContext,
   ): Promise<ContentTaggingResult[]> {
     const unique = new Map<string, ContentForInterestTagging>();
     for (const candidate of candidates) {
@@ -195,7 +199,9 @@ export class ContentInterestTagger {
     const pending = [...unique.values()];
     for (let offset = 0; offset < pending.length; offset += 3) {
       results.push(...await Promise.all(
-        pending.slice(offset, offset + 3).map((candidate) => this.tagCandidate(candidate, signal)),
+        pending.slice(offset, offset + 3).map((candidate) => (
+          this.tagCandidate(candidate, signal, execution)
+        )),
       ));
     }
     return results;

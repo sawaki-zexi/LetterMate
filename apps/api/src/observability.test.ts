@@ -10,6 +10,7 @@ describe('API observability', () => {
       headers: { 'x-trace-id': 'trace-123' },
       method: 'post',
       path: '/api/v1/topics',
+      route: { path: '/api/v1/topics' },
     } as unknown as Request;
     const response = {
       statusCode: 201,
@@ -17,9 +18,14 @@ describe('API observability', () => {
       once: (_event: string, listener: () => void) => { finishListeners.push(listener); },
     } as unknown as Response;
     let traceInHandler = '';
+    const metrics = { recordRequest: vi.fn() };
     const next = (() => { traceInHandler = currentTraceId(); }) as NextFunction;
 
-    createRequestTracingMiddleware(logger, () => new Date('2026-08-08T08:00:00.000Z'))(
+    createRequestTracingMiddleware(
+      logger,
+      () => new Date('2026-08-08T08:00:00.000Z'),
+      metrics,
+    )(
       request,
       response,
       next,
@@ -31,6 +37,9 @@ describe('API observability', () => {
     expect(JSON.parse(logger.log.mock.calls[0]?.[0] as string)).toMatchObject({
       service: 'api', event: 'request.completed', traceId: 'trace-123', statusCode: 201,
     });
+    expect(metrics.recordRequest).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'post', route: '/api/v1/topics', statusCode: 201,
+    }));
   });
 
   it('rejects unsafe inbound trace values', () => {

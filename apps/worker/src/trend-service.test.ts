@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DiscoveryCandidate } from '@lettermate/contracts';
-import type { ValidatedSourceCandidate } from '@lettermate/domain';
+import { validateSourceCandidate, type ValidatedSourceCandidate } from '@lettermate/domain';
 import {
   PrismaTrendRepository,
   TrendDiscoveryService,
@@ -25,6 +25,16 @@ const item: DiscoveryCandidate = {
   publishedAt: '2026-07-28T09:00:00.000Z', sourceType: 'web', platform: 'OpenAI',
   authorName: null, authorHandle: null, externalId: null, provenanceKind: 'fetched_page',
 };
+const evidenceCandidate = validateSourceCandidate({
+  connectorId: 'search-brave', sourceType: 'web', platform: 'Example', externalId: null,
+  url: 'https://example.com/gpt-5-7', title: 'OpenAI gpt-5.7 engineering overview',
+  content: 'OpenAI gpt-5.7 is discussed in a software engineering overview.', excerpt: null,
+  authorName: null, authorHandle: null, publishedAt: '2026-07-28T09:00:00.000Z',
+  language: 'en', engagement: {},
+  proof: {
+    kind: 'fetched_page', connectorId: 'search-brave', parentUrl: 'https://example.com/gpt-5-7',
+  },
+});
 const repository = (overrides: Partial<TrendRepository> = {}): TrendRepository => ({
   claimRun: vi.fn().mockResolvedValue({
     state: 'claimed', runId: 'run-1', monitorId: 'monitor-1', intervalHours: 4,
@@ -49,6 +59,7 @@ const makeService = (options: {
   classify?: ReturnType<typeof vi.fn>;
   search?: ReturnType<typeof vi.fn>;
   quality?: ReturnType<typeof vi.fn>;
+  followup?: ReturnType<typeof vi.fn>;
   maxSeeds?: number;
   requestBudget?: number;
 } = {}) => {
@@ -64,8 +75,9 @@ const makeService = (options: {
     skippedConnectorIds: [], failures: [],
   });
   const quality = options.quality ?? vi.fn().mockResolvedValue([item]);
+  const onStage = vi.fn();
   return {
-    repo, collect, classify, search, quality,
+    repo, collect, classify, search, quality, onStage,
     service: new TrendDiscoveryService({
       repository: repo,
       trendSources: { collect },
@@ -76,11 +88,29 @@ const makeService = (options: {
       timeoutMs: 30_000,
       maxSeeds: options.maxSeeds ?? 60,
       trendRequestBudget: options.requestBudget ?? 24,
+      ...(options.followup ? { evidenceGapRetriever: { retrieve: options.followup } } : {}),
+      onStage,
     }),
   };
 };
 
 describe('TrendDiscoveryService', () => {
+  it('anchors a resumed run collection window to the original run start', async () => {
+    const repo = repository();
+    vi.mocked(repo.claimRun).mockResolvedValue({
+      state: 'claimed', runId: 'run-1', monitorId: 'monitor-1', intervalHours: 4,
+      nextRunAt: new Date('2026-07-28T16:00:00.000Z'),
+      startedAt: new Date('2026-07-28T08:00:00.000Z'),
+    });
+    const { service, collect } = makeService({ repository: repo });
+
+    await service.run(scheduledJob);
+
+    expect(collect).toHaveBeenCalledWith(expect.objectContaining({
+      windowEnd: '2026-07-28T08:00:00.000Z',
+    }), expect.any(AbortSignal));
+  });
+
   it('treats one successful trend source with no candidates as a successful zero-item run', async () => {
     const repo = repository({
       completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManualRunId: null }),
@@ -125,7 +155,10 @@ describe('TrendDiscoveryService', () => {
       externalId: String(index), title: `Project-${index} version-${index}.1 software release`,
       url: `https://example.com/trend/${index}`,
     }));
-    const classify = vi.fn(async ({ seeds }: { seeds: Array<{ id: string; title: string }> }) =>
+    const classify = vi.fn(async ({ seeds }: {
+      seeds: Array<{ id: string; title: string }>;
+      execution?: { runId: string; runKind: string; userId: string };
+    }) =>
       seeds.map(({ id, title }) => ({
         id, accepted: true, query: title, requiredTerms: [title.match(/version-\d+\.1/u)![0]],
       })));
@@ -134,7 +167,7 @@ describe('TrendDiscoveryService', () => {
         new Set([fingerprints[0]])),
       completeSuccess: vi.fn().mockResolvedValue({ newItemCount: 0, followUpManualRunId: null }),
     });
-    const { service } = makeService({
+    const { service, onStage } = makeService({
       repository: repo, classify, maxSeeds: 40,
       collect: vi.fn().mockResolvedValue(sourceSummary({ candidates })),
       quality: vi.fn().mockResolvedValue([]),
@@ -144,6 +177,11 @@ describe('TrendDiscoveryService', () => {
 
     expect(classify).toHaveBeenCalledTimes(3);
     expect(classify.mock.calls.map(([input]) => input.seeds.length)).toEqual([3, 3, 1]);
+    expect(classify.mock.calls.every(([input]) => (
+      input.execution?.runId === 'run-1'
+      && input.execution.runKind === 'trend'
+      && input.execution.userId === 'user-1'
+    ))).toBe(true);
     const saved = vi.mocked(repo.saveSeeds).mock.calls[0]![0];
     expect(saved.seeds).toHaveLength(7);
     expect(saved.seeds[0]).toEqual(expect.objectContaining({
@@ -157,6 +195,12 @@ describe('TrendDiscoveryService', () => {
       decisions: expect.arrayContaining([
         expect.objectContaining({ normalizedQuery: expect.stringContaining('version-1.1') }),
       ]),
+    }));
+    expect(onStage.mock.calls.map(([stage]) => stage.stage)).toEqual([
+      'collect', 'classify', 'retrieve', 'quality_gate', 'persist',
+    ]);
+    expect(onStage).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', stage: 'classify', inputCount: 7, outputCount: 7,
     }));
   });
 
@@ -248,6 +292,37 @@ describe('TrendDiscoveryService', () => {
     expect(plan.expandedTerms).toContain('gpt-5.7');
     expect(quality).toHaveBeenCalledWith(expect.objectContaining({
       keyword: expect.stringContaining('gpt-5.7'), matchPolicy: plan.matchPolicy,
+    }));
+  });
+
+  it('runs evidence follow-up per accepted seed before quality', async () => {
+    const primary = validateSourceCandidate({
+      ...evidenceCandidate,
+      connectorId: 'github',
+      externalId: 'v1',
+      url: 'https://github.com/openai/gpt-5-7/releases/tag/v1',
+      proof: { kind: 'api_record', connectorId: 'github', externalId: 'v1' },
+    });
+    const search = vi.fn().mockResolvedValue({
+      candidates: [evidenceCandidate], successfulConnectorIds: ['search-brave'],
+      skippedConnectorIds: [], failures: [],
+    });
+    const followup = vi.fn().mockResolvedValue({
+      candidates: [evidenceCandidate, primary],
+      successfulConnectorIds: ['search-brave', 'github'], skippedConnectorIds: [], failures: [],
+    });
+    const { service, quality } = makeService({ search, followup });
+
+    await service.run(scheduledJob);
+
+    expect(followup).toHaveBeenCalledWith(expect.objectContaining({
+      execution: { runId: 'run-1', runKind: 'trend', userId: 'user-1' },
+      plan: expect.objectContaining({ matchPolicy: expect.any(Object) }),
+      initial: expect.objectContaining({ candidates: [evidenceCandidate] }),
+      signal: expect.any(AbortSignal),
+    }));
+    expect(quality).toHaveBeenCalledWith(expect.objectContaining({
+      candidates: [evidenceCandidate, primary],
     }));
   });
 
@@ -521,7 +596,7 @@ describe('PrismaTrendRepository', () => {
       }),
     }));
     expect(transaction.trendMonitor.update.mock.calls[0]![0].data)
-      .not.toHaveProperty('runLeaseUntil');
+      .toMatchObject({ runLeaseUntil: now });
   });
 
   it('scopes seed query updates and manual acknowledgements to their owner and run state', async () => {

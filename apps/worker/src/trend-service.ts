@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type {
+  AgentRunStage,
   DiscoveryCandidate,
   TrendJobData,
   DiscoveryTrigger,
@@ -21,6 +22,10 @@ import {
 } from './keyword-policy.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
 import type { ContentInterestTagger } from './content-interest-tagger.js';
+import type { AiExecutionContext } from './ai-runtime.js';
+import type { AgentStageTelemetry } from './observability.js';
+import type { RunStageManager } from './run-stage.js';
+import type { EvidenceGapRetriever } from './evidence-gap-retriever.js';
 import type { TrendCollectionSummary, TrendSeedCandidate, TrendWindow } from './trends/types.js';
 
 const HOUR_MS = 60 * 60 * 1_000;
@@ -49,6 +54,7 @@ export type TrendRunClaim = {
   monitorId: string;
   intervalHours: number;
   nextRunAt: Date;
+  startedAt?: Date;
 } | {
   state: 'active';
   followUpManualRunId: string | null;
@@ -289,7 +295,7 @@ export class PrismaTrendRepository implements TrendRepository {
         });
         return {
           state: 'claimed', runId, monitorId: monitor.id,
-          intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
+          intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt, startedAt,
         } as const;
       }
 
@@ -297,14 +303,13 @@ export class PrismaTrendRepository implements TrendRepository {
         if (
           monitor.activeRunId !== manualRunId ||
           monitor.runStatus !== 'queued' ||
-          monitor.runLeaseUntil === null ||
-          monitor.runLeaseUntil <= startedAt
+          monitor.runLeaseUntil === null
         ) {
           return { state: 'active', followUpManualRunId: await pendingFollowUpRunId() } as const;
         }
         const queuedRun = await transaction.trendRun.findUnique({
           where: { id_userId: { id: manualRunId!, userId } },
-          select: { trigger: true, status: true },
+          select: { trigger: true, status: true, startedAt: true },
         });
         if (queuedRun?.trigger !== 'manual' || queuedRun.status !== 'queued') {
           return { state: 'active', followUpManualRunId: await pendingFollowUpRunId() } as const;
@@ -325,17 +330,53 @@ export class PrismaTrendRepository implements TrendRepository {
         }
         await transaction.trendRun.updateMany({
           where: { id: manualRunId!, userId, trigger: 'manual', status: 'queued' },
-          data: { status: 'running', startedAt },
+          data: { status: 'running' },
         });
         return {
           state: 'claimed', runId: manualRunId!, monitorId: monitor.id,
           intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
+          startedAt: queuedRun.startedAt,
         } as const;
       }
 
       const hasDueAt = 'dueAt' in job;
       const legacyScheduled = !hasDueAt;
       const dueAt = hasDueAt ? new Date(job.dueAt) : monitor.nextRunAt;
+      if (
+        monitor.activeRunId !== null
+        && monitor.runStatus === 'queued'
+        && monitor.runLeaseUntil !== null
+        && monitor.runLeaseUntil <= startedAt
+        && monitor.nextRunAt.getTime() === dueAt.getTime()
+      ) {
+        const resumable = await transaction.trendRun.findUnique({
+          where: { id_userId: { id: monitor.activeRunId, userId } },
+          select: { trigger: true, status: true, startedAt: true },
+        });
+        if (resumable?.trigger === trigger && resumable.status === 'queued') {
+          const claimed = await transaction.trendMonitor.updateMany({
+            where: {
+              id: monitor.id, userId, activeRunId: monitor.activeRunId,
+              runStatus: 'queued', runLeaseUntil: monitor.runLeaseUntil,
+            },
+            data: {
+              runStatus: 'running', runLeaseUntil: new Date(startedAt.getTime() + this.runLeaseMs),
+              lastError: Prisma.DbNull,
+            },
+          });
+          if (claimed.count === 1) {
+            await transaction.trendRun.update({
+              where: { id_userId: { id: monitor.activeRunId, userId } },
+              data: { status: 'running', finishedAt: null, error: Prisma.DbNull },
+            });
+            return {
+              state: 'claimed', runId: monitor.activeRunId, monitorId: monitor.id,
+              intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
+              startedAt: resumable.startedAt,
+            } as const;
+          }
+        }
+      }
       if (
         (!legacyScheduled && dueAt > startedAt) ||
         monitor.nextRunAt.getTime() !== dueAt.getTime() ||
@@ -362,7 +403,7 @@ export class PrismaTrendRepository implements TrendRepository {
       });
       return {
         state: 'claimed', runId, monitorId: monitor.id,
-        intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt,
+        intervalHours: monitor.intervalHours, nextRunAt: monitor.nextRunAt, startedAt,
       } as const;
     });
   }
@@ -577,6 +618,7 @@ export class PrismaTrendRepository implements TrendRepository {
           ? {
               runStatus: 'queued',
               activeRunId: input.runId,
+              runLeaseUntil: input.finishedAt,
               manualRefreshPending: monitor.manualRefreshPending,
               lastError: input.error,
             }
@@ -646,6 +688,9 @@ export interface TrendDiscoveryServiceOptions {
   trendRequestBudget?: number;
   connectorCandidateBudget?: number;
   interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>;
+  stageManager?: RunStageManager;
+  evidenceGapRetriever?: Pick<EvidenceGapRetriever, 'retrieve'>;
+  onStage?: (telemetry: AgentStageTelemetry) => void;
 }
 
 export class TrendDiscoveryService {
@@ -676,14 +721,24 @@ export class TrendDiscoveryService {
       };
     }
     const controller = new AbortController();
+    const execution: AiExecutionContext = { runId: claim.runId, userId, runKind: 'trend' };
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const windowEnd = this.now();
+      const windowEnd = claim.startedAt ?? startedAt;
       const windowStart = new Date(windowEnd.getTime() - RECENT_SEED_MS);
-      const collection = await this.options.trendSources.collect({
+      let stageStartedAt = Date.now();
+      const collectionInput = {
         windowStart: windowStart.toISOString(), windowEnd: windowEnd.toISOString(),
         maxCandidates: this.maxSeeds, requestBudget: this.trendRequestBudget,
-      }, controller.signal);
+      };
+      const collection = await this.runStage(
+        execution, 'retrieve', { kind: 'trend_collection', ...collectionInput },
+        () => this.options.trendSources.collect(collectionInput, controller.signal),
+      );
+      this.emitStage(claim.runId, 'collect', Date.now() - stageStartedAt, {
+        outputCount: collection.candidates.length,
+        failureCount: collection.failures.length,
+      });
       this.throwIfAborted(controller.signal);
       if (collection.successfulSourceIds.length === 0) {
         throw new TrendOrchestrationError(
@@ -728,6 +783,7 @@ export class TrendDiscoveryService {
         ...candidate,
         normalizedQuery: null,
       }));
+      stageStartedAt = Date.now();
       await this.options.repository.saveSeeds({ runId: claim.runId, userId, seeds });
       const classificationInputs: TrendSeedClassificationInput[] = unseen.map((candidate) => ({
         id: candidate.fingerprint, title: candidate.title,
@@ -741,7 +797,12 @@ export class TrendDiscoveryService {
       ) {
         this.throwIfAborted(controller.signal);
         const batch = classificationInputs.slice(offset, offset + TREND_CLASSIFICATION_MAX_SEEDS);
-        const raw = await this.options.gateway.classifyTrendSeeds({ seeds: batch, signal: controller.signal });
+        const raw = await this.runStage(
+          execution, 'assess', { seeds: batch },
+          () => this.options.gateway.classifyTrendSeeds({
+            seeds: batch, execution, signal: controller.signal,
+          }),
+        );
         decisions.push(...validateDecisions(batch, raw));
       }
       const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
@@ -755,9 +816,16 @@ export class TrendDiscoveryService {
       });
 
       const accepted = decisions.filter((decision) => decision.accepted);
+      this.emitStage(claim.runId, 'classify', Date.now() - stageStartedAt, {
+        inputCount: unseen.length,
+        outputCount: accepted.length,
+      });
       const historyUrls = await this.options.repository.listHistoryUrls(userId);
       const items: DiscoveryCandidate[] = [];
       let anyConnectorSucceeded = false;
+      let retrievedCandidateCount = 0;
+      let retrieveDurationMs = 0;
+      let qualityDurationMs = 0;
       const perSeedBudget = accepted.length === 0
         ? 0
         : Math.max(1, Math.floor(this.connectorCandidateBudget / accepted.length));
@@ -766,18 +834,50 @@ export class TrendDiscoveryService {
         const plan = buildTrendPlan(
           decision, windowStart.toISOString(), windowEnd.toISOString(), perSeedBudget,
         );
-        const connectorResult = await this.options.connectors.search(plan, controller.signal);
-        if (connectorResult.successfulConnectorIds.length > 0) anyConnectorSucceeded = true;
-        if (connectorResult.successfulConnectorIds.length === 0 && connectorResult.failures.length > 0) {
+        const retrieveStartedAt = Date.now();
+        const initialConnectorResult = await this.runStage(
+          execution, 'retrieve', { plan, historyUrls },
+          () => this.options.connectors.search(plan, controller.signal),
+        );
+        if (
+          initialConnectorResult.successfulConnectorIds.length === 0
+          && initialConnectorResult.failures.length > 0
+        ) {
+          retrieveDurationMs += Math.max(0, Date.now() - retrieveStartedAt);
           continue;
         }
-        const acceptedItems = await this.options.qualityPipeline.run({
-          keyword: plan.keyword, matchPolicy: plan.matchPolicy,
-          candidates: connectorResult.candidates, historyUrls,
-          windowStart: plan.windowStart, windowEnd: plan.windowEnd, signal: controller.signal,
-        });
+        const connectorResult = this.options.evidenceGapRetriever
+          ? await this.options.evidenceGapRetriever.retrieve({
+              execution, plan, initial: initialConnectorResult, signal: controller.signal,
+            })
+          : initialConnectorResult;
+        this.throwIfAborted(controller.signal);
+        retrieveDurationMs += Math.max(0, Date.now() - retrieveStartedAt);
+        retrievedCandidateCount += connectorResult.candidates.length;
+        if (connectorResult.successfulConnectorIds.length > 0) anyConnectorSucceeded = true;
+        const qualityStartedAt = Date.now();
+        const acceptedItems = await this.runStage(
+          execution, 'quality_gate', {
+            keyword: plan.keyword, plan, candidates: connectorResult.candidates, historyUrls,
+          },
+          () => this.options.qualityPipeline.run({
+            keyword: plan.keyword, matchPolicy: plan.matchPolicy,
+            candidates: connectorResult.candidates, historyUrls,
+            windowStart: plan.windowStart, windowEnd: plan.windowEnd,
+            execution, signal: controller.signal,
+          }),
+        );
+        qualityDurationMs += Math.max(0, Date.now() - qualityStartedAt);
         items.push(...acceptedItems);
       }
+      this.emitStage(claim.runId, 'retrieve', retrieveDurationMs, {
+        inputCount: accepted.length,
+        outputCount: retrievedCandidateCount,
+      });
+      this.emitStage(claim.runId, 'quality_gate', qualityDurationMs, {
+        inputCount: retrievedCandidateCount,
+        outputCount: items.length,
+      });
       if (accepted.length > 0 && !anyConnectorSucceeded) {
         throw new TrendOrchestrationError(
           'ALL_TREND_CONNECTORS_FAILED',
@@ -786,12 +886,17 @@ export class TrendDiscoveryService {
         );
       }
       this.throwIfAborted(controller.signal);
+      stageStartedAt = Date.now();
       const result = await this.options.repository.completeSuccess({
         runId: claim.runId, monitorId: claim.monitorId, userId, trigger,
         candidateCount: unseen.length, acceptedCount: accepted.length,
         items, finishedAt: this.now(),
       });
-      await this.options.interestTagger?.tagCandidates(items, controller.signal);
+      this.emitStage(claim.runId, 'persist', Date.now() - stageStartedAt, {
+        inputCount: items.length,
+        outputCount: result.newItemCount,
+      });
+      await this.options.interestTagger?.tagCandidates(items, controller.signal, execution);
       return { followUpManualRunId: result.followUpManualRunId };
     } catch (error) {
       const failure = controller.signal.aborted
@@ -811,10 +916,39 @@ export class TrendDiscoveryService {
     }
   }
 
+  private emitStage(
+    runId: string,
+    stage: AgentRunStage,
+    durationMs: number,
+    metrics: Pick<AgentStageTelemetry, 'inputCount' | 'outputCount' | 'failureCount'> = {},
+  ): void {
+    try {
+      this.options.onStage?.({
+        runId,
+        stage,
+        durationMs: Math.max(0, durationMs),
+        ...metrics,
+      });
+    } catch {
+      // Telemetry must never change a discovery result.
+    }
+  }
+
   private throwIfAborted(signal: AbortSignal): void {
     if (signal.aborted) {
       throw new TrendOrchestrationError('TREND_RUN_TIMEOUT', 'Trend run exceeded its time limit', true);
     }
+  }
+
+  private runStage<T>(
+    execution: AiExecutionContext,
+    stage: 'retrieve' | 'assess' | 'quality_gate',
+    value: unknown,
+    execute: () => Promise<T>,
+  ): Promise<T> {
+    return this.options.stageManager
+      ? this.options.stageManager.run({ execution, stage, value, execute })
+      : execute();
   }
 
   async acknowledgeManualFollowUp(userId: string, runId: string): Promise<boolean> {

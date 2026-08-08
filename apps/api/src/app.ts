@@ -53,6 +53,8 @@ import { randomBytes } from 'node:crypto';
 import type { Request, Response } from 'express';
 import type { z } from 'zod';
 import { checkApiReadiness, type ApiHealthChecks, type HealthProbe } from './health.js';
+import { configuredDiscoverySources } from './discovery-sources.js';
+import { ApiMetrics } from './metrics.js';
 import {
   MemoryTopicStore,
   PrismaTopicStore,
@@ -129,6 +131,7 @@ const DIGEST_SERVICE = Symbol('DigestService');
 const AUTH_SERVICE = Symbol('AuthService');
 const ALLOW_DEV_IDENTITY = Symbol('AllowDevIdentity');
 const SECURE_COOKIES = Symbol('SecureCookies');
+const API_METRICS = Symbol('ApiMetrics');
 
 function errorBody(code: string, message: string) {
   return { code, message, traceId: currentTraceId() };
@@ -186,8 +189,10 @@ class ApiController {
   }
 
   @Get('health/ready')
-  readiness() {
-    return checkApiReadiness(this.healthChecks);
+  async readiness(@Res({ passthrough: true }) response: Response) {
+    const readiness = await checkApiReadiness(this.healthChecks);
+    if (readiness.status !== 'ok') response.status(503);
+    return readiness;
   }
 
   @Get('auth/session')
@@ -745,6 +750,17 @@ class ApiController {
   }
 }
 
+@Controller()
+class MetricsController {
+  constructor(@Inject(API_METRICS) private readonly metrics: ApiMetrics) {}
+
+  @Get('metrics')
+  async scrape(@Res() response: Response) {
+    response.setHeader('content-type', this.metrics.contentType);
+    response.send(await this.metrics.render());
+  }
+}
+
 function toCreatorCreateInput(identity: ResolvedCreatorIdentity): CreatorCreateInput {
   return {
     platform: identity.platform,
@@ -792,10 +808,11 @@ class AppModule implements NestModule {
     auth: AuthService,
     allowDevIdentity: boolean,
     secureCookies: boolean,
+    metrics: ApiMetrics,
   ): DynamicModule {
     return {
       module: AppModule,
-      controllers: [ApiController],
+      controllers: [ApiController, MetricsController],
       providers: [
         { provide: STORE, useValue: store },
         { provide: QUEUE, useValue: queue },
@@ -812,6 +829,7 @@ class AppModule implements NestModule {
         { provide: AUTH_SERVICE, useValue: auth },
         { provide: ALLOW_DEV_IDENTITY, useValue: allowDevIdentity },
         { provide: SECURE_COOKIES, useValue: secureCookies },
+        { provide: API_METRICS, useValue: metrics },
         ResourceCloser,
       ],
     };
@@ -836,89 +854,8 @@ export interface CreateApiAppOptions {
   authService?: AuthService;
   allowDevIdentity?: boolean;
   requestLogger?: OperationalLogger;
-}
-
-export function configuredDiscoverySources(
-  config: ReturnType<typeof parseConfig>,
-): DiscoverySourceStatus[] {
-  const status = (enabled: boolean) => enabled ? 'enabled' as const : 'not_configured' as const;
-  return discoverySourceStatusSchema.array().parse([
-    {
-      id: 'openrouter-search',
-      label: 'OpenRouter Web Search',
-      category: 'web',
-      status: status(Boolean(config.AI_API_KEY && config.AI_WEB_SEARCH)),
-    },
-    {
-      id: 'twitterapi-io',
-      label: 'X',
-      category: 'social',
-      status: status(Boolean(config.TWITTERAPI_IO_API_KEY)),
-    },
-    {
-      id: 'rss',
-      label: 'RSS/Atom',
-      category: 'feed',
-      status: status(config.DISCOVERY_RSS_FEED_URLS.length > 0),
-    },
-    { id: 'hacker-news', label: 'Hacker News', category: 'community', status: 'enabled' },
-    { id: 'stack-overflow', label: 'Stack Overflow', category: 'community', status: 'enabled' },
-    { id: 'arxiv', label: 'arXiv', category: 'paper', status: 'enabled' },
-    { id: 'github', label: 'GitHub', category: 'code', status: 'enabled' },
-    {
-      id: 'search-brave',
-      label: 'Brave Search',
-      category: 'web',
-      status: status(config.SEARCH_PROVIDER === 'brave' && Boolean(config.SEARCH_API_KEY)),
-    },
-    {
-      id: 'search-tavily',
-      label: 'Tavily',
-      category: 'web',
-      status: status(Boolean(config.TAVILY_API_KEY)),
-    },
-    {
-      id: 'search-bing',
-      label: 'Bing (China)',
-      category: 'web',
-      status: status(config.BING_SEARCH_ENABLED),
-    },
-    {
-      id: 'youtube',
-      label: 'YouTube',
-      category: 'video',
-      status: status(Boolean(config.YOUTUBE_API_KEY)),
-    },
-    {
-      id: 'reddit',
-      label: 'Reddit',
-      category: 'community',
-      status: status(Boolean(config.REDDIT_CLIENT_ID && config.REDDIT_CLIENT_SECRET)),
-    },
-    { id: 'bluesky', label: 'Bluesky', category: 'social', status: 'enabled' },
-    { id: 'bilibili', label: 'Bilibili', category: 'video', status: 'enabled' },
-    {
-      id: 'twitter-trends', label: 'X Trends', category: 'social',
-      status: status(Boolean(config.TWITTERAPI_IO_API_KEY)),
-    },
-    {
-      id: 'hacker-news-trends', label: 'Hacker News Top Stories',
-      category: 'community', status: 'enabled',
-    },
-    {
-      id: 'youtube-trends', label: 'YouTube Most Popular', category: 'video',
-      status: status(Boolean(config.YOUTUBE_API_KEY)),
-    },
-    {
-      id: 'reddit-trends', label: 'Reddit Hot', category: 'community',
-      status: status(Boolean(config.REDDIT_CLIENT_ID && config.REDDIT_CLIENT_SECRET)),
-    },
-    { id: 'bilibili-trends', label: 'Bilibili Popular', category: 'video', status: 'enabled' },
-    {
-      id: 'google-trends-rss', label: 'Google Trends RSS', category: 'feed',
-      status: status(config.TREND_GOOGLE_RSS_URLS.length > 0),
-    },
-  ]);
+  metrics?: ApiMetrics;
+  trustProxy?: boolean | number;
 }
 
 export async function createApiApp(
@@ -981,6 +918,7 @@ export async function createApiApp(
   const discoverySources = discoverySourceStatusSchema.array().parse(
     options.discoverySources ?? configuredDiscoverySources(config),
   );
+  const metrics = options.metrics ?? new ApiMetrics();
   const app = await NestFactory.create(
     AppModule.register(
       store,
@@ -998,15 +936,23 @@ export async function createApiApp(
       auth,
       allowDevIdentity,
       secureCookies,
+      metrics,
     ),
     { logger: false },
   );
+  const trustProxy = options.trustProxy ?? (config.NODE_ENV === 'production' ? 1 : false);
+  if (trustProxy !== false) {
+    const express = app.getHttpAdapter().getInstance() as {
+      set(name: string, value: boolean | number): void;
+    };
+    express.set('trust proxy', trustProxy);
+  }
   app.enableCors({
     origin: options.webOrigin ?? config.WEB_ORIGIN,
     credentials: true,
   });
   const requestLogger = options.requestLogger ?? (config.NODE_ENV === 'test' ? undefined : console);
-  app.use(createRequestTracingMiddleware(requestLogger, options.now));
+  app.use(createRequestTracingMiddleware(requestLogger, options.now, metrics));
   app.use(createAuthMiddleware(auth, { allowDevIdentity, secureCookies }));
   await app.init();
   return app;
@@ -1019,4 +965,4 @@ function healthProbe(value: unknown): HealthProbe | undefined {
   return { check: () => Promise.resolve(check.call(value)) };
 }
 
-export { MemoryTopicStore };
+export { configuredDiscoverySources, MemoryTopicStore };

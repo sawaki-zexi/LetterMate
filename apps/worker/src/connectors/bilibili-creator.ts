@@ -54,6 +54,58 @@ const searchResponseSchema = z.object({
 const navSchema = z.object({
   data: z.object({ wbi_img: z.object({ img_url: z.string().url(), sub_url: z.string().url() }) }),
 }).passthrough();
+const dynamicAuthorSchema = z.object({
+  mid: z.union([z.string(), z.number()]).transform(String),
+  name: z.string().trim().min(1),
+  pub_ts: numeric.optional().default(0),
+}).passthrough();
+const dynamicCountSchema = z.object({ count: numeric.optional().default(0) }).passthrough();
+const dynamicMajorPayloadSchema = z.object({
+  id: z.union([z.string(), z.number()]).transform(String).optional(),
+  bvid: z.string().regex(/^BV[A-Za-z0-9]+$/).optional(),
+  title: z.string().optional().nullable(),
+  desc: z.string().optional().nullable(),
+  jump_url: z.string().optional().nullable(),
+  summary: z.union([
+    z.string(),
+    z.object({ text: z.string().optional().default('') }).passthrough(),
+  ]).optional().nullable(),
+}).passthrough();
+const dynamicMajorSchema = z.object({
+  type: z.string().optional().default(''),
+  archive: z.unknown().optional().nullable(),
+  article: z.unknown().optional().nullable(),
+  opus: z.unknown().optional().nullable(),
+  common: z.unknown().optional().nullable(),
+  draw: z.unknown().optional().nullable(),
+}).passthrough();
+const dynamicItemSchema = z.object({
+  id_str: z.union([z.string(), z.number()]).transform(String).pipe(z.string().regex(/^\d+$/)),
+  type: z.string().min(1),
+  modules: z.object({
+    module_author: dynamicAuthorSchema,
+    module_dynamic: z.object({
+      desc: z.object({ text: z.string().optional().default('') }).passthrough().optional().nullable(),
+      major: dynamicMajorSchema.optional().nullable(),
+    }).passthrough(),
+    module_stat: z.object({
+      comment: dynamicCountSchema.optional().default({ count: 0 }),
+      forward: dynamicCountSchema.optional().default({ count: 0 }),
+      like: dynamicCountSchema.optional().default({ count: 0 }),
+    }).passthrough().optional().default({
+      comment: { count: 0 }, forward: { count: 0 }, like: { count: 0 },
+    }),
+  }).passthrough(),
+  orig: z.unknown().optional().nullable(),
+}).passthrough();
+const dynamicResponseSchema = z.object({
+  code: z.number().int(),
+  data: z.object({
+    has_more: z.boolean().optional().default(false),
+    offset: z.union([z.string(), z.number()]).transform(String).optional().nullable(),
+    items: z.array(z.unknown()).max(100).optional().default([]),
+  }).optional().nullable(),
+}).passthrough();
 
 export interface BilibiliCreatorConnectorConfig {
   mid: string;
@@ -65,6 +117,38 @@ export interface BilibiliCreatorConnectorConfig {
 const clean = (value: string | null | undefined): string => (
   value?.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim() ?? ''
 );
+
+const dynamicUrl = (id: string): string => `https://t.bilibili.com/${id}`;
+
+function absoluteBilibiliUrl(value: string | null | undefined): string | null {
+  const input = value?.trim();
+  if (!input) return null;
+  try {
+    const url = input.startsWith('//')
+      ? new URL(`https:${input}`)
+      : new URL(input, 'https://www.bilibili.com');
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function summaryText(value: z.infer<typeof dynamicMajorPayloadSchema>['summary']): string {
+  return clean(typeof value === 'string' ? value : value?.text);
+}
+
+function joinContent(...values: Array<string | null | undefined>): string {
+  return [...new Set(values.map((value) => clean(value)).filter(Boolean))].join('\n\n');
+}
+
+interface DynamicContent {
+  title: string;
+  text: string;
+  url: string;
+  sourceType: SourceCandidate['sourceType'];
+  key: string;
+  externalId: string;
+}
 
 function providerCode(payload: unknown): number {
   return typeof payload === 'object' && payload !== null && 'code' in payload
@@ -132,8 +216,27 @@ export class BilibiliCreatorConnector {
       if (response.data.data.result.length === 0 || (pages !== undefined && page >= pages)) break;
     }
 
+    let offset: string | null = null;
+    for (let page = 1; page <= this.pageBudget; page += 1) {
+      const url = new URL('/x/polymer/web-dynamic/v1/feed/space', API_BASE_URL);
+      url.searchParams.set('host_mid', this.config.mid);
+      if (offset) url.searchParams.set('offset', offset);
+      const payload = await this.request(url, signal);
+      requestCount += 1;
+      const response = dynamicResponseSchema.safeParse(payload);
+      if (!response.success || response.data.code !== 0 || !response.data.data) throw providerError(payload);
+      response.data.data.items.forEach((item) => this.addDynamic(drafts, item, card.name, plan));
+      const nextOffset = response.data.data.offset?.trim() || null;
+      if (!response.data.data.has_more || response.data.data.items.length === 0 || !nextOffset) break;
+      offset = nextOffset;
+    }
+
     return {
-      candidates: [...drafts.values()].slice(0, plan.maxCandidates),
+      candidates: [...drafts.values()]
+        .sort((left, right) => (
+          Date.parse(right.publishedAt ?? '') - Date.parse(left.publishedAt ?? '') || 0
+        ))
+        .slice(0, plan.maxCandidates),
       requestCount,
       identity: {
         displayName: card.name,
@@ -183,6 +286,144 @@ export class BilibiliCreatorConnector {
         parentContentText: null,
       },
     });
+  }
+
+  private addDynamic(
+    drafts: Map<string, SourceCandidate>,
+    raw: unknown,
+    displayName: string,
+    plan: SourceQueryPlan,
+  ): void {
+    const parsed = dynamicItemSchema.safeParse(raw);
+    if (!parsed.success || parsed.data.modules.module_author.mid !== this.config.mid) return;
+    const item = parsed.data;
+    const publishedAt = item.modules.module_author.pub_ts > 0
+      ? new Date(item.modules.module_author.pub_ts * 1_000).toISOString()
+      : null;
+    if (publishedAt && (publishedAt < plan.windowStart || publishedAt > plan.windowEnd)) return;
+
+    const isRepost = item.type === 'DYNAMIC_TYPE_FORWARD';
+    const originalResult = isRepost ? dynamicItemSchema.safeParse(item.orig) : null;
+    const originalItem = originalResult?.success ? originalResult.data : null;
+    const originalContent = originalItem ? this.dynamicContent(originalItem) : null;
+    if (isRepost && (!originalItem || !originalContent)) return;
+
+    const content = this.dynamicContent(item);
+    if (!isRepost && !content) return;
+    const commentary = clean(item.modules.module_dynamic.desc?.text);
+    const body = isRepost
+      ? joinContent(commentary, `原帖：${originalContent!.text}`)
+      : content!.text;
+    if (!body) return;
+
+    const author = isRepost ? originalItem!.modules.module_author : item.modules.module_author;
+    const title = isRepost ? `转发：${originalContent!.title}`.slice(0, 300) : content!.title;
+    const candidateUrl = isRepost ? dynamicUrl(item.id_str) : content!.url;
+    const externalId = isRepost ? item.id_str : content!.externalId;
+    const key = isRepost ? `dynamic:${item.id_str}` : content!.key;
+    if (drafts.has(key)) return;
+    const stats = item.modules.module_stat;
+    drafts.set(key, {
+      connectorId: 'bilibili-creator',
+      sourceType: isRepost ? 'social' : content!.sourceType,
+      platform: 'Bilibili',
+      externalId,
+      url: candidateUrl,
+      title,
+      content: body,
+      excerpt: null,
+      authorName: clean(author.name) || displayName,
+      authorHandle: `UID ${author.mid}`,
+      publishedAt,
+      language: 'zh',
+      engagement: {
+        comments: stats.comment.count,
+        reposts: stats.forward.count,
+        likes: stats.like.count,
+      },
+      proof: { kind: 'api_record', connectorId: 'bilibili-creator', externalId },
+      creatorContext: {
+        contentType: isRepost ? 'repost' : 'original',
+        originalAuthorName: isRepost ? clean(originalItem!.modules.module_author.name) : null,
+        originalAuthorHandle: isRepost ? `UID ${originalItem!.modules.module_author.mid}` : null,
+        originalContentId: isRepost ? originalItem!.id_str : null,
+        originalContentUrl: isRepost ? originalContent!.url : null,
+        parentContentId: null,
+        parentContentUrl: null,
+        parentContentText: null,
+      },
+    });
+  }
+
+  private dynamicContent(item: z.infer<typeof dynamicItemSchema>): DynamicContent | null {
+    const id = item.id_str;
+    const description = clean(item.modules.module_dynamic.desc?.text);
+    const major = item.modules.module_dynamic.major;
+    const archive = dynamicMajorPayloadSchema.safeParse(major?.archive);
+    if (archive.success && archive.data.bvid) {
+      const title = clean(archive.data.title) || description.slice(0, 120);
+      const text = joinContent(description, archive.data.desc, summaryText(archive.data.summary));
+      if (!title || !text) return null;
+      return {
+        title,
+        text,
+        url: `https://www.bilibili.com/video/${archive.data.bvid}`,
+        sourceType: 'video',
+        key: archive.data.bvid,
+        externalId: archive.data.bvid,
+      };
+    }
+
+    const article = dynamicMajorPayloadSchema.safeParse(major?.article);
+    if (article.success) {
+      const articleId = article.data.id?.replace(/^cv/i, '') ?? null;
+      const url = absoluteBilibiliUrl(article.data.jump_url)
+        ?? (articleId ? `https://www.bilibili.com/read/cv${articleId}` : dynamicUrl(id));
+      const title = clean(article.data.title) || description.slice(0, 120);
+      const text = joinContent(description, article.data.desc, summaryText(article.data.summary));
+      if (!title || !text) return null;
+      return { title, text, url, sourceType: 'web', key: `dynamic:${id}`, externalId: id };
+    }
+
+    const opus = dynamicMajorPayloadSchema.safeParse(major?.opus);
+    if (opus.success) {
+      const title = clean(opus.data.title) || description.slice(0, 120);
+      const text = joinContent(description, opus.data.desc, summaryText(opus.data.summary));
+      if (!title || !text) return null;
+      return {
+        title,
+        text,
+        url: absoluteBilibiliUrl(opus.data.jump_url) ?? dynamicUrl(id),
+        sourceType: 'web',
+        key: `dynamic:${id}`,
+        externalId: id,
+      };
+    }
+
+    const common = dynamicMajorPayloadSchema.safeParse(major?.common);
+    if (common.success) {
+      const title = clean(common.data.title) || description.slice(0, 120);
+      const text = joinContent(description, common.data.desc, summaryText(common.data.summary));
+      if (!title || !text) return null;
+      return {
+        title,
+        text,
+        url: absoluteBilibiliUrl(common.data.jump_url) ?? dynamicUrl(id),
+        sourceType: 'web',
+        key: `dynamic:${id}`,
+        externalId: id,
+      };
+    }
+
+    if (!description) return null;
+    return {
+      title: description.slice(0, 120),
+      text: description,
+      url: dynamicUrl(id),
+      sourceType: 'social',
+      key: `dynamic:${id}`,
+      externalId: id,
+    };
   }
 
   private async fetchCard(signal: AbortSignal): Promise<z.infer<typeof cardSchema>> {

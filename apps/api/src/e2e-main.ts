@@ -10,6 +10,7 @@ import {
 import { MemoryTopicStore } from './topic-store.js';
 import type { TopicQueue } from './topic-queue.js';
 import type { TrendQueue } from './trend-queue.js';
+import type { CreatorQueue } from './creator-queue.js';
 
 const personalizationFacts: MemoryPersonalizationFacts = {
   events: [],
@@ -180,7 +181,17 @@ const trendQueue: TrendQueue = {
   close: closeScheduledRuns,
 };
 
+const creatorQueue: CreatorQueue = {
+  async enqueue() {},
+  async close() {},
+};
+
 const app = await createApiApp({
-  store, queue, trendQueue, aiConfigured: true, personalizationMemory: personalization,
+  store,
+  queue,
+  trendQueue,
+  creatorQueue,
+  aiConfigured: true,
+  personalizationMemory: personalization,
 });
 await app.listen(Number(process.env.PORT ?? 3001), '0.0.0.0');

@@ -1,10 +1,24 @@
-import { operationalLogSchema, type OperationalLog } from '@lettermate/contracts';
+import {
+  operationalLogSchema,
+  type AgentRunStage,
+  type OperationalLog,
+} from '@lettermate/contracts';
 import type { Job, Worker } from 'bullmq';
+import type { WorkerMetricsSink } from './metrics.js';
 
 export interface OperationalLogger {
   log(message: string): void;
   warn(message: string): void;
   error(message: string): void;
+}
+
+export interface AgentStageTelemetry {
+  runId: string;
+  stage: AgentRunStage;
+  durationMs: number;
+  inputCount?: number;
+  outputCount?: number;
+  failureCount?: number;
 }
 
 interface QueueCounts {
@@ -53,28 +67,64 @@ export function writeOperationalLog(
   else logger.log(serialized);
 }
 
+export function writeAgentStageLog(
+  logger: OperationalLogger,
+  component: 'topic' | 'trend',
+  telemetry: AgentStageTelemetry,
+  now = new Date(),
+  metrics?: WorkerMetricsSink,
+): void {
+  const { runId, stage, durationMs, inputCount, outputCount, failureCount } = telemetry;
+  const aggregateCounts = { inputCount, outputCount, failureCount };
+  const hasMetrics = Object.values(aggregateCounts).some((value) => value !== undefined);
+  writeOperationalLog(logger, {
+    level: 'info',
+    event: 'agent.stage.completed',
+    component,
+    runId,
+    stage,
+    durationMs: Math.max(0, Math.floor(durationMs)),
+    ...(hasMetrics ? { metrics: aggregateCounts } : {}),
+  }, now);
+  metrics?.recordAgentStage({ component, ...telemetry });
+}
+
 export function attachWorkerLogging<T>(
   worker: Worker<T>,
   queue: string,
   logger: OperationalLogger = console,
   now: () => Date = () => new Date(),
+  metrics?: WorkerMetricsSink,
 ): void {
-  worker.on('completed', (job) => writeOperationalLog(logger, {
-    level: 'info', event: 'queue.job.completed', queue, ...jobContext(job),
-  }, now()));
-  worker.on('failed', (job, error) => writeOperationalLog(logger, {
-    level: 'error', event: 'queue.job.failed', queue, ...jobContext(job),
-    code: safeErrorCode(error, 'JOB_FAILED'),
-  }, now()));
-  worker.on('stalled', (jobId) => writeOperationalLog(logger, {
-    level: 'warn', event: 'queue.job.stalled', queue,
-    ...(boundedIdentifier(jobId, 200) ? { jobId: boundedIdentifier(jobId, 200) } : {}),
-    code: 'JOB_STALLED',
-  }, now()));
-  worker.on('error', (error) => writeOperationalLog(logger, {
-    level: 'error', event: 'queue.worker.error', queue,
-    code: safeErrorCode(error, 'WORKER_ERROR'), dependency: 'redis',
-  }, now()));
+  worker.on('completed', (job) => {
+    writeOperationalLog(logger, {
+      level: 'info', event: 'queue.job.completed', queue, ...jobContext(job),
+    }, now());
+    metrics?.recordJob(queue, 'completed');
+  });
+  worker.on('failed', (job, error) => {
+    const code = safeErrorCode(error, 'JOB_FAILED');
+    writeOperationalLog(logger, {
+      level: 'error', event: 'queue.job.failed', queue, ...jobContext(job), code,
+    }, now());
+    metrics?.recordJob(queue, 'failed', code);
+  });
+  worker.on('stalled', (jobId) => {
+    writeOperationalLog(logger, {
+      level: 'warn', event: 'queue.job.stalled', queue,
+      ...(boundedIdentifier(jobId, 200) ? { jobId: boundedIdentifier(jobId, 200) } : {}),
+      code: 'JOB_STALLED',
+    }, now());
+    metrics?.recordJob(queue, 'stalled', 'JOB_STALLED');
+  });
+  worker.on('error', (error) => {
+    const code = safeErrorCode(error, 'WORKER_ERROR');
+    writeOperationalLog(logger, {
+      level: 'error', event: 'queue.worker.error', queue,
+      code, dependency: 'redis',
+    }, now());
+    metrics?.recordJob(queue, 'worker_error', code);
+  });
 }
 
 export function startQueueMetricsReporter(
@@ -84,6 +134,7 @@ export function startQueueMetricsReporter(
     logger?: OperationalLogger;
     intervalMs?: number;
     now?: () => Date;
+    metrics?: WorkerMetricsSink;
   } = {},
 ): { close(): void } {
   const logger = options.logger ?? console;
@@ -106,6 +157,7 @@ export function startQueueMetricsReporter(
           queue,
           counts,
         }, now());
+        options.metrics?.recordQueueSnapshot(queue, counts);
       })
       .catch(() => writeOperationalLog(logger, {
         level: 'error', event: 'queue.metrics.failed', queue,

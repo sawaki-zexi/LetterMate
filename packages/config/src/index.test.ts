@@ -11,6 +11,7 @@ describe('configuration', () => {
   it('provides safe local service defaults', () => {
     expect(parseConfig({ NODE_ENV: 'development' })).toMatchObject({
       PORT: 3000,
+      METRICS_PORT: 9464,
       WEB_ORIGIN: 'http://localhost:5173',
       ALLOW_DEV_IDENTITY: true,
       SMTP_ENABLED: false,
@@ -120,6 +121,10 @@ describe('configuration', () => {
     expect(parseConfig({ NODE_ENV: 'development', AI_API_KEY: 'secret' })).toMatchObject({
       AI_API_KEY: 'secret',
       AI_MODEL: 'openrouter/auto',
+      AI_PROVIDER_ORDER: ['DeepSeek'],
+      AI_PROVIDER_FALLBACKS: false,
+      AI_RUN_MAX_CALLS: 200,
+      AI_RUN_MAX_COST_USD: 10,
       AI_WEB_SEARCH: true,
       AI_TIMEOUT_MS: 60_000,
     });
@@ -213,11 +218,37 @@ describe('configuration', () => {
     expect(() =>
       parseConfig({
         NODE_ENV: 'production',
+        WEB_ORIGIN: 'https://discovery.example.com',
         SESSION_SECRET: 's'.repeat(32),
         CSRF_SECRET: 'c'.repeat(32),
         ALLOW_DEV_IDENTITY: 'false',
       }),
     ).not.toThrow();
+  });
+
+  it('validates the internal Worker metrics port', () => {
+    expect(parseConfig({ METRICS_PORT: '19464' }).METRICS_PORT).toBe(19464);
+    expect(() => parseConfig({ METRICS_PORT: '0' })).toThrow();
+  });
+
+  it('parses task model routes, fallbacks, and conservative run budgets', () => {
+    expect(parseConfig({
+      AI_FAST_MODEL: 'fast/model',
+      AI_QUALITY_MODEL: 'quality/model',
+      AI_FALLBACK_MODELS: 'fallback/a, fallback/b',
+      AI_PROVIDER_ORDER: 'Provider A, Provider B',
+      AI_PROVIDER_FALLBACKS: 'true',
+      AI_RUN_MAX_CALLS: '12',
+      AI_RUN_MAX_COST_USD: '2.5',
+    })).toMatchObject({
+      AI_FAST_MODEL: 'fast/model',
+      AI_QUALITY_MODEL: 'quality/model',
+      AI_FALLBACK_MODELS: ['fallback/a', 'fallback/b'],
+      AI_PROVIDER_ORDER: ['Provider A', 'Provider B'],
+      AI_PROVIDER_FALLBACKS: true,
+      AI_RUN_MAX_CALLS: 12,
+      AI_RUN_MAX_COST_USD: 2.5,
+    });
   });
 
   it('requires production to disable the development identity', () => {
@@ -228,9 +259,20 @@ describe('configuration', () => {
     })).toThrow(/ALLOW_DEV_IDENTITY/);
     expect(parseConfig({
       NODE_ENV: 'production',
+      WEB_ORIGIN: 'https://discovery.example.com',
       SESSION_SECRET: 's'.repeat(32),
       CSRF_SECRET: 'c'.repeat(32),
       ALLOW_DEV_IDENTITY: 'false',
     }).ALLOW_DEV_IDENTITY).toBe(false);
+  });
+
+  it('requires an HTTPS Web origin in production', () => {
+    expect(() => parseConfig({
+      NODE_ENV: 'production',
+      WEB_ORIGIN: 'http://discovery.example.com',
+      SESSION_SECRET: 's'.repeat(32),
+      CSRF_SECRET: 'c'.repeat(32),
+      ALLOW_DEV_IDENTITY: 'false',
+    })).toThrow(/WEB_ORIGIN.*HTTPS/);
   });
 });

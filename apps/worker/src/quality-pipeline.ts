@@ -14,12 +14,14 @@ import {
   type KeywordPolicy,
 } from './keyword-policy.js';
 import { isChineseContent } from './chinese-content.js';
+import type { AiExecutionContext } from './ai-runtime.js';
 
 export type QualityAiGateway = Pick<AiGateway, 'evaluateCandidates' | 'composeItems'>;
 export type { QualityAssessment, QualityAssessmentCandidate } from './ai-gateway.js';
 export interface QualityPipelineInput {
   keyword: string; candidates: ValidatedSourceCandidate[]; historyUrls: string[];
-  windowStart: string; windowEnd: string; matchPolicy?: KeywordPolicy; signal?: AbortSignal;
+  windowStart: string; windowEnd: string; matchPolicy?: KeywordPolicy;
+  execution?: AiExecutionContext; signal?: AbortSignal;
 }
 interface ContentFetcherLike { fetchText(url: string, signal?: AbortSignal): Promise<FetchedText> }
 
@@ -109,6 +111,7 @@ export class QualityPipeline {
       const assessments = await this.gateway.evaluateCandidates({
         keyword: input.keyword,
         candidates: assessmentCandidates,
+        ...(input.execution ? { execution: input.execution } : {}),
         ...(input.signal ? { signal: input.signal } : {}),
       });
       const batch = this.validateAssessments(
@@ -132,6 +135,7 @@ export class QualityPipeline {
     const rawItems = await this.gateway.composeItems({
       keyword: input.keyword,
       candidates: compositionCandidates,
+      ...(input.execution ? { execution: input.execution } : {}),
       ...(input.signal ? { signal: input.signal } : {}),
     });
     if (!Array.isArray(rawItems) || rawItems.length > 8) throw new QualityPipelineError();

@@ -4,7 +4,7 @@ export default defineConfig({
   testDir: './tests/e2e',
   timeout: 30_000,
   fullyParallel: false,
-  // All projects share one stateful E2E API and Vite server.
+  // Each project uses one stateful E2E API and production-preview server.
   workers: 1,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
@@ -21,7 +21,7 @@ export default defineConfig({
       timeout: 120_000,
     },
     {
-      command: 'npm run dev -w @lettermate/web -- --host 127.0.0.1 --port 5410',
+      command: 'npm run preview:e2e -w @lettermate/web',
       url: 'http://127.0.0.1:5410',
       env: { VITE_API_PROXY: 'http://127.0.0.1:3011' },
       reuseExistingServer: false,

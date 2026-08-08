@@ -21,7 +21,7 @@ import {
   CreatorResolutionService,
   type CreatorIdentityResolver,
 } from './creator-resolver.js';
-import { AuthService, MemoryAuthStore } from './auth-service.js';
+import { AuthService, MemoryAuthRateLimiter, MemoryAuthStore } from './auth-service.js';
 
 class RecordingQueue implements TopicQueue {
   jobs: DiscoveryJobData[] = [];
@@ -524,8 +524,17 @@ describe('AI discovery API', () => {
       .expect(200)
       .expect(({ body }) => expect(body).toMatchObject({ status: 'ok' }));
     await request(localApp.getHttpServer())
-      .get('/api/v1/health/ready')
+      .get('/metrics')
       .expect(200)
+      .expect('Content-Type', /text\/plain/)
+      .expect(({ text }) => {
+        expect(text).toContain('lettermate_api_http_requests_total');
+        expect(text).toContain('route="/api/v1/health"');
+        expect(text).not.toContain('user-a');
+      });
+    await request(localApp.getHttpServer())
+      .get('/api/v1/health/ready')
+      .expect(503)
       .expect(({ body }) => {
         expect(body).toEqual(expect.objectContaining({
           status: 'degraded',
@@ -539,6 +548,23 @@ describe('AI discovery API', () => {
       });
 
     await localApp.close();
+
+    const healthyApp = await createApiApp({
+      store,
+      queue,
+      trendQueue,
+      creatorQueue,
+      aiConfigured: true,
+      healthChecks: {
+        database: { check: async () => {} },
+        redis: { check: async () => {} },
+      },
+    });
+    await request(healthyApp.getHttpServer())
+      .get('/api/v1/health/ready')
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({ status: 'ok' }));
+    await healthyApp.close();
   });
 
   it('rejects equivalent duplicate keywords for one user', async () => {
@@ -1114,6 +1140,43 @@ describe('AI discovery API', () => {
 });
 
 describe('production session identity', () => {
+  it('keeps login rate limits isolated by forwarded client IP behind one trusted proxy', async () => {
+    const auth = new AuthService(
+      new MemoryAuthStore(),
+      'session-secret-with-at-least-32-characters',
+      'csrf-secret-with-at-least-32-characters',
+      () => new Date('2026-08-08T00:00:00.000Z'),
+      new MemoryAuthRateLimiter(1, 60_000),
+    );
+    await auth.register({
+      email: 'student@example.com',
+      password: 'correct horse battery staple',
+      timezone: 'Asia/Shanghai',
+    });
+    const localApp = await createApiApp({
+      store: new MemoryTopicStore(),
+      queue: new RecordingQueue(),
+      trendQueue: new RecordingTrendQueue(),
+      creatorQueue: new RecordingCreatorQueue(),
+      authService: auth,
+      allowDevIdentity: false,
+      trustProxy: 1,
+    });
+
+    await request(localApp.getHttpServer())
+      .post('/api/v1/auth/login')
+      .set('x-forwarded-for', '203.0.113.10')
+      .send({ email: 'student@example.com', password: 'wrong password' })
+      .expect(401);
+    await request(localApp.getHttpServer())
+      .post('/api/v1/auth/login')
+      .set('x-forwarded-for', '203.0.113.11')
+      .send({ email: 'student@example.com', password: 'correct horse battery staple' })
+      .expect(201);
+
+    await localApp.close();
+  });
+
   it('rejects spoofed identity, enforces CSRF, and revokes logout sessions', async () => {
     let currentTime = new Date('2026-08-08T00:00:00.000Z');
     const auth = new AuthService(

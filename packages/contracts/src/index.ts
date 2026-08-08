@@ -546,12 +546,22 @@ export const readinessSchema = z.strictObject({
   dependencies: z.record(z.string().min(1), healthDependencySchema),
 });
 
+export const agentRunStageSchema = z.enum([
+  'plan',
+  'collect',
+  'classify',
+  'retrieve',
+  'quality_gate',
+  'persist',
+]);
+
 export const operationalLogSchema = z.strictObject({
   timestamp: z.iso.datetime(),
   level: z.enum(['info', 'warn', 'error']),
   service: z.enum(['api', 'worker']),
   event: z.string().trim().min(1).max(100),
   component: z.string().trim().min(1).max(100).optional(),
+  stage: agentRunStageSchema.optional(),
   traceId: z.string().trim().min(1).max(100).optional(),
   runId: z.string().trim().min(1).max(100).optional(),
   jobId: z.string().trim().min(1).max(200).optional(),
@@ -568,6 +578,11 @@ export const operationalLogSchema = z.strictObject({
     active: z.number().int().nonnegative(),
     delayed: z.number().int().nonnegative(),
     failed: z.number().int().nonnegative(),
+  }).optional(),
+  metrics: z.strictObject({
+    inputCount: z.number().int().nonnegative().optional(),
+    outputCount: z.number().int().nonnegative().optional(),
+    failureCount: z.number().int().nonnegative().optional(),
   }).optional(),
 });
 
@@ -631,6 +646,7 @@ export type HealthDependency = z.infer<typeof healthDependencySchema>;
 export type ProvenanceKind = z.infer<typeof provenanceKindSchema>;
 export type Readiness = z.infer<typeof readinessSchema>;
 export type OperationalLog = z.infer<typeof operationalLogSchema>;
+export type AgentRunStage = z.infer<typeof agentRunStageSchema>;
 export type RunSummary = z.infer<typeof runSummarySchema>;
 export type SafeError = z.infer<typeof safeErrorSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;

@@ -43,6 +43,75 @@ const uniqueConstraints = (modelName: string) => {
 const prohibitedFieldFragments = ['rank', 'score', 'payload', 'trust', 'evidence'];
 
 describe('multi-source Prisma schema', () => {
+  it('stores versioned run stages and private replayable artifacts', () => {
+    expect(modelNames()).toEqual(expect.arrayContaining(['RunStage', 'RunArtifact']));
+    expect(fieldNames('RunStage')).toEqual(expect.arrayContaining([
+      'runKind', 'runId', 'userId', 'stage', 'status', 'attempt', 'inputDigest',
+      'policyVersion', 'routeVersion', 'startedAt', 'finishedAt', 'errorCode',
+    ]));
+    expect(fieldNames('RunArtifact')).toEqual(expect.arrayContaining([
+      'stageId', 'data', 'byteLength', 'createdAt', 'stage',
+    ]));
+    expect(relation('RunStage', 'user')).toMatchObject({
+      relationFromFields: ['userId'], relationOnDelete: 'Cascade',
+    });
+    expect(relation('RunArtifact', 'stage')).toMatchObject({
+      relationFromFields: ['stageId'], relationOnDelete: 'Cascade',
+    });
+    expect(uniqueConstraints('RunStage')).toContainEqual([
+      'userId', 'runKind', 'runId', 'stage', 'inputDigest', 'policyVersion', 'routeVersion',
+    ]);
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260809_run_stage_checkpoints', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TABLE "RunStage"');
+    expect(migration).toContain('CREATE TABLE "RunArtifact"');
+    expect(migration).toContain('CREATE TYPE "RunStageName" AS ENUM');
+  });
+
+  it('stores user-owned AI run budgets and per-call usage without provider payloads', () => {
+    expect(modelNames()).toEqual(expect.arrayContaining(['AiRunBudget', 'AiUsage']));
+    expect(fieldNames('AiRunBudget')).toEqual(expect.arrayContaining([
+      'runKind', 'runId', 'userId', 'policyVersion', 'budgetVersion',
+      'maxCalls', 'maxInputTokens', 'maxOutputTokens', 'maxCostMicros',
+      'reservedCalls', 'reservedInputTokens', 'reservedOutputTokens',
+      'reservedCostMicros',
+    ]));
+    expect(fieldNames('AiUsage')).toEqual(expect.arrayContaining([
+      'runKind', 'runId', 'userId', 'task', 'status', 'routeVersion',
+      'requestedModel', 'actualModel', 'provider', 'estimatedInputTokens',
+      'reservedOutputTokens', 'reservedCostMicros', 'inputTokens', 'outputTokens',
+      'reasoningTokens', 'cachedTokens', 'costMicros', 'errorCode',
+    ]));
+    expect(fieldNames('AiUsage')).not.toEqual(expect.arrayContaining(['request', 'response', 'payload']));
+    expect(relation('AiRunBudget', 'user')).toMatchObject({
+      relationFromFields: ['userId'], relationOnDelete: 'Cascade',
+    });
+    expect(relation('AiUsage', 'budget')).toMatchObject({
+      relationFromFields: ['runKind', 'runId'],
+      relationToFields: ['runKind', 'runId'],
+      relationOnDelete: 'Cascade',
+    });
+
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260808_ai_runtime_budget', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TABLE "AiRunBudget"');
+    expect(migration).toContain('CREATE TABLE "AiUsage"');
+    expect(migration).toContain('CREATE TYPE "AiTask" AS ENUM');
+    expect(schema).toMatch(/enum AiTask \{[\s\S]*evidence_gap_detection[\s\S]*\}/);
+    const evidenceGapMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260809_evidence_gap_task', 'migration.sql',
+    );
+    const evidenceGapMigration = existsSync(evidenceGapMigrationPath)
+      ? readFileSync(evidenceGapMigrationPath, 'utf8') : '';
+    expect(evidenceGapMigration).toContain(
+      'ALTER TYPE "AiTask" ADD VALUE \'evidence_gap_detection\';',
+    );
+  });
+
   it('stores topic scheduling state and source-aware discovery items', () => {
     expect(fieldNames('Topic')).toEqual(expect.arrayContaining([
       'nextRunAt', 'scheduleIntervalHours', 'productiveRunStreak', 'emptyRunStreak', 'runs',

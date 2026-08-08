@@ -43,12 +43,27 @@ const trendGoogleRssUrls = z.preprocess(
   z.array(z.url().refine((url) => new URL(url).protocol === 'https:')).default([]),
 );
 
+const commaSeparatedStrings = z.preprocess(
+  (value) => typeof value === 'string'
+    ? value.split(',').map((item) => item.trim()).filter(Boolean)
+    : value,
+  z.array(z.string().trim().min(1)).default([]),
+);
+
+const aiProviderOrder = z.preprocess(
+  (value) => typeof value === 'string'
+    ? value.split(',').map((item) => item.trim()).filter(Boolean)
+    : value,
+  z.array(z.string().trim().min(1)).default(['DeepSeek']),
+);
+
 const baseConfigSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   WEB_ORIGIN: z.url().default('http://localhost:5173'),
   DATABASE_URL: z.string().min(1).default('postgresql://lettermate:lettermate@localhost:5432/lettermate'),
   REDIS_URL: z.string().min(1).default('redis://localhost:6379'),
+  METRICS_PORT: z.coerce.number().int().min(1).max(65_535).default(9464),
   SESSION_SECRET: z.string().min(32).optional(),
   CSRF_SECRET: z.string().min(32).optional(),
   ALLOW_DEV_IDENTITY: z
@@ -57,6 +72,17 @@ const baseConfigSchema = z.object({
     .transform((value) => value === 'true'),
   AI_API_KEY: optionalNonEmptyString,
   AI_MODEL: z.string().trim().min(1).default('openrouter/auto'),
+  AI_FAST_MODEL: optionalNonEmptyString,
+  AI_QUALITY_MODEL: optionalNonEmptyString,
+  AI_LOCALIZATION_MODEL: optionalNonEmptyString,
+  AI_FALLBACK_MODELS: commaSeparatedStrings,
+  AI_PROVIDER_ORDER: aiProviderOrder,
+  AI_PROVIDER_FALLBACKS: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
+  AI_RESERVED_COST_USD_PER_CALL: z.coerce.number().finite().min(0).default(0.05),
+  AI_RUN_MAX_CALLS: z.coerce.number().int().positive().default(200),
+  AI_RUN_MAX_INPUT_TOKENS: z.coerce.number().int().positive().default(2_000_000),
+  AI_RUN_MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(1_000_000),
+  AI_RUN_MAX_COST_USD: z.coerce.number().finite().positive().default(10),
   AI_WEB_SEARCH: z
     .enum(['true', 'false'])
     .default('true')
@@ -161,6 +187,9 @@ export function parseConfig(environment: Record<string, string | undefined>): Ap
     }
     if (parsed.ALLOW_DEV_IDENTITY) {
       throw new Error('ALLOW_DEV_IDENTITY must be false in production');
+    }
+    if (new URL(parsed.WEB_ORIGIN).protocol !== 'https:') {
+      throw new Error('WEB_ORIGIN must use HTTPS in production');
     }
   }
 

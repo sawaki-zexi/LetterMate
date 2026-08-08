@@ -1,6 +1,7 @@
 import {
   safeErrorSchema,
   topicSchema,
+  type AgentRunStage,
   type DiscoveryCandidate,
   type DiscoveryTrigger,
   type SafeError,
@@ -19,6 +20,10 @@ import type { ConnectorSearchSummary, SourceQueryPlan } from './connectors/types
 import { buildKeywordPolicy } from './keyword-policy.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
 import type { ContentInterestTagger } from './content-interest-tagger.js';
+import type { AiExecutionContext } from './ai-runtime.js';
+import type { AgentStageTelemetry } from './observability.js';
+import type { RunStageManager } from './run-stage.js';
+import type { EvidenceGapRetriever } from './evidence-gap-retriever.js';
 import { SourceRouter } from './source-router.js';
 import {
   calculateFailureSchedule,
@@ -50,6 +55,7 @@ export interface SaveSuccessInput {
 
 export interface BegunDiscoveryRun {
   runId: string;
+  startedAt?: Date;
   keyword: string;
   keywordProfile: KeywordProfile;
   expandedTerms: string[];
@@ -155,7 +161,8 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
         },
       });
       if (!previous) return null;
-      const runId = randomUUID();
+      const resumedRunId = previous.runStatus === 'queued' ? previous.activeRunId : null;
+      const runId = resumedRunId ?? randomUUID();
       const keywordProfile = previous.keywordProfile === 'unknown'
         ? classifyKeywordProfile(previous.keyword)
         : { kind: previous.keywordProfile };
@@ -183,6 +190,7 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
       });
       if (claimed.count === 0) return null;
       if (
+        resumedRunId === null &&
         previous.activeRunId &&
         (
           previous.runStatus === 'running' ||
@@ -199,16 +207,23 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
           },
         });
       }
-      const run = await transaction.discoveryRun.create({
-        data: {
-          id: runId, topicId, trigger, status: 'running', startedAt,
-          keywordSnapshot: previous.keyword, expandedTermsSnapshot: previous.expandedTerms,
-          keywordProfileSnapshot: keywordProfile.kind,
-        },
-        select: { id: true },
-      });
+      const run = resumedRunId
+        ? await transaction.discoveryRun.update({
+            where: { id: resumedRunId },
+            data: { status: 'running', finishedAt: null, error: Prisma.DbNull },
+            select: { id: true, startedAt: true },
+          })
+        : await transaction.discoveryRun.create({
+            data: {
+              id: runId, topicId, trigger, status: 'running', startedAt,
+              keywordSnapshot: previous.keyword, expandedTermsSnapshot: previous.expandedTerms,
+              keywordProfileSnapshot: keywordProfile.kind,
+            },
+            select: { id: true, startedAt: true },
+          });
       return {
         runId: run.id,
+        startedAt: run.startedAt,
         keyword: previous.keyword,
         keywordProfile,
         expandedTerms: previous.expandedTerms,
@@ -406,8 +421,8 @@ export class PrismaDiscoveryRepository implements DiscoveryRepository {
           ...(topicState?.pausedAt ? { nextRunAt: null } : {}),
           lastRunAt: input.finishedAt,
           lastError: input.error,
-          activeRunId: null,
-          runLeaseUntil: null,
+          activeRunId: input.status === 'queued' ? input.runId : null,
+          runLeaseUntil: input.status === 'queued' ? input.finishedAt : null,
           ...(!topicState?.pausedAt ? input.schedule ?? {} : {}),
         },
       });
@@ -467,6 +482,9 @@ export interface TopicDiscoveryServiceOptions {
   now?: () => Date;
   timeoutMs?: number;
   interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>;
+  stageManager?: RunStageManager;
+  evidenceGapRetriever?: Pick<EvidenceGapRetriever, 'retrieve'>;
+  onStage?: (telemetry: AgentStageTelemetry) => void;
 }
 
 export interface DiscoveryRunContext {
@@ -482,6 +500,9 @@ export class TopicDiscoveryService {
   private readonly now: () => Date;
   private readonly timeoutMs: number;
   private readonly interestTagger: Pick<ContentInterestTagger, 'tagCandidates'> | undefined;
+  private readonly onStage: ((telemetry: AgentStageTelemetry) => void) | undefined;
+  private readonly stageManager: RunStageManager | undefined;
+  private readonly evidenceGapRetriever: Pick<EvidenceGapRetriever, 'retrieve'> | undefined;
 
   constructor(options: TopicDiscoveryServiceOptions) {
     this.gateway = options.gateway;
@@ -492,6 +513,9 @@ export class TopicDiscoveryService {
     this.now = options.now ?? (() => new Date());
     this.timeoutMs = options.timeoutMs ?? 600_000;
     this.interestTagger = options.interestTagger;
+    this.onStage = options.onStage;
+    this.stageManager = options.stageManager;
+    this.evidenceGapRetriever = options.evidenceGapRetriever;
   }
 
   async run(
@@ -516,18 +540,24 @@ export class TopicDiscoveryService {
         }
       : claim;
     const { runId } = begun;
+    const execution: AiExecutionContext = { runId, userId, runKind: 'topic' };
     const controller = new AbortController();
     const deadlineAt = Date.now() + this.timeoutMs;
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     let pendingManualRefresh = false;
     try {
+      let stageStartedAt = Date.now();
       buildKeywordPolicy(begun.keyword);
       const expanded = begun.initialExpansion
-        ? await this.gateway.expandTopic({ keyword: begun.keyword, signal: controller.signal })
+        ? await this.runStage(execution, 'plan', {
+            keyword: begun.keyword, initialExpansion: begun.initialExpansion,
+          }, () => this.gateway.expandTopic({
+            keyword: begun.keyword, execution, signal: controller.signal,
+          }))
         : { terms: begun.expandedTerms, searchQueries: begun.expandedTerms };
       this.throwIfTimedOut(controller.signal, deadlineAt);
       const expandedTerms = unique([...expanded.terms, ...expanded.searchQueries]);
-      const windowEnd = this.now();
+      const windowEnd = begun.startedAt ?? startedAt;
       const windowStart = new Date(windowEnd.getTime() - 7 * 24 * 60 * 60 * 1_000);
       const plan = this.router.route({
         keyword: begun.keyword,
@@ -536,29 +566,57 @@ export class TopicDiscoveryService {
         windowEnd: windowEnd.toISOString(),
         expanded,
       });
-      const [connectorResult, historyUrls] = await Promise.all([
-        this.registry.search(plan, controller.signal),
-        this.repository.listHistoryUrls(topicId),
-      ]);
+      this.emitStage(runId, 'plan', stageStartedAt, {
+        inputCount: expanded.terms.length + expanded.searchQueries.length,
+        outputCount: plan.connectorIds?.length ?? plan.sourceTypes.length,
+      });
+      stageStartedAt = Date.now();
+      const historyUrls = await this.repository.listHistoryUrls(topicId);
+      const initialConnectorResult = await this.runStage(
+        execution, 'retrieve', { plan, historyUrls },
+        () => this.registry.search(plan, controller.signal),
+      );
       this.throwIfTimedOut(controller.signal, deadlineAt);
       if (
-        connectorResult.successfulConnectorIds.length === 0 &&
-        connectorResult.failures.length > 0
+        initialConnectorResult.successfulConnectorIds.length === 0 &&
+        initialConnectorResult.failures.length > 0
       ) {
         throw new DiscoveryOrchestrationError(
           'ALL_CONNECTORS_FAILED',
           'All configured discovery sources failed',
-          connectorResult.failures.some((failure) => failure.retryable),
+          initialConnectorResult.failures.some((failure) => failure.retryable),
         );
       }
-      const items = await this.qualityPipeline.run({
-        keyword: begun.keyword,
-        matchPolicy: plan.matchPolicy,
-        candidates: connectorResult.candidates,
-        historyUrls,
-        windowStart: plan.windowStart,
-        windowEnd: plan.windowEnd,
-        signal: controller.signal,
+      const connectorResult = this.evidenceGapRetriever
+        ? await this.evidenceGapRetriever.retrieve({
+            execution, plan, initial: initialConnectorResult, signal: controller.signal,
+          })
+        : initialConnectorResult;
+      this.throwIfTimedOut(controller.signal, deadlineAt);
+      this.emitStage(runId, 'retrieve', stageStartedAt, {
+        inputCount: plan.queries.length,
+        outputCount: connectorResult.candidates.length,
+        failureCount: connectorResult.failures.length,
+      });
+      stageStartedAt = Date.now();
+      const items = await this.runStage(
+        execution,
+        'quality_gate',
+        { keyword: begun.keyword, plan, candidates: connectorResult.candidates, historyUrls },
+        () => this.qualityPipeline.run({
+          keyword: begun.keyword,
+          matchPolicy: plan.matchPolicy,
+          candidates: connectorResult.candidates,
+          historyUrls,
+          windowStart: plan.windowStart,
+          windowEnd: plan.windowEnd,
+          execution,
+          signal: controller.signal,
+        }),
+      );
+      this.emitStage(runId, 'quality_gate', stageStartedAt, {
+        inputCount: connectorResult.candidates.length,
+        outputCount: items.length,
       });
       this.throwIfTimedOut(controller.signal, deadlineAt);
       const scheduleState = trigger === 'manual'
@@ -577,6 +635,7 @@ export class TopicDiscoveryService {
           });
       this.throwIfTimedOut(controller.signal, deadlineAt);
       const persistenceTimeoutMs = this.remainingTimeMs(controller.signal, deadlineAt);
+      stageStartedAt = Date.now();
       const saved = await this.repository.saveSuccess({
         runId,
         topicId,
@@ -599,9 +658,13 @@ export class TopicDiscoveryService {
         persistenceTimeoutMs,
         ...(schedule ? { schedule } : {}),
       });
+      this.emitStage(runId, 'persist', stageStartedAt, {
+        inputCount: items.length,
+        outputCount: saved.newItemCount,
+      });
       this.throwIfTimedOut(controller.signal, deadlineAt);
       pendingManualRefresh = saved.pendingManualRefresh;
-      await this.interestTagger?.tagCandidates(items, controller.signal);
+      await this.interestTagger?.tagCandidates(items, controller.signal, execution);
     } catch (error) {
       const failure = this.isTimedOut(error, controller.signal, deadlineAt)
         ? new DiscoveryOrchestrationError(
@@ -637,6 +700,35 @@ export class TopicDiscoveryService {
     if (pendingManualRefresh) {
       await this.run(topicId, userId, 'manual', context);
     }
+  }
+
+  private emitStage(
+    runId: string,
+    stage: AgentRunStage,
+    startedAt: number,
+    metrics: Pick<AgentStageTelemetry, 'inputCount' | 'outputCount' | 'failureCount'> = {},
+  ): void {
+    try {
+      this.onStage?.({
+        runId,
+        stage,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        ...metrics,
+      });
+    } catch {
+      // Telemetry must never change a discovery result.
+    }
+  }
+
+  private runStage<T>(
+    execution: AiExecutionContext,
+    stage: 'plan' | 'retrieve' | 'quality_gate',
+    value: unknown,
+    execute: () => Promise<T>,
+  ): Promise<T> {
+    return this.stageManager
+      ? this.stageManager.run({ execution, stage, value, execute })
+      : execute();
   }
 
   private remainingTimeMs(signal: AbortSignal, deadlineAt: number): number {

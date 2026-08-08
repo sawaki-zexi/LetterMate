@@ -19,8 +19,18 @@ import {
   TopicDiscoveryService,
 } from './discovery-service.js';
 import { OpenRouterAiGateway } from './openrouter-gateway.js';
+import {
+  createAiRuntimePolicy,
+  PrismaAiUsageLedger,
+} from './ai-runtime.js';
+import {
+  PrismaRunStageStore,
+  RUN_STAGE_POLICY_VERSION,
+  RunStageManager,
+} from './run-stage.js';
 import { createWorkerShutdown } from './lifecycle.js';
 import { QualityPipeline } from './quality-pipeline.js';
+import { EvidenceGapRetriever } from './evidence-gap-retriever.js';
 import { createSourceConnectors, createTrendSources } from './runtime.js';
 import {
   PrismaTopicScheduleRepository,
@@ -59,8 +69,10 @@ import { createDigestWorker } from './digest-worker.js';
 import {
   attachWorkerLogging,
   startQueueMetricsReporter,
+  writeAgentStageLog,
   writeOperationalLog,
 } from './observability.js';
+import { WorkerMetrics, startWorkerMetricsServer } from './metrics.js';
 
 try {
   process.loadEnvFile(new URL('../../../.env', import.meta.url));
@@ -80,6 +92,10 @@ const redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
 const schedulers: Array<{ close(): void | Promise<unknown> }> = [];
 const workers: Array<{ close(): void | Promise<unknown> }> = [];
 const queues: Array<{ close(): void | Promise<unknown> }> = [];
+const metrics = new WorkerMetrics();
+const metricsServer = await startWorkerMetricsServer(metrics, config.METRICS_PORT);
+schedulers.push(metricsServer);
+writeOperationalLog(console, { level: 'info', event: 'metrics.started' });
 
 if (config.SMTP_ENABLED && config.SMTP_HOST && config.SMTP_FROM) {
   const digestQueue = new Queue<DigestJobData>(digestQueueName, { connection: redis });
@@ -100,13 +116,13 @@ if (config.SMTP_ENABLED && config.SMTP_HOST && config.SMTP_FROM) {
     redis,
     new DigestDeliveryService(new PrismaDigestDeliveryRepository(prisma), digestGateway),
   );
-  attachWorkerLogging(digestWorker, digestQueueName);
+  attachWorkerLogging(digestWorker, digestQueueName, console, () => new Date(), metrics);
   const digestScheduler = startDigestScheduler(new DigestScheduleService(
     new PrismaDigestScheduleRepository(prisma),
     digestQueue,
   ));
   schedulers.push(digestScheduler);
-  schedulers.push(startQueueMetricsReporter(digestQueueName, digestQueue));
+  schedulers.push(startQueueMetricsReporter(digestQueueName, digestQueue, { metrics }));
   workers.push(digestWorker);
   queues.push(digestQueue);
 } else {
@@ -125,11 +141,33 @@ if (!config.AI_API_KEY) {
   const queue = new Queue<DiscoveryJobData>(discoveryQueueName, { connection: redis });
   const trendQueue = new Queue<TrendJobData>(trendQueueName, { connection: redis });
   const creatorQueue = new Queue<CreatorJobData>(creatorQueueName, { connection: redis });
+  const runtimePolicy = createAiRuntimePolicy({
+    defaultModel: config.AI_MODEL,
+    ...(config.AI_FAST_MODEL ? { fastModel: config.AI_FAST_MODEL } : {}),
+    ...(config.AI_QUALITY_MODEL ? { qualityModel: config.AI_QUALITY_MODEL } : {}),
+    ...(config.AI_LOCALIZATION_MODEL
+      ? { localizationModel: config.AI_LOCALIZATION_MODEL } : {}),
+    fallbackModels: config.AI_FALLBACK_MODELS,
+    providerOrder: config.AI_PROVIDER_ORDER,
+    allowProviderFallbacks: config.AI_PROVIDER_FALLBACKS,
+    reservedCostUsdPerCall: config.AI_RESERVED_COST_USD_PER_CALL,
+    budget: {
+      maxCalls: config.AI_RUN_MAX_CALLS,
+      maxInputTokens: config.AI_RUN_MAX_INPUT_TOKENS,
+      maxOutputTokens: config.AI_RUN_MAX_OUTPUT_TOKENS,
+      maxCostUsd: config.AI_RUN_MAX_COST_USD,
+    },
+  });
+  const stageManager = new RunStageManager(new PrismaRunStageStore(prisma), {
+    policyVersion: `${RUN_STAGE_POLICY_VERSION}:${runtimePolicy.version}`,
+  });
   const gateway = new OpenRouterAiGateway({
     apiKey: config.AI_API_KEY,
     model: config.AI_MODEL,
     webSearch: config.AI_WEB_SEARCH,
     timeoutMs: config.AI_TIMEOUT_MS,
+    runtimePolicy,
+    usageLedger: new PrismaAiUsageLedger(prisma),
   });
   const interestTagger = new ContentInterestTagger(
     new PrismaContentInterestTagRepository(prisma),
@@ -143,6 +181,7 @@ if (!config.AI_API_KEY) {
       code: failure.code, dependency: 'external',
     }),
   });
+  const evidenceGapRetriever = new EvidenceGapRetriever(gateway, registry, stageManager);
   const repository = new PrismaDiscoveryRepository(
     prisma,
     config.DISCOVERY_RUN_TIMEOUT_MS + 5 * 60 * 1_000,
@@ -154,9 +193,12 @@ if (!config.AI_API_KEY) {
     repository,
     timeoutMs: config.DISCOVERY_RUN_TIMEOUT_MS,
     interestTagger,
+    stageManager,
+    evidenceGapRetriever,
+    onStage: (telemetry) => writeAgentStageLog(console, 'topic', telemetry, new Date(), metrics),
   });
   const worker = createDiscoveryWorker(redis, service);
-  attachWorkerLogging(worker, discoveryQueueName);
+  attachWorkerLogging(worker, discoveryQueueName, console, () => new Date(), metrics);
   const trendRegistry = new TrendSourceRegistry(createTrendSources(config), {
     concurrency: config.DISCOVERY_CONNECTOR_CONCURRENCY,
     timeoutMs: Math.min(config.DISCOVERY_RUN_TIMEOUT_MS, 120_000),
@@ -177,6 +219,9 @@ if (!config.AI_API_KEY) {
     qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway),
     timeoutMs: config.DISCOVERY_RUN_TIMEOUT_MS,
     interestTagger,
+    stageManager,
+    evidenceGapRetriever,
+    onStage: (telemetry) => writeAgentStageLog(console, 'trend', telemetry, new Date(), metrics),
   });
   const trendWorker = createTrendWorker(redis, trendService, trendQueue);
   const creatorService = createCreatorDiscoveryService(
@@ -185,10 +230,11 @@ if (!config.AI_API_KEY) {
     config.DISCOVERY_RUN_TIMEOUT_MS,
     config.TWITTERAPI_IO_API_KEY,
     interestTagger,
+    stageManager,
   );
   const creatorWorker = createCreatorWorker(redis, creatorService);
-  attachWorkerLogging(trendWorker, trendQueueName);
-  attachWorkerLogging(creatorWorker, creatorQueueName);
+  attachWorkerLogging(trendWorker, trendQueueName, console, () => new Date(), metrics);
+  attachWorkerLogging(creatorWorker, creatorQueueName, console, () => new Date(), metrics);
   const scheduler = config.DISCOVERY_SCHEDULER_ENABLED
     ? startTopicScheduler(new TopicScheduleService(
         new PrismaTopicScheduleRepository(prisma),
@@ -212,9 +258,9 @@ if (!config.AI_API_KEY) {
     (value): value is NonNullable<typeof value> => value !== null,
   ));
   schedulers.push(
-    startQueueMetricsReporter(discoveryQueueName, queue),
-    startQueueMetricsReporter(trendQueueName, trendQueue),
-    startQueueMetricsReporter(creatorQueueName, creatorQueue),
+    startQueueMetricsReporter(discoveryQueueName, queue, { metrics }),
+    startQueueMetricsReporter(trendQueueName, trendQueue, { metrics }),
+    startQueueMetricsReporter(creatorQueueName, creatorQueue, { metrics }),
   );
   workers.push(worker, trendWorker, creatorWorker);
   queues.push(queue, trendQueue, creatorQueue);

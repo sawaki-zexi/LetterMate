@@ -21,6 +21,8 @@ import { QualityPipeline } from './quality-pipeline.js';
 import { buildKeywordPolicy } from './keyword-policy.js';
 import { ContentFetcher } from './content-fetcher.js';
 import type { ContentInterestTagger } from './content-interest-tagger.js';
+import type { AiExecutionContext } from './ai-runtime.js';
+import type { RunStageManager } from './run-stage.js';
 import { isChineseContent } from './chinese-content.js';
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -30,6 +32,7 @@ const ARCHIVE_LOCALIZATION_BACKFILL_LIMIT = 30;
 export interface CreatorRunClaim {
   state: 'claimed' | 'active' | 'missing';
   runId?: string;
+  startedAt?: Date;
   creator?: Pick<CreatorSubscription, 'id' | 'userId' | 'platform' | 'accountKey' | 'displayName' | 'profileUrl' | 'feedUrl'>;
 }
 
@@ -81,6 +84,7 @@ export interface CreatorDiscoveryServiceOptions {
   timeoutMs?: number;
   now?: () => Date;
   interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>;
+  stageManager?: RunStageManager;
 }
 
 export class CreatorDiscoveryService {
@@ -105,12 +109,17 @@ export class CreatorDiscoveryService {
 
   async run(job: CreatorJobData, context: { finalAttempt: boolean } = { finalAttempt: true }): Promise<void> {
     const parsed = creatorJobDataSchema.parse(job);
-    const claim = await this.options.repository.claimRun(parsed, this.now());
+    const startedAt = this.now();
+    const claim = await this.options.repository.claimRun(parsed, startedAt);
     if (claim.state !== 'claimed' || !claim.creator || !claim.runId) return;
+    const creator = claim.creator;
+    const execution: AiExecutionContext = {
+      runId: claim.runId, userId: claim.creator.userId, runKind: 'creator',
+    };
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const windowEnd = this.now();
+      const windowEnd = claim.startedAt ?? startedAt;
       const windowStart = new Date(windowEnd.getTime() - 7 * DAY_MS);
       const plan: SourceQueryPlan = {
         keyword: claim.creator.displayName,
@@ -123,7 +132,10 @@ export class CreatorDiscoveryService {
         matchPolicy: buildKeywordPolicy(claim.creator.displayName),
       };
       const [result, historyUrls, archiveBackfill] = await Promise.all([
-        this.createConnector(claim.creator).search(plan, controller.signal),
+        this.runStage(
+          execution, 'retrieve', { creatorId: creator.id, plan },
+          () => this.createConnector(creator).search(plan, controller.signal),
+        ),
         this.options.repository.listHistoryUrls(claim.creator.id),
         this.options.repository.listArchiveItemsNeedingLocalization(
           claim.creator.id,
@@ -132,14 +144,18 @@ export class CreatorDiscoveryService {
       ]);
       if (controller.signal.aborted) throw new Error('Creator run timed out');
       const candidates = result.candidates.map((candidate) => validateSourceCandidate(candidate));
-      const items = await this.options.qualityPipeline.run({
-        keyword: claim.creator.displayName,
-        candidates,
-        historyUrls,
-        windowStart: plan.windowStart,
-        windowEnd: plan.windowEnd,
-        signal: controller.signal,
-      });
+      const items = await this.runStage(
+        execution, 'quality_gate', { keyword: creator.displayName, plan, candidates, historyUrls },
+        () => this.options.qualityPipeline.run({
+          keyword: creator.displayName,
+          candidates,
+          historyUrls,
+          windowStart: plan.windowStart,
+          windowEnd: plan.windowEnd,
+          execution,
+          signal: controller.signal,
+        }),
+      );
       const feedUrls = new Set(items.flatMap((item) => (
         item.sourceUrls.map((url) => canonicalizeUrl(url))
       )));
@@ -165,6 +181,7 @@ export class CreatorDiscoveryService {
         claim.creator.displayName,
         [...archiveCandidatesById.values()],
         controller.signal,
+        execution,
       );
       const finishedAt = this.now();
       await this.options.repository.saveSuccess({
@@ -178,7 +195,7 @@ export class CreatorDiscoveryService {
         ...(result.identity ? { identity: result.identity } : {}),
         finishedAt,
       });
-      await this.options.interestTagger?.tagCandidates(items, controller.signal);
+      await this.options.interestTagger?.tagCandidates(items, controller.signal, execution);
     } catch (error) {
       await this.options.repository.saveFailure({
         runId: claim.runId,
@@ -199,11 +216,12 @@ export class CreatorDiscoveryService {
     creatorName: string,
     candidates: CreatorArchiveLocalizationCandidate[],
     signal: AbortSignal,
+    execution: AiExecutionContext,
   ): Promise<CreatorArchiveLocalization[]> {
     const results: CreatorArchiveLocalization[] = [];
     for (let index = 0; index < candidates.length; index += ARCHIVE_LOCALIZATION_BATCH_SIZE) {
       const batch = candidates.slice(index, index + ARCHIVE_LOCALIZATION_BATCH_SIZE);
-      results.push(...await this.localizeArchiveBatch(creatorName, batch, signal));
+      results.push(...await this.localizeArchiveBatch(creatorName, batch, signal, execution));
     }
     return results;
   }
@@ -212,14 +230,16 @@ export class CreatorDiscoveryService {
     creatorName: string,
     candidates: CreatorArchiveLocalizationCandidate[],
     signal: AbortSignal,
+    execution: AiExecutionContext,
   ): Promise<CreatorArchiveLocalization[]> {
     if (candidates.length === 0) return [];
     try {
-      const items = await this.options.archiveLocalizer.localizeCreatorItems({
-        creatorName,
-        candidates,
-        signal,
-      });
+      const items = await this.runStage(
+        execution, 'compose', { creatorName, candidates },
+        () => this.options.archiveLocalizer.localizeCreatorItems({
+          creatorName, candidates, execution, signal,
+        }),
+      );
       const inputIds = new Set(candidates.map(({ id }) => id));
       const outputIds = new Set<string>();
       for (const item of items) {
@@ -241,10 +261,25 @@ export class CreatorDiscoveryService {
       if (signal.aborted) throw error;
       if (candidates.length === 1) return [];
       const midpoint = Math.ceil(candidates.length / 2);
-      const left = await this.localizeArchiveBatch(creatorName, candidates.slice(0, midpoint), signal);
-      const right = await this.localizeArchiveBatch(creatorName, candidates.slice(midpoint), signal);
+      const left = await this.localizeArchiveBatch(
+        creatorName, candidates.slice(0, midpoint), signal, execution,
+      );
+      const right = await this.localizeArchiveBatch(
+        creatorName, candidates.slice(midpoint), signal, execution,
+      );
       return [...left, ...right];
     }
+  }
+
+  private runStage<T>(
+    execution: AiExecutionContext,
+    stage: 'retrieve' | 'quality_gate' | 'compose',
+    value: unknown,
+    execute: () => Promise<T>,
+  ): Promise<T> {
+    return this.options.stageManager
+      ? this.options.stageManager.run({ execution, stage, value, execute })
+      : execute();
   }
 }
 
@@ -261,7 +296,8 @@ export class PrismaCreatorRepository implements CreatorRepository {
       if (creator.runStatus === 'running' && creator.runLeaseUntil && creator.runLeaseUntil > startedAt) {
         return { state: 'active' };
       }
-      const runId = randomUUID();
+      const resumedRunId = creator.runStatus === 'queued' ? creator.activeRunId : null;
+      const runId = resumedRunId ?? randomUUID();
       const claimed = await transaction.creatorSubscription.updateMany({
         where: {
           id: creator.id,
@@ -283,25 +319,36 @@ export class PrismaCreatorRepository implements CreatorRepository {
         },
       });
       if (claimed.count !== 1) return { state: 'active' };
-      if (creator.activeRunId) {
+      if (resumedRunId === null && creator.activeRunId) {
         await transaction.creatorRun.updateMany({
           where: { id: creator.activeRunId, status: { in: ['queued', 'running'] } },
           data: { status: 'failed', finishedAt: startedAt, error: { code: 'CREATOR_RUN_LEASE_EXPIRED' } },
         });
       }
-      await transaction.creatorRun.create({
-        data: {
-          id: runId,
-          userId: input.userId,
-          creatorId: creator.id,
-          trigger: input.trigger,
-          status: 'running',
-          startedAt,
-        },
-      });
+      let runStartedAt = startedAt;
+      if (resumedRunId) {
+        const run = await transaction.creatorRun.update({
+          where: { id: resumedRunId },
+          data: { status: 'running', finishedAt: null, error: Prisma.DbNull },
+          select: { startedAt: true },
+        });
+        runStartedAt = run.startedAt;
+      } else {
+        await transaction.creatorRun.create({
+          data: {
+            id: runId,
+            userId: input.userId,
+            creatorId: creator.id,
+            trigger: input.trigger,
+            status: 'running',
+            startedAt,
+          },
+        });
+      }
       return {
         state: 'claimed',
         runId,
+        startedAt: runStartedAt,
         creator: {
           id: creator.id,
           userId: creator.userId,
@@ -464,7 +511,10 @@ export class PrismaCreatorRepository implements CreatorRepository {
     await this.prisma.$transaction(async (transaction) => {
       const ownership = await transaction.creatorSubscription.updateMany({
         where: { id: input.creatorId, userId: input.userId, activeRunId: input.runId, cancelledAt: null },
-        data: { activeRunId: null, runLeaseUntil: null },
+        data: {
+          activeRunId: input.status === 'queued' ? input.runId : null,
+          runLeaseUntil: input.status === 'queued' ? input.finishedAt : null,
+        },
       });
       if (ownership.count !== 1) return;
       await transaction.creatorRun.update({
@@ -490,6 +540,7 @@ export function createCreatorDiscoveryService(
   timeoutMs: number,
   twitterApiKey?: string,
   interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>,
+  stageManager?: RunStageManager,
 ): CreatorDiscoveryService {
   return new CreatorDiscoveryService({
     repository: new PrismaCreatorRepository(prisma),
@@ -498,5 +549,6 @@ export function createCreatorDiscoveryService(
     timeoutMs,
     twitterApiKey,
     ...(interestTagger ? { interestTagger } : {}),
+    ...(stageManager ? { stageManager } : {}),
   });
 }

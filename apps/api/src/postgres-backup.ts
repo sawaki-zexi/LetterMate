@@ -17,6 +17,11 @@ import { z } from 'zod';
 const dayMs = 24 * 60 * 60 * 1_000;
 const dumpNamePattern = /^lettermate-(\d{8}T\d{6}Z)\.dump$/;
 const databaseNamePattern = /^[a-z][a-z0-9_]{0,62}$/;
+const backupDatabaseNameSchema = z.string().trim().min(1).max(63)
+  .refine((value) => (
+    !/[\\/]/u.test(value)
+    && [...value].every((character) => character.charCodeAt(0) >= 32)
+  ), 'Backup database name is invalid');
 
 export const backupRetentionPolicy = {
   dailyDays: 14,
@@ -27,7 +32,7 @@ export const backupRetentionPolicy = {
 const backupManifestSchema = z.strictObject({
   schemaVersion: z.literal(1),
   createdAt: z.iso.datetime(),
-  database: z.literal('lettermate'),
+  database: backupDatabaseNameSchema,
   format: z.literal('postgres-custom'),
   fileName: z.string().regex(dumpNamePattern),
   bytes: z.number().int().positive(),
@@ -43,13 +48,24 @@ interface BackupRecord {
 }
 
 interface DockerOptions {
-  composePath: string;
+  composePath?: string;
   service?: string;
   user?: string;
+  runner?: PostgresCommandRunner;
+}
+
+type ResolvedDockerOptions = Omit<DockerOptions, 'composePath' | 'runner'> & {
+  composePath: string;
+};
+
+export interface PostgresCommandRunner {
+  writeToFile(command: string[], outputPath: string, operation: string): Promise<void>;
+  execute(command: string[], operation: string, inputPath?: string): Promise<string>;
 }
 
 export interface CreateBackupOptions extends DockerOptions {
   backupDirectory: string;
+  database?: string;
   now?: Date;
   prune?: boolean;
 }
@@ -111,7 +127,7 @@ const commandFailure = (operation: string, exitCode: number | null): Error => (
 );
 
 async function dockerToFile(
-  docker: DockerOptions,
+  docker: ResolvedDockerOptions,
   command: string[],
   outputPath: string,
   operation: string,
@@ -133,7 +149,7 @@ async function dockerToFile(
 }
 
 async function dockerCommand(
-  docker: DockerOptions,
+  docker: ResolvedDockerOptions,
   command: string[],
   operation: string,
   inputPath?: string,
@@ -155,6 +171,116 @@ async function dockerCommand(
   if (exitCode !== 0) throw commandFailure(operation, exitCode);
   return output.trim();
 }
+
+export function createDockerPostgresCommandRunner(
+  docker: ResolvedDockerOptions,
+): PostgresCommandRunner {
+  return {
+    writeToFile: (command, outputPath, operation) => (
+      dockerToFile(docker, command, outputPath, operation)
+    ),
+    execute: (command, operation, inputPath) => (
+      dockerCommand(docker, command, operation, inputPath)
+    ),
+  };
+}
+
+export function postgresEnvironmentFromUrl(connectionString: string): Record<string, string> {
+  const url = new URL(connectionString);
+  if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+    throw new Error('DATABASE_URL must use the postgres or postgresql protocol');
+  }
+  const database = decodeURIComponent(url.pathname.replace(/^\//, ''));
+  if (!url.hostname || !url.username || !database || database.includes('/')) {
+    throw new Error('DATABASE_URL is missing PostgreSQL connection fields');
+  }
+  const environment: Record<string, string> = {
+    PGHOST: url.hostname,
+    PGPORT: url.port || '5432',
+    PGUSER: decodeURIComponent(url.username),
+    PGDATABASE: database,
+  };
+  if (url.password) environment.PGPASSWORD = decodeURIComponent(url.password);
+  const sslMode = url.searchParams.get('sslmode');
+  if (sslMode) environment.PGSSLMODE = sslMode;
+  return environment;
+}
+
+const inheritedProcessEnvironmentKeys = [
+  'PATH', 'Path', 'PATHEXT', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'HOME', 'LANG', 'LC_ALL',
+] as const;
+
+export function postgresProcessEnvironment(
+  connectionString: string,
+  baseEnvironment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const key of inheritedProcessEnvironmentKeys) {
+    const value = baseEnvironment[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  return { ...environment, ...postgresEnvironmentFromUrl(connectionString) };
+}
+
+const directChild = (
+  command: string[],
+  environment: NodeJS.ProcessEnv,
+) => {
+  const [executable, ...args] = command;
+  if (!executable) throw new Error('PostgreSQL command is empty');
+  return spawn(executable, args, {
+    env: environment,
+    stdio: 'pipe',
+  });
+};
+
+export function createDirectPostgresCommandRunner(
+  connectionString: string,
+  baseEnvironment: NodeJS.ProcessEnv = process.env,
+): PostgresCommandRunner {
+  const environment = postgresProcessEnvironment(connectionString, baseEnvironment);
+  return {
+    async writeToFile(command, outputPath, operation) {
+      const child = directChild(command, environment);
+      child.stdin.end();
+      const stderr = collectStream(child.stderr);
+      const exit = new Promise<number | null>((resolveExit, reject) => {
+        child.once('error', reject);
+        child.once('close', resolveExit);
+      });
+      await Promise.all([
+        pipeline(child.stdout, createWriteStream(outputPath, { flags: 'wx' })),
+        stderr,
+        exit.then((code) => { if (code !== 0) throw commandFailure(operation, code); }),
+      ]);
+    },
+    async execute(command, operation, inputPath) {
+      const child = directChild(command, environment);
+      const stdout = collectStream(child.stdout);
+      const stderr = collectStream(child.stderr);
+      const exit = new Promise<number | null>((resolveExit, reject) => {
+        child.once('error', reject);
+        child.once('close', resolveExit);
+      });
+      const input = inputPath
+        ? pipeline(createReadStream(inputPath), child.stdin)
+        : Promise.resolve(child.stdin.end());
+      const [output, , exitCode] = await Promise.all([stdout, stderr, exit, input]);
+      if (exitCode !== 0) throw commandFailure(operation, exitCode);
+      return output.trim();
+    },
+  };
+}
+
+const commandRunner = (options: DockerOptions): PostgresCommandRunner => {
+  if (options.runner) return options.runner;
+  if (!options.composePath) throw new Error('Docker Compose path is required');
+  return createDockerPostgresCommandRunner({
+    composePath: options.composePath,
+    ...(options.service ? { service: options.service } : {}),
+    ...(options.user ? { user: options.user } : {}),
+  });
+};
 
 export async function verifyBackup(dumpPath: string): Promise<BackupManifest> {
   const absoluteDump = resolve(dumpPath);
@@ -252,6 +378,7 @@ export async function pruneBackups(backupDirectory: string, now = new Date()): P
 
 export async function createPostgresBackup(options: CreateBackupOptions): Promise<BackupRecord> {
   const now = options.now ?? new Date();
+  const database = backupDatabaseNameSchema.parse(options.database ?? 'lettermate');
   const directory = resolve(options.backupDirectory);
   await mkdir(directory, { recursive: true });
   const fileName = createBackupFileName(now);
@@ -262,8 +389,8 @@ export async function createPostgresBackup(options: CreateBackupOptions): Promis
   await rm(partialDump, { force: true });
   await rm(partialManifest, { force: true });
   try {
-    await dockerToFile(options, [
-      'pg_dump', '-U', options.user ?? 'lettermate', '-d', 'lettermate',
+    await commandRunner(options).writeToFile([
+      'pg_dump', '-U', options.user ?? 'lettermate', '-d', database,
       '--format=custom', '--no-owner', '--no-privileges',
     ], partialDump, 'PostgreSQL backup');
     const details = await stat(partialDump);
@@ -271,7 +398,7 @@ export async function createPostgresBackup(options: CreateBackupOptions): Promis
     const manifest = backupManifestSchema.parse({
       schemaVersion: 1,
       createdAt: now.toISOString(),
-      database: 'lettermate',
+      database,
       format: 'postgres-custom',
       fileName,
       bytes: details.size,
@@ -312,18 +439,19 @@ export async function restorePostgresBackupForVerification(
   const user = options.user ?? 'lettermate';
   let created = false;
   let succeeded = false;
+  const runner = commandRunner(options);
   try {
-    await dockerCommand(options, ['createdb', '-U', user, targetDatabase], 'Create restore database');
+    await runner.execute(['createdb', '-U', user, targetDatabase], 'Create restore database');
     created = true;
-    await dockerCommand(options, [
+    await runner.execute([
       'pg_restore', '-U', user, '-d', targetDatabase,
       '--no-owner', '--no-privileges', '--exit-on-error',
     ], 'Restore PostgreSQL backup', resolve(options.dumpPath));
-    const tableCount = parseCount(await dockerCommand(options, [
+    const tableCount = parseCount(await runner.execute([
       'psql', '-U', user, '-d', targetDatabase, '-At', '-c',
       "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public';",
     ], 'Count restored tables'), 'Table count');
-    const migrationCount = parseCount(await dockerCommand(options, [
+    const migrationCount = parseCount(await runner.execute([
       'psql', '-U', user, '-d', targetDatabase, '-At', '-c',
       'SELECT COUNT(*) FROM "_prisma_migrations" WHERE finished_at IS NOT NULL;',
     ], 'Count restored migrations'), 'Migration count');
@@ -334,7 +462,7 @@ export async function restorePostgresBackupForVerification(
     return { targetDatabase, tableCount, migrationCount, kept: options.keepDatabase === true };
   } finally {
     if (created && (!succeeded || options.keepDatabase !== true)) {
-      await dockerCommand(options, ['dropdb', '-U', user, targetDatabase], 'Remove restore database')
+      await runner.execute(['dropdb', '-U', user, targetDatabase], 'Remove restore database')
         .catch(() => undefined);
     }
   }

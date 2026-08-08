@@ -1,0 +1,15 @@
+.git
+.worktrees
+.scratch
+node_modules
+dist
+dist-types
+coverage
+playwright-report
+test-results
+.backups
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo

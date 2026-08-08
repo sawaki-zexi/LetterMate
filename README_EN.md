@@ -192,6 +192,38 @@ npm run dev -w @lettermate/worker
 
 Open [http://localhost:5173](http://localhost:5173). The API listens on `http://localhost:3000` by default. Topic and trend jobs remain queued if the Worker is not running.
 
+### Production container baseline
+
+The root `Dockerfile` provides `api`, `worker`, and `web` build targets. `infra/compose.production.example.yaml` also includes PostgreSQL, password-protected Redis, and a one-shot Prisma migration service. Before using it, configure strong random `SESSION_SECRET`, `CSRF_SECRET`, `POSTGRES_PASSWORD`, and `REDIS_PASSWORD` values in `.env`, disable the development identity, and use Compose service names in the connection URLs:
+
+```env
+NODE_ENV=production
+ALLOW_DEV_IDENTITY=false
+WEB_ORIGIN=https://discovery.example.com
+DATABASE_URL=postgresql://lettermate:<url-encoded-password>@postgres:5432/lettermate
+REDIS_URL=redis://:<url-encoded-password>@redis:6379
+```
+
+Validate the configuration and images before starting the stack:
+
+```powershell
+docker compose -f infra/compose.production.example.yaml config
+docker compose -f infra/compose.production.example.yaml build
+docker compose -f infra/compose.production.example.yaml up -d
+```
+
+The example Web container listens on port 8080 and only serves static files and proxies `/api`; it does not terminate TLS. Put an HTTPS reverse proxy in front of it and make `WEB_ORIGIN` exactly match the browser origin. Production session cookies are Secure and therefore do not work over direct HTTP.
+
+Production backups and restore drills use the `operations` profile and do not require a Docker socket. The backup output reports the path inside the backup volume; pass that path as `BACKUP_PATH` for an isolated restore:
+
+```powershell
+docker compose -f infra/compose.production.example.yaml --profile operations run --rm backup
+$env:BACKUP_PATH='/backups/lettermate-YYYYMMDDTHHMMSSZ.dump'
+docker compose -f infra/compose.production.example.yaml --profile operations run --rm restore-drill
+```
+
+Schedule the one-shot `backup` service daily with the target environment's cron, systemd timer, or CronJob. After success, copy both the `.dump` and `.manifest.json` files to encrypted off-site storage. The application repository does not hold that storage encryption key.
+
 ## Configuration
 
 See [`.env.example`](./.env.example) for the complete definition and non-sensitive defaults.
@@ -199,6 +231,7 @@ See [`.env.example`](./.env.example) for the complete definition and non-sensiti
 | Group | Variables | Purpose |
 | --- | --- | --- |
 | Infrastructure | `DATABASE_URL`, `REDIS_URL`, `WEB_ORIGIN` | PostgreSQL, Redis, and Web origin |
+| Observability | `METRICS_PORT` | Internal Worker health and Prometheus metrics port; defaults to 9464 |
 | Authentication | `SESSION_SECRET`, `CSRF_SECRET`, `ALLOW_DEV_IDENTITY` | Session HMAC, CSRF, and the development identity switch; production must disable it |
 | AI | `AI_API_KEY`, `AI_MODEL`, `AI_WEB_SEARCH`, `AI_TIMEOUT_MS` | OpenRouter search, assessment, and composition |
 | Optional sources | `TWITTERAPI_IO_API_KEY`, `GITHUB_TOKEN`, `YOUTUBE_API_KEY` | X, GitHub, and YouTube |
@@ -225,6 +258,9 @@ All business endpoints are under `/api/v1`:
 | `POST` | `/auth/login` | Throttled login and Session Cookie issuance |
 | `POST` | `/auth/logout` | Validate CSRF, revoke the session, and clear cookies |
 | `GET` | `/auth/session` | Read the current user and CSRF token |
+| `GET` | `/health` | Liveness probe without dependency checks |
+| `GET` | `/health/ready` | Dependency readiness probe; returns HTTP 503 when degraded |
+| `GET` | `/metrics` | Internal Prometheus API metrics outside `/api/v1`; not proxied by production Web |
 | `POST` | `/topics` | Create an exact-keyword Topic and enqueue its initial run |
 | `GET` | `/topics` | Read Topics, schedules, and latest run summaries |
 | `POST` | `/topics/:id/refresh` | Register a manual Topic refresh |
@@ -234,7 +270,7 @@ All business endpoints are under `/api/v1`:
 | `GET` | `/items/:id` | Read Topic or trend item details |
 | `GET` | `/discovery-sources` | Read redacted connector availability |
 
-The Feed supports `range=1d|3d|7d|30d|90d|all`, `origin=all|topic|trend`, `kind=hot|quality`, and optional `topicId`. `topicId` cannot be combined with `origin=trend`.
+The Feed supports `range=1d|3d|7d|30d|90d|all`, `origin=all|topic|trend|creator`, `kind=hot|quality`, and optional `topicId`. `topicId` cannot be combined with `origin=trend|creator`.
 
 ## Development and Verification
 
@@ -245,13 +281,20 @@ The Feed supports `range=1d|3d|7d|30d|90d|all`, `origin=all|topic|trend`, `kind=
 | `npm run lint` | Run ESLint with zero warnings |
 | `npm run typecheck` | Check TypeScript project references |
 | `npm test` | Run Vitest unit and integration tests |
+| `npm run evaluate:quality` | Run the offline Agent golden-fixture quality gate |
+| `npm run ops:doctor` | Run redacted configuration and source checks without external access |
+| `npm run ops:doctor -- live` | Also probe PostgreSQL and Redis |
 | `npm run build` | Build Web, API, and Worker |
 | `npm run test:e2e` | Run Playwright desktop, tablet, and mobile flows |
 | `npm run db:migrate` | Create a local Prisma development migration |
 | `npm run db:deploy` | Apply committed migrations |
 | `npm run db:backup` | Create a PostgreSQL custom-format backup and SHA-256 manifest, then apply retention |
+| `npm run db:backup:direct` | Create a backup with local PostgreSQL tools and `DATABASE_URL` |
 | `npm run db:backup:verify -- <backup-path>` | Verify the backup size, SHA-256 digest, and manifest |
 | `npm run db:restore:verify -- <backup-path>` | Restore into a temporary isolated database and verify tables and migrations |
+| `npm run db:restore:verify:direct -- <backup-path>` | Run isolated restore verification through `DATABASE_URL` |
+
+The offline evaluation checks expected hits, forbidden hits, HTTP(S) source coverage, Chinese content coverage, and duplicate rate. A failed case exits with a non-zero status. Topic and Trend workers also emit redacted `agent.stage.completed` events for planning, retrieval, quality-gate, and persistence latency. See [Agent quality evaluation](./docs/agent-quality-evaluation.md).
 
 Default tests do not access external services. Live smoke tests require an explicit flag and matching key:
 
@@ -261,6 +304,10 @@ npm test -- apps/worker/src/openrouter.live.test.ts
 
 $env:RUN_LIVE_TWITTERAPI_IO_TESTS='1'
 npm test -- apps/worker/src/twitterapi-io.live.test.ts
+
+$env:RUN_LIVE_BILIBILI_TESTS='1'
+$env:BILIBILI_LIVE_MID='target creator mid'
+npm test -- apps/worker/src/bilibili-creator.live.test.ts
 
 $env:RUN_LIVE_EMAIL_TESTS='1'
 npm test -- apps/worker/src/smtp-email.live.test.ts
@@ -275,12 +322,15 @@ Database backups default to `.backups/postgres`. Retention keeps every backup fo
 Implemented:
 
 - Persisted Topic and trend discovery pipelines.
-- RSS/Atom, X, and Bilibili video creator subscriptions.
+- RSS/Atom, X, and Bilibili creator subscriptions; Bilibili includes public videos, dynamics, articles, and reposts with original-post context.
 - Interest memory, personalized ranking, adjacent-interest exploration, and explicit feedback.
 - Daily digest preview, scheduling, retry recovery, and optional production SMTP delivery.
 - 14 main discovery connectors and 6 trend inputs.
 - Scheduling, lease recovery, idempotent refresh, and run summaries.
 - Unified API `x-trace-id`, redacted structured request logs, Worker queue snapshots, and safe job/connector failure events.
+- Low-cardinality Prometheus metrics at API `/metrics` and Worker `:9464/metrics` for requests, queues, jobs, and Agent stages.
+- API liveness/readiness checks, dependency-failure 503 responses, graceful SIGINT/SIGTERM shutdown, and API/Worker/Web container targets with one-shot migrations.
+- Redacted `ops:doctor` configuration/dependency diagnostics and a key-rotation, quota, alerting, and recovery runbook.
 - PostgreSQL custom-format backups, SHA-256 manifests, 14-day/8-week/12-month retention, and isolated restore verification.
 - Unified Feed, time/origin filters, calendar grouping, and responsive UI.
 - Offline default automation and credential-gated live smoke-test entry points.
@@ -290,9 +340,11 @@ Required before production use:
 - Configure `SESSION_SECRET`, `CSRF_SECRET`, and `ALLOW_DEV_IDENTITY=false`; real login, server-side sessions, and CSRF protection are implemented.
 - Validate external connectors, quotas, rate limits, and failure recovery in the target environment.
 - Connect structured logs and queue snapshots to target-environment aggregation and alerts.
+- Complete the TLS ingress, secret store, capacity baseline, and deployment drill in the target environment.
 - Schedule database backups, maintain encrypted off-site copies, run periodic restore drills, and establish deployment, production-restore approval, key rotation, and security response procedures.
 
 See [Product Requirements](./docs/requirements.md) and [Technical Design](./docs/design.md) for detailed scope and decisions.
+See the [Operations Runbook](./docs/operations-runbook.md) for production checks, alerts, and recovery procedures.
 
 ## Contributing
 

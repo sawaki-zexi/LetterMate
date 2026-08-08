@@ -82,6 +82,35 @@ const item: DiscoveryCandidate = {
 };
 
 describe('creator discovery service', () => {
+  it('anchors a resumed run search window to the original run start', async () => {
+    const repo = repository();
+    vi.mocked(repo.claimRun).mockResolvedValue({
+      state: 'claimed',
+      runId: 'run-1',
+      startedAt: new Date('2026-08-05T08:00:00.000Z'),
+      creator: {
+        id: 'creator-1', userId: 'user-1', platform: 'rss',
+        accountKey: 'https://example.com/feed.xml', displayName: 'Example Author',
+        profileUrl: 'https://example.com/', feedUrl: 'https://example.com/feed.xml',
+      },
+    });
+    const search = vi.fn().mockResolvedValue({ candidates: [], requestCount: 1 });
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn().mockResolvedValue([]) },
+      archiveLocalizer: archiveLocalizer(),
+      createConnector: () => ({ search }),
+      now: () => new Date(now),
+    });
+
+    await service.run(job);
+
+    expect(search).toHaveBeenCalledWith(expect.objectContaining({
+      windowStart: '2026-07-29T08:00:00.000Z',
+      windowEnd: '2026-08-05T08:00:00.000Z',
+    }), expect.any(AbortSignal));
+  });
+
   it('quality-filters RSS entries without requiring the creator name to match', async () => {
     const repo = repository();
     const qualityPipeline = { run: vi.fn().mockResolvedValue([item]) };
@@ -99,6 +128,7 @@ describe('creator discovery service', () => {
 
     expect(qualityPipeline.run).toHaveBeenCalledWith(expect.objectContaining({
       keyword: 'Example Author',
+      execution: { runId: 'run-1', runKind: 'creator', userId: 'user-1' },
       candidates: [expect.objectContaining({ canonicalUrl: sourceCandidate.url })],
     }));
     expect(qualityPipeline.run.mock.calls[0]?.[0]).not.toHaveProperty('matchPolicy');
@@ -179,6 +209,7 @@ describe('creator discovery service', () => {
 
     expect(localizer.localizeCreatorItems).toHaveBeenCalledWith(expect.objectContaining({
       creatorName: 'Example Author',
+      execution: { runId: 'run-1', runKind: 'creator', userId: 'user-1' },
       candidates: [expect.objectContaining({
         id: sourceCandidate.url,
         title: sourceCandidate.title,

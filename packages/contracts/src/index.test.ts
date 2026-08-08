@@ -3,6 +3,7 @@ import {
   authLoginInputSchema,
   authRegisterInputSchema,
   authSessionSchema,
+  agentRunStageSchema,
   creatorInputSchema,
   creatorIdentityCandidateSchema,
   creatorPlatformStatusSchema,
@@ -733,6 +734,17 @@ describe('AI discovery contracts', () => {
       attempt: 3,
       code: 'JOB_FAILED',
     })).toMatchObject({ event: 'queue.job.failed', runId: 'run-1' });
+    expect(operationalLogSchema.parse({
+      timestamp: '2026-08-08T08:00:00.000Z',
+      level: 'info',
+      service: 'worker',
+      event: 'agent.stage.completed',
+      component: 'topic',
+      runId: 'run-1',
+      stage: agentRunStageSchema.parse('quality_gate'),
+      durationMs: 25,
+      metrics: { inputCount: 10, outputCount: 2, failureCount: 1 },
+    })).toMatchObject({ stage: 'quality_gate', metrics: { outputCount: 2 } });
     expect(() => operationalLogSchema.parse({
       timestamp: '2026-08-08T08:00:00.000Z',
       level: 'info',

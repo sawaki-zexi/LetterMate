@@ -139,7 +139,10 @@ Copy-Item .env.example .env
 AI_API_KEY=your-openrouter-key
 ```
 
-默认模型为 `openrouter/auto`。真实密钥只能保存在未跟踪的本地 `.env` 中。
+默认模型为 `openrouter/auto`。可用 `AI_FAST_MODEL`、`AI_QUALITY_MODEL` 和
+`AI_LOCALIZATION_MODEL` 按任务选择模型；未配置时均回退到 `AI_MODEL`。Worker 会在每次
+AI 请求前按运行预留调用次数、输入/输出 token 和成本预算，并记录 OpenRouter 返回的实际
+模型、provider、token 与成本。真实密钥只能保存在未跟踪的本地 `.env` 中。
 
 可选网页搜索源：
 
@@ -194,6 +197,38 @@ npm run dev -w @lettermate/worker
 
 打开 [http://localhost:5173](http://localhost:5173)。API 默认监听 `http://localhost:3000`。如果未启动 Worker，Topic 与趋势任务会保持在队列中。
 
+### 生产容器基线
+
+根目录 `Dockerfile` 提供 `api`、`worker` 和 `web` 三个构建目标；`infra/compose.production.example.yaml` 还包含 PostgreSQL、带密码的 Redis 和一次性 Prisma 迁移任务。使用前必须在 `.env` 中配置强随机 `SESSION_SECRET`、`CSRF_SECRET`、`POSTGRES_PASSWORD`、`REDIS_PASSWORD`，关闭开发身份，并将连接 URL 的主机改为 Compose 服务名：
+
+```env
+NODE_ENV=production
+ALLOW_DEV_IDENTITY=false
+WEB_ORIGIN=https://discovery.example.com
+DATABASE_URL=postgresql://lettermate:<url-encoded-password>@postgres:5432/lettermate
+REDIS_URL=redis://:<url-encoded-password>@redis:6379
+```
+
+先校验配置和镜像，再启动：
+
+```powershell
+docker compose -f infra/compose.production.example.yaml config
+docker compose -f infra/compose.production.example.yaml build
+docker compose -f infra/compose.production.example.yaml up -d
+```
+
+示例 Web 容器监听 8080，只负责静态页面和 `/api` 反向代理，不终止 TLS。必须在其前方配置 HTTPS 反向代理，并使 `WEB_ORIGIN` 与浏览器实际 Origin 完全一致；生产 Session Cookie 为 Secure，直接使用 HTTP 无法完成登录。
+
+生产备份和恢复演练使用 `operations` profile，不需要 Docker Socket。备份输出会返回卷内文件路径；将该路径作为 `BACKUP_PATH` 执行隔离恢复：
+
+```powershell
+docker compose -f infra/compose.production.example.yaml --profile operations run --rm backup
+$env:BACKUP_PATH='/backups/lettermate-YYYYMMDDTHHMMSSZ.dump'
+docker compose -f infra/compose.production.example.yaml --profile operations run --rm restore-drill
+```
+
+由目标环境的 cron、systemd timer 或 CronJob 每日调用一次 `backup`，成功后将 `.dump` 和 `.manifest.json` 一并复制到加密外部存储。应用仓库不持有外部存储加密密钥。
+
 ## 配置
 
 完整定义和非敏感默认值见 [`.env.example`](./.env.example)。
@@ -201,8 +236,9 @@ npm run dev -w @lettermate/worker
 | 分组 | 变量 | 说明 |
 | --- | --- | --- |
 | 基础设施 | `DATABASE_URL`, `REDIS_URL`, `WEB_ORIGIN` | PostgreSQL、Redis 和 Web Origin |
+| 可观测性 | `METRICS_PORT` | Worker 内部健康与 Prometheus 指标端口；默认 9464 |
 | 认证与会话 | `SESSION_SECRET`, `CSRF_SECRET`, `ALLOW_DEV_IDENTITY` | Session Cookie、CSRF 和开发身份开关；生产必须关闭开发身份 |
-| AI | `AI_API_KEY`, `AI_MODEL`, `AI_WEB_SEARCH`, `AI_TIMEOUT_MS` | OpenRouter 搜索、评审与生成 |
+| AI | `AI_API_KEY`, `AI_MODEL`, `AI_*_MODEL`, `AI_FALLBACK_MODELS`, `AI_PROVIDER_*`, `AI_RUN_*`, `AI_WEB_SEARCH`, `AI_TIMEOUT_MS` | OpenRouter 任务路由、运行预算、用量审计与结构化生成 |
 | 可选来源 | `TWITTERAPI_IO_API_KEY`, `GITHUB_TOKEN`, `YOUTUBE_API_KEY` | X、GitHub 和 YouTube |
 | Reddit | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` | Reddit OAuth |
 | 通用搜索 | `SEARCH_PROVIDER`, `SEARCH_API_KEY`, `SEARCH_API_BASE_URL` | Brave-compatible Search |
@@ -228,6 +264,9 @@ npm run dev -w @lettermate/worker
 | `POST` | `/auth/login` | 登录并签发 Session Cookie |
 | `POST` | `/auth/logout` | 校验 CSRF、撤销会话并清除 Cookie |
 | `GET` | `/auth/session` | 读取当前登录用户和 CSRF Token |
+| `GET` | `/health` | 存活探针，不检查外部依赖 |
+| `GET` | `/health/ready` | 依赖就绪探针；异常时返回 HTTP 503 |
+| `GET` | `/metrics` | 内部 Prometheus API 指标；不属于 `/api/v1`，生产 Web 不代理 |
 | `POST` | `/topics` | 创建完整关键词 Topic 并入队首次运行 |
 | `GET` | `/topics` | 获取 Topic、调度和最新运行摘要 |
 | `PATCH` | `/topics/:id` | 修改主关键词和用户管理的扩展词，并入队新关键词发现 |
@@ -242,7 +281,7 @@ npm run dev -w @lettermate/worker
 | `GET` | `/digest-preview` | 预览下一封邮件候选 |
 | `GET` | `/digest-status` | 获取邮件能力、下一次本地发送时间和最近运行 |
 
-Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend`、`kind=hot|quality`、可选 `topicId` 和最长 100 字符的 `q`。`q` 只搜索当前用户已入库文章的标题、摘要和推荐理由，不触发外部发现；有关键词时按标题、摘要、推荐理由的加权相关性排序，再按文章时间和 ID 稳定排序。`topicId` 不能与 `origin=trend` 同时使用。
+Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend|creator`、`kind=hot|quality`、可选 `topicId` 和最长 100 字符的 `q`。`q` 只搜索当前用户已入库文章的标题、摘要和推荐理由，不触发外部发现；有关键词时按标题、摘要、推荐理由的加权相关性排序，再按文章时间和 ID 稳定排序。`topicId` 不能与 `origin=trend|creator` 同时使用。
 
 ## 开发与验证
 
@@ -253,14 +292,21 @@ Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend`、`kind=hot|
 | `npm run lint` | ESLint，禁止 warning |
 | `npm run typecheck` | TypeScript project references 检查 |
 | `npm test` | Vitest 单元与集成测试 |
+| `npm run evaluate:quality` | 运行离线 Agent golden fixtures 质量门槛 |
+| `npm run ops:doctor` | 脱敏检查配置和可用来源，不访问外部服务 |
+| `npm run ops:doctor -- live` | 额外探测 PostgreSQL 与 Redis |
 | `npm run build` | 构建 Web、API 与 Worker |
 | `npm run test:e2e` | Playwright 桌面、平板和移动端流程 |
 | `npm run db:migrate` | 创建本地 Prisma 开发迁移 |
 | `npm run db:deploy` | 应用已提交迁移 |
 | `npm run db:backup` | 创建 PostgreSQL custom-format 备份、SHA-256 清单并执行保留策略 |
+| `npm run db:backup:direct` | 使用本机 PostgreSQL 客户端和 `DATABASE_URL` 创建备份 |
 | `npm run db:backup:verify -- <backup-path>` | 校验备份文件大小、SHA-256 和清单 |
 | `npm run db:restore:verify -- <backup-path>` | 将备份恢复到临时隔离数据库并验证表与迁移记录 |
+| `npm run db:restore:verify:direct -- <backup-path>` | 通过 `DATABASE_URL` 执行隔离恢复验证 |
 | `npm run backfill:interest-tags -w @lettermate/worker` | 为近期合格内容回填版本化兴趣标签；需要 `AI_API_KEY` |
+
+离线评估检查预期命中、禁止命中、HTTP(S) 来源覆盖、中文内容覆盖和重复率；任一 case 未达到门槛时返回非零状态。Topic 与 Trend Worker 同时输出脱敏的 `agent.stage.completed` 阶段事件，便于定位规划、检索、质量门控和持久化耗时。详见 [Agent 质量评估](./docs/agent-quality-evaluation.md)。
 
 默认测试不访问外部服务。Live smoke test 需要显式开关和对应 Key：
 
@@ -270,6 +316,10 @@ npm test -- apps/worker/src/openrouter.live.test.ts
 
 $env:RUN_LIVE_TWITTERAPI_IO_TESTS='1'
 npm test -- apps/worker/src/twitterapi-io.live.test.ts
+
+$env:RUN_LIVE_BILIBILI_TESTS='1'
+$env:BILIBILI_LIVE_MID='目标 UP 主 mid'
+npm test -- apps/worker/src/bilibili-creator.live.test.ts
 
 $env:RUN_LIVE_EMAIL_TESTS='1'
 npm test -- apps/worker/src/smtp-email.live.test.ts
@@ -284,12 +334,15 @@ SMTP live smoke 还需要完整 SMTP 配置和 `SMTP_SMOKE_RECIPIENT`。普通 S
 已实现：
 
 - Topic 与趋势两条持久化发现管线。
-- RSS/Atom、X 与 Bilibili 公开视频博主关注。
+- RSS/Atom、X 与 Bilibili 博主关注；Bilibili 支持公开视频、公开动态、专栏和带原帖上下文的转发动态。
 - 可审计兴趣事件、版本化内容标签、短期/长期/负向画像和个性化 Feed 排序。
 - 相邻兴趣探索、每日邮件预览、调度、重试和可选生产 SMTP 投递。
 - 14 个主发现连接器和 6 个趋势输入。
 - 调度、租约恢复、幂等刷新和运行摘要。
 - API 统一 `x-trace-id`、脱敏结构化请求日志、Worker 队列快照与任务/连接器失败事件。
+- API `/metrics` 与 Worker `:9464/metrics` 的低基数 Prometheus 指标，覆盖请求、队列、任务和 Agent 阶段。
+- API 存活/就绪检查、依赖异常 503、SIGINT/SIGTERM 优雅退出，以及 API/Worker/Web 容器与一次性迁移 Compose 基线。
+- 脱敏 `ops:doctor` 配置/依赖诊断，以及密钥轮换、配额、告警与故障恢复手册。
 - PostgreSQL custom-format 备份、SHA-256 清单、14 日/8 周/12 月分层保留和隔离恢复验证。
 - 统一 Feed、已入库文章搜索、时间/来源筛选、日期分组和响应式界面。
 - 默认离线自动化测试与凭据型 live smoke test 入口。
@@ -299,9 +352,11 @@ SMTP live smoke 还需要完整 SMTP 配置和 `SMTP_SMOKE_RECIPIENT`。普通 S
 - 在生产环境配置 `SESSION_SECRET`、`CSRF_SECRET`，并设置 `ALLOW_DEV_IDENTITY=false`。真实登录、服务端会话和 CSRF 已实现；开发环境默认保留 `ALLOW_DEV_IDENTITY=true` 以兼容本地调试。
 - 在目标环境逐一验证外部连接器、配额、限流和故障恢复。
 - 将结构化日志和队列快照接入目标环境的指标聚合与告警。
+- 在目标环境完成 TLS 入口、秘密存储、容量基线和部署演练。
 - 为数据库备份配置定时任务、加密外部副本和周期恢复演练，并建立部署、主库恢复审批、密钥轮换和安全响应流程。
 
 详细范围与技术决策见 [产品需求](./docs/requirements.md) 和 [技术方案](./docs/design.md)。
+生产检查、告警和恢复步骤见 [运行手册](./docs/operations-runbook.md)。
 
 ## 贡献
 

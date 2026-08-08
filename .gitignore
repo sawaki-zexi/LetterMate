@@ -8,6 +8,8 @@ coverage/
 playwright-report/
 test-results/
 .backups/
+.scratch/
+*.log
 *.tsbuildinfo
 .env
 .env.*

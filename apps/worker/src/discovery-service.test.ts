@@ -62,7 +62,9 @@ function createPrisma(existingUrls: string[] = []) {
       }),
     },
     discoveryRun: {
-      create: vi.fn().mockResolvedValue({ id: 'run-1' }),
+      create: vi.fn().mockResolvedValue({
+        id: 'run-1', startedAt: new Date('2026-07-27T09:00:00.000Z'),
+      }),
       findUnique: vi.fn().mockResolvedValue({ keywordSnapshot: 'AI Agent' }),
       update: vi.fn().mockResolvedValue({ id: 'run-1' }),
       updateMany: vi.fn().mockResolvedValue({ count: 0 }),
@@ -112,7 +114,7 @@ describe('PrismaDiscoveryRepository', () => {
 
     expect(runId).toMatchObject({
       runId: 'run-1', keyword: 'AI Agent', keywordProfile: { kind: 'domain' },
-      expandedTerms: ['agent'], initialExpansion: false,
+      expandedTerms: ['agent'], initialExpansion: false, startedAt,
     });
     expect(transaction.discoveryRun.create).toHaveBeenCalledWith({
       data: {
@@ -125,7 +127,7 @@ describe('PrismaDiscoveryRepository', () => {
         status: 'running',
         startedAt,
       },
-      select: { id: true },
+      select: { id: true, startedAt: true },
     });
     expect(transaction.topic.updateMany).toHaveBeenCalledWith({
       where: {
@@ -472,7 +474,7 @@ const sourceCandidate = validateSourceCandidate({
   },
 });
 
-function createOrchestration(keyword = 'AI Agent') {
+function createOrchestration(keyword = 'AI Agent', followup?: ReturnType<typeof vi.fn>) {
   const repository = {
     findOwnedTopic: vi.fn().mockResolvedValue({
       id: 'topic-1',
@@ -543,6 +545,7 @@ function createOrchestration(keyword = 'AI Agent') {
   const now = vi.fn()
     .mockReturnValueOnce(new Date('2026-07-27T09:00:00.000Z'))
     .mockReturnValue(new Date('2026-07-27T10:00:00.000Z'));
+  const onStage = vi.fn();
   const service = new TopicDiscoveryService({
     gateway,
     registry,
@@ -551,8 +554,10 @@ function createOrchestration(keyword = 'AI Agent') {
     router,
     now,
     timeoutMs: 600_000,
+    ...(followup ? { evidenceGapRetriever: { retrieve: followup } } : {}),
+    onStage,
   });
-  return { service, repository, gateway, registry, qualityPipeline, router };
+  return { service, repository, gateway, registry, qualityPipeline, router, onStage };
 }
 
 describe('TopicDiscoveryService multi-source orchestration', () => {
@@ -569,7 +574,9 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
   });
 
   it('routes expanded queries through connectors and the quality pipeline', async () => {
-    const { service, repository, gateway, registry, qualityPipeline, router } = createOrchestration();
+    const {
+      service, repository, gateway, registry, qualityPipeline, router, onStage,
+    } = createOrchestration();
 
     await service.run('topic-1', 'user-1', 'scheduled');
 
@@ -580,6 +587,7 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     );
     expect(gateway.expandTopic).toHaveBeenCalledWith({
       keyword: 'AI Agent',
+      execution: { runId: 'run-1', runKind: 'topic', userId: 'user-1' },
       signal: expect.any(AbortSignal),
     });
     expect(router.route).toHaveBeenCalledWith({
@@ -589,8 +597,8 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
         terms: ['intelligent agent'],
         searchQueries: ['AI agent release', '智能体 发布'],
       },
-      windowStart: '2026-07-20T10:00:00.000Z',
-      windowEnd: '2026-07-27T10:00:00.000Z',
+      windowStart: '2026-07-20T09:00:00.000Z',
+      windowEnd: '2026-07-27T09:00:00.000Z',
     });
     expect(registry.search).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -604,21 +612,22 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
         sourceTypes: ['code'],
         connectorIds: ['github'],
         maxCandidates: 12,
-        windowStart: '2026-07-20T10:00:00.000Z',
-        windowEnd: '2026-07-27T10:00:00.000Z',
+        windowStart: '2026-07-20T09:00:00.000Z',
+        windowEnd: '2026-07-27T09:00:00.000Z',
       }),
       expect.any(AbortSignal),
     );
     expect(qualityPipeline.run).toHaveBeenCalledWith({
       keyword: 'AI Agent',
+      execution: { runId: 'run-1', runKind: 'topic', userId: 'user-1' },
       matchPolicy: {
         exactPhrase: 'ai agent',
         aliases: ['ai agent', 'aiagent'],
       },
       candidates: [sourceCandidate],
       historyUrls: ['https://example.com/old'],
-      windowStart: '2026-07-20T10:00:00.000Z',
-      windowEnd: '2026-07-27T10:00:00.000Z',
+      windowStart: '2026-07-20T09:00:00.000Z',
+      windowEnd: '2026-07-27T09:00:00.000Z',
       signal: expect.any(AbortSignal),
     });
     expect(repository.saveSuccess).toHaveBeenCalledWith(expect.objectContaining({
@@ -639,6 +648,47 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
       candidateCount: 1,
       acceptedCount: 1,
       schedule: expect.objectContaining({ scheduleIntervalHours: 12 }),
+    }));
+    expect(onStage.mock.calls.map(([stage]) => stage.stage)).toEqual([
+      'plan', 'retrieve', 'quality_gate', 'persist',
+    ]);
+    expect(onStage).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'run-1', stage: 'retrieve', inputCount: 2, outputCount: 1, failureCount: 1,
+    }));
+  });
+
+  it('passes follow-up evidence into quality and persistence', async () => {
+    const followupCandidate = validateSourceCandidate({
+      ...sourceCandidate,
+      connectorId: 'github',
+      externalId: 'v2',
+      url: 'https://github.com/example/agent/releases/tag/v2',
+      proof: { kind: 'api_record', connectorId: 'github', externalId: 'v2' },
+    });
+    const followup = vi.fn().mockResolvedValue({
+      candidates: [sourceCandidate, followupCandidate],
+      successfulConnectorIds: ['twitterapi-io', 'github'],
+      skippedConnectorIds: ['youtube'],
+      failures: [],
+    });
+    const { service, qualityPipeline, repository } = createOrchestration('AI Agent', followup);
+
+    await service.run('topic-1', 'user-1', 'scheduled');
+
+    expect(followup).toHaveBeenCalledWith(expect.objectContaining({
+      execution: { runId: 'run-1', runKind: 'topic', userId: 'user-1' },
+      initial: expect.objectContaining({ candidates: [sourceCandidate] }),
+      signal: expect.any(AbortSignal),
+    }));
+    expect(qualityPipeline.run).toHaveBeenCalledWith(expect.objectContaining({
+      candidates: [sourceCandidate, followupCandidate],
+    }));
+    expect(repository.saveSuccess).toHaveBeenCalledWith(expect.objectContaining({
+      candidateCount: 2,
+      connectorSummary: {
+        successfulConnectorIds: ['twitterapi-io', 'github'],
+        skippedConnectorIds: ['youtube'], failures: [],
+      },
     }));
   });
 
@@ -789,6 +839,25 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     expect(router.route).toHaveBeenCalledWith(expect.objectContaining({
       keyword: 'AI Agent',
       expanded: { terms: [], searchQueries: [] },
+    }));
+  });
+
+  it('anchors a resumed run search window to the original run start', async () => {
+    const { service, repository, router } = createOrchestration();
+    repository.beginRun.mockResolvedValue({
+      runId: 'run-1',
+      startedAt: new Date('2026-07-27T09:00:00.000Z'),
+      keyword: 'AI Agent',
+      keywordProfile: { kind: 'domain' },
+      expandedTerms: [],
+      initialExpansion: false,
+    });
+
+    await service.run('topic-1', 'user-1', 'scheduled');
+
+    expect(router.route).toHaveBeenCalledWith(expect.objectContaining({
+      windowStart: '2026-07-20T09:00:00.000Z',
+      windowEnd: '2026-07-27T09:00:00.000Z',
     }));
   });
 

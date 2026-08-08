@@ -19,6 +19,46 @@ enum RunStatus {
   failed
 }
 
+enum AiRunKind {
+  topic
+  trend
+  creator
+}
+
+enum AiTask {
+  topic_expansion
+  trend_classification
+  evidence_gap_detection
+  candidate_assessment
+  item_composition
+  item_chinese_repair
+  creator_localization
+  interest_tagging
+}
+
+enum AiUsageStatus {
+  reserved
+  succeeded
+  failed
+}
+
+enum RunStageName {
+  plan
+  retrieve
+  enrich
+  assess
+  followup
+  compose
+  quality_gate
+  persist
+}
+
+enum RunStageStatus {
+  running
+  succeeded
+  failed
+}
+
 enum DiscoveryTrigger {
   initial
   manual
@@ -126,6 +166,96 @@ model User {
   forgottenInterestTags ForgottenInterestTag[]
   digestPreference DigestPreference?
   digestRuns DigestRun[]
+  aiRunBudgets AiRunBudget[]
+  aiUsages AiUsage[]
+  runStages RunStage[]
+}
+
+model RunStage {
+  id            String         @id @default(uuid())
+  runKind       AiRunKind
+  runId         String
+  userId        String
+  stage         RunStageName
+  status        RunStageStatus @default(running)
+  attempt       Int            @default(1)
+  inputDigest   String
+  policyVersion String         @default("")
+  routeVersion  String         @default("")
+  startedAt     DateTime
+  finishedAt    DateTime?
+  errorCode     String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  artifact      RunArtifact?
+
+  @@unique([userId, runKind, runId, stage, inputDigest, policyVersion, routeVersion])
+  @@index([userId, createdAt])
+  @@index([runKind, runId, stage, status])
+}
+
+model RunArtifact {
+  id         String   @id @default(uuid())
+  stageId    String   @unique
+  data       Json
+  byteLength Int
+  createdAt  DateTime @default(now())
+  stage      RunStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+}
+
+model AiRunBudget {
+  runKind              AiRunKind
+  runId                String
+  userId               String
+  policyVersion        String
+  budgetVersion        String
+  maxCalls             Int
+  maxInputTokens       Int
+  maxOutputTokens      Int
+  maxCostMicros        Int
+  reservedCalls        Int      @default(0)
+  reservedInputTokens  Int      @default(0)
+  reservedOutputTokens Int      @default(0)
+  reservedCostMicros   Int      @default(0)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  usages               AiUsage[]
+
+  @@id([runKind, runId])
+  @@index([userId, createdAt])
+}
+
+model AiUsage {
+  id                   String        @id @default(uuid())
+  runKind              AiRunKind
+  runId                String
+  userId               String
+  task                 AiTask
+  status               AiUsageStatus @default(reserved)
+  routeVersion         String
+  requestedModel       String
+  actualModel          String?
+  provider             String?
+  estimatedInputTokens Int
+  reservedOutputTokens Int
+  reservedCostMicros   Int
+  inputTokens          Int?
+  outputTokens         Int?
+  reasoningTokens      Int?
+  cachedTokens         Int?
+  costMicros           Int?
+  errorCode            String?
+  startedAt            DateTime
+  finishedAt           DateTime?
+  createdAt            DateTime      @default(now())
+  user                 User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  budget               AiRunBudget   @relation(fields: [runKind, runId], references: [runKind, runId], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([runKind, runId, createdAt])
+  @@index([status, createdAt])
 }
 
 model Session {
