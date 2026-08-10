@@ -10,6 +10,7 @@ import {
 } from 'bullmq';
 import { AiGatewayError } from './ai-gateway.js';
 import type { TopicDiscoveryService } from './discovery-service.js';
+import { toWorkerFailure } from './retry-policy.js';
 
 export const backoffStrategy: BackoffStrategy = (attemptsMade, _type, error) => {
   if (error instanceof AiGatewayError && error.retryAfterMs !== undefined) {
@@ -24,12 +25,16 @@ export function createDiscoveryJobHandler(
   return async (job: Job<DiscoveryJobData>): Promise<void> => {
     const attempts = job.opts.attempts ?? 1;
     const finalAttempt = job.attemptsMade + 1 >= attempts;
-    await service.run(
-      job.data.topicId,
-      job.data.userId,
-      job.data.trigger,
-      { finalAttempt },
-    );
+    try {
+      await service.run(
+        job.data.topicId,
+        job.data.userId,
+        job.data.trigger,
+        { finalAttempt },
+      );
+    } catch (error) {
+      throw toWorkerFailure(error);
+    }
   };
 }
 

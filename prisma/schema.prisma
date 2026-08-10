@@ -16,6 +16,7 @@ enum RunStatus {
   queued
   running
   succeeded
+  degraded
   failed
 }
 
@@ -23,6 +24,7 @@ enum AiRunKind {
   topic
   trend
   creator
+  digest
 }
 
 enum AiTask {
@@ -34,6 +36,7 @@ enum AiTask {
   item_chinese_repair
   creator_localization
   interest_tagging
+  digest_brief
 }
 
 enum AiUsageStatus {
@@ -92,6 +95,8 @@ enum CreatorPlatform {
   rss
   x
   bilibili
+  youtube
+  bluesky
 }
 
 enum CreatorContentType {
@@ -162,6 +167,7 @@ model User {
   interestProfiles UserInterestProfile[]
   interestProfileVersions InterestProfileVersion[]
   recommendationDecisions RecommendationDecision[]
+  feedImpressions FeedImpression[]
   interestMemorySettings InterestMemorySettings?
   forgottenInterestTags ForgottenInterestTag[]
   digestPreference DigestPreference?
@@ -454,6 +460,7 @@ model CreatorSubscription {
   activeRunId     String?
   runLeaseUntil   DateTime?
   lastError       Json?
+  degradedSources Json?
   user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   runs            CreatorRun[]
   items           CreatorItem[]
@@ -475,6 +482,7 @@ model CreatorRun {
   acceptedCount   Int                 @default(0)
   newItemCount    Int                 @default(0)
   error           Json?
+  degradedSources Json?
   user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   creator         CreatorSubscription @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
@@ -644,10 +652,28 @@ model RecommendationDecision {
   user             User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
   profile          InterestProfileVersion    @relation(fields: [userId, profileVersion], references: [userId, version], onDelete: Cascade)
   items            RecommendationDecisionItem[]
+  impressions      FeedImpression[]
 
   @@unique([userId, surface, requestKey])
   @@index([userId, createdAt])
   @@index([userId, profileVersion])
+}
+
+model FeedImpression {
+  id         String                @id @default(uuid())
+  userId     String
+  decisionId String
+  contentKey String
+  position   Int
+  surface    RecommendationSurface @default(feed)
+  bucketStart DateTime
+  shownAt    DateTime              @default(now())
+  user       User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  decision   RecommendationDecision @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, decisionId, contentKey, bucketStart])
+  @@index([userId, surface, shownAt])
+  @@index([contentKey, shownAt])
 }
 
 model RecommendationDecisionItem {
@@ -706,6 +732,9 @@ model DigestRun {
   error              Json?
   runLeaseUntil      DateTime?
   attemptCount       Int             @default(0)
+  briefGenerationStatus    String    @default("fallback")
+  briefGenerationVersion   String    @default("digest-brief-fallback-v1")
+  briefGenerationErrorCode String?
   user               User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   items              DigestItem[]
 
@@ -715,14 +744,20 @@ model DigestRun {
 }
 
 model DigestItem {
-  runId      String
-  contentKey String
-  position   Int
-  title      String
-  summary    String
-  reason     String
-  sourceUrl  String
-  run        DigestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  runId        String
+  contentKey   String
+  position     Int
+  title        String
+  summary      String
+  reason       String
+  sourceUrl    String
+  citationUrls String[] @default([])
+  platform     String   @default("Web")
+  publishedAt  DateTime?
+  evidence     String   @default("")
+  uncertainty  String   @default("")
+  followUp     String   @default("")
+  run           DigestRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 
   @@id([runId, contentKey])
   @@unique([runId, position])

@@ -7,7 +7,7 @@ export const digestQueueName = 'daily-digest';
 export const maxTopicExpandedTerms = 32;
 
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
-export const runStatusSchema = z.enum(['queued', 'running', 'succeeded', 'failed']);
+export const runStatusSchema = z.enum(['queued', 'running', 'succeeded', 'degraded', 'failed']);
 export const sourceTypeSchema = z.enum([
   'web',
   'feed',
@@ -38,7 +38,7 @@ export const provenanceKindSchema = z.enum([
   'fetched_page',
 ]);
 
-export const creatorPlatformSchema = z.enum(['rss', 'x', 'bilibili']);
+export const creatorPlatformSchema = z.enum(['rss', 'x', 'bilibili', 'youtube', 'bluesky']);
 export const creatorContentTypeSchema = z.enum(['original', 'repost', 'reply']);
 export const creatorLegacyInputSchema = z.strictObject({
   url: httpUrlSchema,
@@ -133,6 +133,12 @@ export const safeErrorSchema = z.object({
   message: z.string().min(1),
 });
 
+export const creatorDegradedSourceSchema = z.strictObject({
+  source: z.string().trim().regex(/^[a-z0-9][a-z0-9_-]{0,79}$/),
+  code: z.string().trim().regex(/^[A-Z0-9][A-Z0-9_-]{0,79}$/),
+  retryable: z.boolean(),
+});
+
 const runSummaryBaseShape = {
   id: z.string().min(1),
   trigger: discoveryTriggerSchema,
@@ -155,6 +161,12 @@ export const runSummarySchema = z.discriminatedUnion('status', [
   z.strictObject({
     ...runSummaryBaseShape,
     status: z.literal('succeeded'),
+    finishedAt: z.iso.datetime(),
+    newItemCount: z.number().int().nonnegative(),
+  }),
+  z.strictObject({
+    ...runSummaryBaseShape,
+    status: z.literal('degraded'),
     finishedAt: z.iso.datetime(),
     newItemCount: z.number().int().nonnegative(),
   }),
@@ -269,6 +281,7 @@ export const feedRecommendationSchema = z.strictObject({
   lane: recommendationLaneSchema,
   reason: recommendationReasonSchema,
   isExploration: z.boolean(),
+  decisionId: z.string().trim().min(1).max(200).optional(),
 });
 
 const feedMergeFields = {
@@ -285,6 +298,24 @@ export const feedbackInputSchema = z.strictObject({
 export const contentFeedbackSchema = z.strictObject({
   contentKey: httpUrlSchema,
   value: feedbackValueSchema.nullable(),
+});
+
+export const feedImpressionInputSchema = z.strictObject({
+  decisionId: z.string().trim().min(1).max(200),
+  contentKeys: z.array(httpUrlSchema).min(1).max(100),
+}).superRefine((input, context) => {
+  const keys = input.contentKeys.map((key) => key.toLowerCase());
+  if (new Set(keys).size !== keys.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['contentKeys'],
+      message: '曝光内容不能重复',
+    });
+  }
+});
+
+export const feedImpressionReceiptSchema = z.strictObject({
+  recorded: z.number().int().nonnegative(),
 });
 
 export const topicInterestEventPayloadSchema = z.strictObject({
@@ -391,6 +422,20 @@ export const digestPreferenceInputSchema = z.strictObject({
 
 export const digestPreferenceSchema = digestPreferenceInputSchema;
 
+export const digestBriefSchema = z.strictObject({
+  conclusion: z.string().trim().min(1),
+  evidence: z.string().trim().min(1),
+  uncertainty: z.string().trim().min(1),
+  followUp: z.string().trim().min(1),
+});
+
+export const digestCitationSchema = z.strictObject({
+  contentKey: httpUrlSchema,
+  url: httpUrlSchema,
+  platform: z.string().trim().min(1).max(200),
+  publishedAt: z.iso.datetime().nullable(),
+});
+
 export const digestPreviewItemSchema = z.strictObject({
   contentKey: httpUrlSchema,
   title: z.string().trim().min(1),
@@ -398,6 +443,9 @@ export const digestPreviewItemSchema = z.strictObject({
   reason: z.string().trim().min(1),
   sourceUrl: httpUrlSchema,
   publishedAt: z.iso.datetime().nullable(),
+  platform: z.string().trim().min(1).max(200),
+  brief: digestBriefSchema,
+  citations: z.array(digestCitationSchema).min(1).max(20),
 });
 
 export const digestPreviewSchema = z.strictObject({
@@ -525,6 +573,7 @@ export const creatorSchema = z.object({
   nextRunAt: z.iso.datetime().nullable(),
   runStatus: runStatusSchema,
   lastError: safeErrorSchema.nullable(),
+  degradedSources: z.array(creatorDegradedSourceSchema).max(16).default([]),
   lastRun: runSummarySchema.nullable(),
 });
 
@@ -593,11 +642,13 @@ export type DiscoveryCandidate = z.infer<typeof discoveryCandidateSchema>;
 export type DiscoveryResult = z.infer<typeof discoveryResultSchema>;
 export type DiscoveryItem = z.infer<typeof discoveryItemSchema>;
 export type Creator = z.infer<typeof creatorSchema>;
+export type CreatorDegradedSource = z.infer<typeof creatorDegradedSourceSchema>;
 export type CreatorInput = z.infer<typeof creatorInputSchema>;
 export type CreatorConfirmationInput = z.infer<typeof creatorConfirmationInputSchema>;
 export type CreatorIdentityCandidate = z.infer<typeof creatorIdentityCandidateSchema>;
 export type CreatorLegacyInput = z.infer<typeof creatorLegacyInputSchema>;
 export type CreatorPlatformStatus = z.infer<typeof creatorPlatformStatusSchema>;
+export type CreatorPlatform = z.infer<typeof creatorPlatformSchema>;
 export type CreatorResolutionInput = z.infer<typeof creatorResolutionInputSchema>;
 export type CreatorResolutionResult = z.infer<typeof creatorResolutionResultSchema>;
 export type CreatorUpdateInput = z.infer<typeof creatorUpdateInputSchema>;
@@ -610,6 +661,8 @@ export type DiscoverySourceStatus = z.infer<typeof discoverySourceStatusSchema>;
 export type DiscoveryTrigger = z.infer<typeof discoveryTriggerSchema>;
 export type FeedItem = z.infer<typeof feedItemSchema>;
 export type FeedbackInput = z.infer<typeof feedbackInputSchema>;
+export type FeedImpressionInput = z.infer<typeof feedImpressionInputSchema>;
+export type FeedImpressionReceipt = z.infer<typeof feedImpressionReceiptSchema>;
 export type FeedbackValue = z.infer<typeof feedbackValueSchema>;
 export type ContentFeedback = z.infer<typeof contentFeedbackSchema>;
 export type InterestEvent = z.infer<typeof interestEventSchema>;
@@ -623,6 +676,8 @@ export type InterestMemoryTheme = z.infer<typeof interestMemoryThemeSchema>;
 export type InterestMemorySettingsInput = z.infer<typeof interestMemorySettingsInputSchema>;
 export type DigestPreference = z.infer<typeof digestPreferenceSchema>;
 export type DigestPreferenceInput = z.infer<typeof digestPreferenceInputSchema>;
+export type DigestBrief = z.infer<typeof digestBriefSchema>;
+export type DigestCitation = z.infer<typeof digestCitationSchema>;
 export type DigestPreview = z.infer<typeof digestPreviewSchema>;
 export type DigestPreviewItem = z.infer<typeof digestPreviewItemSchema>;
 export type DigestJobData = z.infer<typeof digestJobDataSchema>;

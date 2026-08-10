@@ -26,9 +26,10 @@ describe('digest email gateway', () => {
     expect(gateway.messages).toHaveLength(1);
     expect(gateway.messages[0]).toMatchObject({
       to: 'student@example.com',
-      subject: 'LetterMate 每日重点 | 2026-08-08',
+      subject: 'LetterMate 每日研究简报 | 2026-08-08',
     });
-    expect(gateway.messages[0]?.text).toContain('原文：https://example.com/model-update');
+    expect(gateway.messages[0]?.text).toContain('引用：https://example.com/model-update');
+    expect(gateway.messages[0]?.text).toContain('不确定性：');
     expect(gateway.messages[0]?.html).toContain('GPT model update &lt;official&gt;');
   });
 

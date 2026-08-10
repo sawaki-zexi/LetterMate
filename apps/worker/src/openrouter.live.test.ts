@@ -15,7 +15,7 @@ const apiKey = process.env.AI_API_KEY;
 const enabled = process.env.RUN_LIVE_AI_TESTS === '1' && Boolean(apiKey);
 
 describe.skipIf(!enabled)('OpenRouter live discovery', () => {
-  it('expands a topic and returns citation-backed web candidates', async () => {
+  it('expands a topic into a bounded query plan', async () => {
     const model = process.env.AI_MODEL ?? 'openrouter/auto';
     const gateway = new OpenRouterAiGateway({
       apiKey: apiKey!,
@@ -24,13 +24,20 @@ describe.skipIf(!enabled)('OpenRouter live discovery', () => {
       timeoutMs: 120_000,
     });
     const expanded = await gateway.expandTopic({ keyword: '人工智能' });
+
+    expect(expanded.terms.length).toBeGreaterThan(0);
+    expect(expanded.searchQueries.length).toBeGreaterThan(0);
+  }, 180_000);
+
+  it('returns citation-backed web candidates for a fixed query plan', async () => {
+    const model = process.env.AI_MODEL ?? 'openrouter/auto';
     const windowEnd = new Date();
     const windowStart = new Date(windowEnd.getTime() - 30 * 24 * 60 * 60 * 1_000);
     const plan: SourceQueryPlan = {
       keyword: '人工智能',
       matchPolicy: buildKeywordPolicy('人工智能'),
-      expandedTerms: expanded.terms,
-      queries: expanded.searchQueries.slice(0, 3),
+      expandedTerms: ['AI', '人工智能'],
+      queries: ['人工智能 官方 更新'],
       sourceTypes: ['web'],
       windowStart: windowStart.toISOString(),
       windowEnd: windowEnd.toISOString(),
@@ -45,8 +52,6 @@ describe.skipIf(!enabled)('OpenRouter live discovery', () => {
     const result = await connector.search(plan, new AbortController().signal);
     const valid = result.candidates.map(validateSourceCandidate);
 
-    expect(expanded.terms.length).toBeGreaterThan(0);
-    expect(expanded.searchQueries.length).toBeGreaterThan(0);
     expect(valid.length).toBeGreaterThan(0);
     expect(valid.every((candidate) => candidate.proof.kind === 'ai_citation')).toBe(true);
     expect(valid.every((candidate) => candidate.proof.connectorId === connector.id)).toBe(true);

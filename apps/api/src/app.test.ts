@@ -103,7 +103,6 @@ describe('AI discovery API', () => {
   ];
 
   beforeEach(async () => {
-    store = new MemoryTopicStore();
     queue = new RecordingQueue();
     trendQueue = new RecordingTrendQueue();
     creatorQueue = new RecordingCreatorQueue();
@@ -124,6 +123,13 @@ describe('AI discovery API', () => {
       }],
       creatorContent: [], settings: {}, forgottenTagIds: {},
     };
+    store = new MemoryTopicStore(
+      () => new Date('2026-07-27T12:00:00.000Z'),
+      new MemoryPersonalizationMemory(
+        () => personalizationFacts,
+        () => new Date('2026-07-27T12:00:00.000Z'),
+      ),
+    );
     const rssResolver: CreatorIdentityResolver = {
       platform: 'rss',
       label: 'RSS/Atom',
@@ -994,6 +1000,39 @@ describe('AI discovery API', () => {
     await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
       .send({ value: 'like' }).expect(400)
       .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+  });
+
+  it('records only owned Feed decision impressions and deduplicates the minute bucket', async () => {
+    const own = store.seedRadarItem('user-a', 'quality');
+    const other = store.seedRadarItem('user-b', 'quality');
+    const feed = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    const decisionId = feed.body.find((item: { contentKey: string }) => (
+      item.contentKey === own.contentKey
+    )).recommendation.decisionId;
+
+    await request(app.getHttpServer())
+      .post('/api/v1/impressions')
+      .set('x-user-id', 'user-a')
+      .send({ decisionId, contentKeys: [own.contentKey] })
+      .expect(202, { recorded: 1 });
+    await request(app.getHttpServer())
+      .post('/api/v1/impressions')
+      .set('x-user-id', 'user-a')
+      .send({ decisionId, contentKeys: [own.contentKey] })
+      .expect(202, { recorded: 0 });
+    await request(app.getHttpServer())
+      .post('/api/v1/impressions')
+      .set('x-user-id', 'user-a')
+      .send({ decisionId, contentKeys: [other.contentKey] })
+      .expect(404);
+    await request(app.getHttpServer())
+      .post('/api/v1/impressions')
+      .set('x-user-id', 'user-a')
+      .send({ decisionId: 'unknown-decision', contentKeys: [own.contentKey] })
+      .expect(404);
   });
 
   it('returns safe trend status and registers only one repeated manual refresh', async () => {

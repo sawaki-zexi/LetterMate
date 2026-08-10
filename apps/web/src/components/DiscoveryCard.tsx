@@ -21,6 +21,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { useEffect, useRef } from 'react';
 import { discoveryKindLabels } from '../discovery-display.js';
 
 const sourceTypeMeta: Record<SourceType, { label: string; icon: LucideIcon }> = {
@@ -56,13 +57,32 @@ export function DiscoveryCard({
   headingLevel = 2,
   feedbackPending = false,
   onFeedback,
+  onImpression,
 }: {
   item: FeedItem;
   detailHref?: string;
   headingLevel?: 2 | 3;
   feedbackPending?: boolean;
   onFeedback?: (value: FeedbackValue | null) => void;
+  onImpression?: () => void;
 }) {
+  const cardRef = useRef<HTMLElement | null>(null);
+  const impressionSent = useRef(false);
+
+  useEffect(() => {
+    if (!onImpression || impressionSent.current || typeof IntersectionObserver === 'undefined') return;
+    const node = cardRef.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry?.isIntersecting || entry.intersectionRatio < 0.5) return;
+      impressionSent.current = true;
+      onImpression();
+      observer.disconnect();
+    }, { threshold: [0.5] });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [onImpression]);
+
   const Heading = `h${headingLevel}` as const;
   const ClassificationIcon = item.kind === 'hot' ? Flame : Sparkles;
   const classification = discoveryKindLabels[item.kind];
@@ -76,7 +96,7 @@ export function DiscoveryCard({
     .filter(Boolean)
     .join(' · ');
   return (
-    <article className="discovery-card">
+    <article className="discovery-card" ref={cardRef}>
       <div className="discovery-card__topline">
         <span className={`classification classification--${item.kind}`}>
           <ClassificationIcon size={15} />{classification}

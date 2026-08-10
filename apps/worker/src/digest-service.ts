@@ -1,18 +1,25 @@
+import { randomUUID } from 'node:crypto';
 import type { DigestJobData, FeedItem } from '@lettermate/contracts';
 import {
+  INTEREST_ADJACENCY_VERSION,
   INTEREST_EXTRACTOR_VERSION,
+  applyExplorationEligibility,
   canonicalizeUrl,
   mergeFeedItems,
   rankShadowSlate,
   type CandidateInterestTag,
   type InterestProfileEntry,
+  type InterestTagAdjacency,
 } from '@lettermate/domain';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { EmailGateway } from './digest-email.js';
 import { EmailGatewayError, renderDigestEmail } from './digest-email.js';
+import { DigestBriefGenerator } from './digest-brief-generator.js';
 
 const MAX_DIGEST_ITEMS = 10;
 const DEFAULT_WINDOW_START = new Date(0);
+const DIGEST_UNCERTAINTY = '邮件摘要仅基于已验证的原始来源，不替代对完整原文的独立核验。';
+const DIGEST_FOLLOW_UP = '打开原文核验关键细节，并继续关注后续更新或独立来源。';
 
 export interface DigestSnapshot {
   contentKey: string;
@@ -21,6 +28,12 @@ export interface DigestSnapshot {
   summary: string;
   reason: string;
   sourceUrl: string;
+  citationUrls: string[];
+  platform: string;
+  publishedAt: Date | null;
+  evidence: string;
+  uncertainty: string;
+  followUp: string;
 }
 
 export interface DigestCandidateTag extends CandidateInterestTag {
@@ -39,6 +52,8 @@ export function selectDigestSnapshots(input: {
   candidates: readonly FeedItem[];
   profiles: readonly InterestProfileEntry[];
   tags: readonly DigestCandidateTag[];
+  adjacencies: readonly InterestTagAdjacency[];
+  forgottenTagIds: readonly string[];
   deliveredContentKeys: ReadonlySet<string>;
   asOf: Date;
 }): DigestSnapshot[] {
@@ -56,19 +71,26 @@ export function selectDigestSnapshots(input: {
     values.push({ tagId: tag.tagId, confidence: tag.confidence });
     tagsByContent.set(tag.contentKey, values);
   }
-  const ranked = rankShadowSlate({
+  const digestCandidates = applyExplorationEligibility({
     candidates: candidates.map((item) => ({
       item,
       tags: tagsByContent.get(item.contentKey) ?? [],
-      explorationEligible: false,
     })),
+    profile: input.profiles,
+    adjacencies: input.adjacencies,
+    forgottenTagIds: input.forgottenTagIds,
+    surface: 'feed',
+  }).filter((candidate) => !candidate.explorationEligible);
+  const ranked = rankShadowSlate({
+    candidates: digestCandidates,
     profile: input.profiles,
     asOf: input.asOf,
   });
   const candidateByKey = new Map(candidates.map((item) => [item.contentKey, item]));
   return ranked.slice(0, MAX_DIGEST_ITEMS).flatMap((entry, position) => {
     const item = candidateByKey.get(entry.contentKey);
-    const sourceUrl = item?.sourceUrls.find(isHttpUrl);
+    const citationUrls = [...new Set(item?.sourceUrls.filter(isHttpUrl) ?? [])];
+    const sourceUrl = citationUrls[0];
     return item && sourceUrl ? [{
       contentKey: item.contentKey,
       position,
@@ -76,6 +98,12 @@ export function selectDigestSnapshots(input: {
       summary: item.summary,
       reason: item.reason,
       sourceUrl,
+      citationUrls,
+      platform: item.platform,
+      publishedAt: item.publishedAt ? new Date(item.publishedAt) : null,
+      evidence: item.reason,
+      uncertainty: DIGEST_UNCERTAINTY,
+      followUp: DIGEST_FOLLOW_UP,
     }] : [];
   });
 }
@@ -207,17 +235,34 @@ async function loadDigestSnapshots(
     select: { contentKey: true, tagId: true, confidence: true },
   });
   const forgottenIds = new Set(forgotten.map((entry) => entry.tagId));
+  const activeProfiles = settings?.personalizationEnabled === false ? [] : profiles
+    .filter((profile) => !forgottenIds.has(profile.tagId));
+  const profileTagIds = [...new Set(activeProfiles.map((profile) => profile.tagId))];
+  const candidateTagIds = [...new Set(tagRows.map((tag) => tag.tagId))];
+  const adjacencyRows = profileTagIds.length === 0 || candidateTagIds.length === 0
+    ? []
+    : await transaction.interestTagAdjacency.findMany({
+        where: {
+          relationVersion: INTEREST_ADJACENCY_VERSION,
+          OR: [
+            { leftTagId: { in: profileTagIds }, rightTagId: { in: candidateTagIds } },
+            { rightTagId: { in: profileTagIds }, leftTagId: { in: candidateTagIds } },
+          ],
+        },
+        select: { leftTagId: true, rightTagId: true },
+      });
   return selectDigestSnapshots({
     candidates,
     deliveredContentKeys: new Set(deliveredRows.map((row) => row.contentKey)),
-    profiles: settings?.personalizationEnabled === false ? [] : profiles
-      .filter((profile) => !forgottenIds.has(profile.tagId))
+    profiles: activeProfiles
       .map((profile) => ({
         ...profile,
         evidenceUpdatedAt: profile.evidenceUpdatedAt.toISOString(),
         sourceKinds: profile.sourceKinds as InterestProfileEntry['sourceKinds'],
       })),
     tags: tagRows,
+    adjacencies: adjacencyRows,
+    forgottenTagIds: [...forgottenIds],
     asOf: windowEnd,
   });
 }
@@ -244,8 +289,53 @@ export interface DigestScheduleRepository {
   }): Promise<PreparedDigestRun | null>;
 }
 
+const reusableDigestRun = (
+  existing: { id: string; status: string; runLeaseUntil: Date | null },
+  userId: string,
+  now: Date,
+): PreparedDigestRun | null => {
+  if (existing.status === 'queued' || (
+    existing.status === 'running'
+    && existing.runLeaseUntil !== null
+    && existing.runLeaseUntil <= now
+  )) {
+    return { runId: existing.id, userId, status: 'queued' };
+  }
+  return null;
+};
+
+const canonicalHttpUrl = (value: string): string | null => {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol)
+      ? canonicalizeUrl(value)
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const removeDeliveredSnapshots = (
+  snapshots: readonly DigestSnapshot[],
+  deliveredRows: readonly { contentKey: string; sourceUrl: string; citationUrls: string[] }[],
+): DigestSnapshot[] => {
+  const delivered = new Set(deliveredRows.flatMap((row) => (
+    [row.contentKey, row.sourceUrl, ...row.citationUrls]
+      .map(canonicalHttpUrl)
+      .filter((value): value is string => value !== null)
+  )));
+  return snapshots.filter((snapshot) => ![
+    snapshot.contentKey, snapshot.sourceUrl, ...snapshot.citationUrls,
+  ].some((url) => {
+    const key = canonicalHttpUrl(url);
+    return key !== null && delivered.has(key);
+  })).map((snapshot, position) => ({ ...snapshot, position }));
+};
+
 export class PrismaDigestScheduleRepository implements DigestScheduleRepository {
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly briefGenerator: Pick<DigestBriefGenerator, 'generate'> = new DigestBriefGenerator(),
+  ) {}
 
   async listEnabledPreferences(): Promise<DigestSchedulePreference[]> {
     const rows = await this.prisma.digestPreference.findMany({
@@ -269,7 +359,7 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
     windowEnd: Date;
     now: Date;
   }): Promise<PreparedDigestRun | null> {
-    return this.prisma.$transaction(async (transaction) => {
+    const preparation = await this.prisma.$transaction(async (transaction) => {
       const lockKey = `digest:${input.userId}:${input.scheduledLocalDate}`;
       await transaction.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
       const existing = await transaction.digestRun.findUnique({
@@ -282,14 +372,7 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
         select: { id: true, status: true, runLeaseUntil: true },
       });
       if (existing) {
-        if (existing.status === 'queued' || (
-          existing.status === 'running'
-          && existing.runLeaseUntil !== null
-          && existing.runLeaseUntil <= input.now
-        )) {
-          return { runId: existing.id, userId: input.userId, status: 'queued' };
-        }
-        return null;
+        return { kind: 'existing' as const, run: reusableDigestRun(existing, input.userId, input.now) };
       }
       const boundary = await transaction.digestRun.findFirst({
         where: { userId: input.userId, status: { in: ['succeeded', 'skipped'] } },
@@ -303,15 +386,54 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
         windowStart,
         input.windowEnd,
       );
+      return { kind: 'new' as const, snapshots };
+    });
+    if (preparation.kind === 'existing') return preparation.run;
+
+    const runId = randomUUID();
+    const generated = await this.briefGenerator.generate({
+      runId,
+      userId: input.userId,
+      snapshots: preparation.snapshots,
+    });
+    return this.prisma.$transaction(async (transaction) => {
+      const lockKey = `digest:${input.userId}:${input.scheduledLocalDate}`;
+      await transaction.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      const existing = await transaction.digestRun.findUnique({
+        where: {
+          userId_scheduledLocalDate: {
+            userId: input.userId,
+            scheduledLocalDate: input.scheduledLocalDate,
+          },
+        },
+        select: { id: true, status: true, runLeaseUntil: true },
+      });
+      if (existing) return reusableDigestRun(existing, input.userId, input.now);
+      const [boundary, deliveredRows] = await Promise.all([
+        transaction.digestRun.findFirst({
+          where: { userId: input.userId, status: { in: ['succeeded', 'skipped'] } },
+          select: { windowEnd: true },
+          orderBy: [{ windowEnd: 'desc' }, { id: 'desc' }],
+        }),
+        transaction.digestItem.findMany({
+          where: { run: { userId: input.userId, status: 'succeeded' } },
+          select: { contentKey: true, sourceUrl: true, citationUrls: true },
+        }),
+      ]);
+      const snapshots = removeDeliveredSnapshots(generated.items, deliveredRows);
       const skipped = snapshots.length === 0;
       const run = await transaction.digestRun.create({
         data: {
+          id: runId,
           userId: input.userId,
           scheduledLocalDate: input.scheduledLocalDate,
-          windowStart,
+          windowStart: boundary?.windowEnd ?? DEFAULT_WINDOW_START,
           windowEnd: input.windowEnd,
           status: skipped ? 'skipped' : 'queued',
           finishedAt: skipped ? input.now : null,
+          briefGenerationStatus: generated.status,
+          briefGenerationVersion: generated.version,
+          briefGenerationErrorCode: generated.errorCode,
           ...(snapshots.length === 0 ? {} : { items: { create: snapshots } }),
         },
         select: { id: true },

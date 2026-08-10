@@ -112,6 +112,8 @@ describe('daily digest snapshot selection', () => {
       candidates,
       profiles: [],
       tags: [],
+      adjacencies: [],
+      forgottenTagIds: [],
       deliveredContentKeys: new Set([`${candidates[11]!.contentKey}?utm_source=digest`]),
       asOf: new Date('2026-08-08T12:00:00.000Z'),
     });
@@ -126,6 +128,50 @@ describe('daily digest snapshot selection', () => {
       summary: '已经持久化的中文摘要 0',
       reason: '推荐理由 0',
       sourceUrl: 'https://example.com/0',
+      citationUrls: ['https://example.com/0'],
+      platform: 'Example',
+      publishedAt: null,
+      evidence: '推荐理由 0',
+      uncertainty: '邮件摘要仅基于已验证的原始来源，不替代对完整原文的独立核验。',
+      followUp: '打开原文核验关键细节，并继续关注后续更新或独立来源。',
     });
+  });
+
+  it('deduplicates origins, ranks direct interests, and excludes adjacent exploration', () => {
+    const followed = candidate(0, 'topic');
+    const duplicateTrend = {
+      ...candidate(1),
+      id: 'trend-duplicate',
+      contentKey: followed.contentKey,
+      sourceUrls: followed.sourceUrls,
+      externalId: followed.externalId,
+    } as FeedItem;
+    const directInterest = candidate(2);
+    const adjacentExploration = candidate(3);
+    const ordinaryTrend = candidate(4);
+    const snapshots = selectDigestSnapshots({
+      candidates: [ordinaryTrend, adjacentExploration, duplicateTrend, directInterest, followed],
+      profiles: [{
+        tagId: 'tag-core', shortScore: 5, longScore: 3, negativeScore: 0,
+        evidenceUpdatedAt: '2026-08-08T08:00:00.000Z', sourceKinds: ['interested'],
+      }],
+      tags: [
+        { contentKey: directInterest.contentKey, tagId: 'tag-core', confidence: 0.95 },
+        { contentKey: adjacentExploration.contentKey, tagId: 'tag-edge', confidence: 0.95 },
+        { contentKey: followed.contentKey, tagId: 'tag-edge', confidence: 0.95 },
+      ],
+      adjacencies: [{ leftTagId: 'tag-core', rightTagId: 'tag-edge' }],
+      forgottenTagIds: [],
+      deliveredContentKeys: new Set(),
+      asOf: new Date('2026-08-08T12:00:00.000Z'),
+    });
+
+    expect(snapshots.filter((item) => item.contentKey === followed.contentKey)).toHaveLength(1);
+    expect(snapshots.some((item) => item.contentKey === adjacentExploration.contentKey)).toBe(false);
+    expect(snapshots.map((item) => item.contentKey)).toEqual([
+      followed.contentKey,
+      directInterest.contentKey,
+      ordinaryTrend.contentKey,
+    ]);
   });
 });

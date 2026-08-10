@@ -7,7 +7,10 @@
     "dev": "tsx watch src/main.ts",
     "build": "tsc -b tsconfig.json",
     "start": "node dist/main.js",
-    "backfill:interest-tags": "tsx src/interest-tag-backfill.ts"
+    "backfill:interest-tags": "tsx src/interest-tag-backfill.ts",
+    "evaluate:source-quality": "tsx src/source-quality-evaluation.ts",
+    "evaluate:interest-effects": "tsx src/interest-effect-evaluation.ts",
+    "evaluate:semantic-recall": "tsx src/semantic-recall-evaluation.ts"
   },
   "dependencies": {
     "@lettermate/config": "*",

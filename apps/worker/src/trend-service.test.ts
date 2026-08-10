@@ -7,6 +7,7 @@ import {
   TrendOrchestrationError,
   type TrendRepository,
 } from './trend-service.js';
+import { AiGatewayError } from './ai-gateway.js';
 
 const now = new Date('2026-07-28T12:00:00.000Z');
 const scheduledJob = {
@@ -148,6 +149,20 @@ describe('TrendDiscoveryService', () => {
       error: { code: 'ALL_TREND_SOURCES_FAILED', message: 'All configured trend sources failed' },
     }));
     expect(JSON.stringify(vi.mocked(repo.completeFailure).mock.calls)).not.toContain('do not persist');
+  });
+
+  it('makes an explicit non-retryable failure terminal on the first attempt', async () => {
+    const repo = repository();
+    const failure = new AiGatewayError('AI_AUTH_FAILED', 'Authentication failed', false);
+    const { service } = makeService({
+      repository: repo,
+      classify: vi.fn().mockRejectedValue(failure),
+    });
+
+    await expect(service.run(scheduledJob, { finalAttempt: false })).rejects.toBe(failure);
+    expect(repo.completeFailure).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+    }));
   });
 
   it('deduplicates recent seeds, classifies in bounded batches, and persists sanitized decisions', async () => {

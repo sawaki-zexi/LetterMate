@@ -1,6 +1,6 @@
 # LetterMate 运行手册
 
-**更新日期：** 2026-08-09
+**更新日期：** 2026-08-10
 
 ## 1. 边界
 
@@ -30,7 +30,7 @@ docker compose -f infra/compose.production.example.yaml run --rm api node --impo
 
 1. 使用秘密存储提供 `SESSION_SECRET`、`CSRF_SECRET`、数据库、Redis、AI、连接器和 SMTP 凭据；不要写入镜像或仓库。
 2. 设置 `NODE_ENV=production`、`ALLOW_DEV_IDENTITY=false`，并使用 HTTPS `WEB_ORIGIN`。生产配置不满足这三项时必须启动失败。
-3. 运行 `docker compose -f infra/compose.production.example.yaml config`，确认没有暴露 PostgreSQL/Redis 端口。
+3. 运行 `docker compose -f infra/compose.production.example.yaml --profile monitoring config --quiet`，确认 Compose 有效且没有暴露 PostgreSQL/Redis 端口。
 4. 创建并校验数据库备份，再运行 `npm run db:deploy` 或一次性 `migrate` 服务。禁止自动执行迁移回滚。
 5. 运行配置模式和 live 模式 `ops:doctor`；数据库与 Redis 必须为 `ok`。
 6. 启动 API/Worker/Web，确认 `/api/v1/health` 为 200，`/api/v1/health/ready` 为 200。
@@ -47,14 +47,54 @@ $env:BACKUP_PATH='/backups/lettermate-YYYYMMDDTHHMMSSZ.dump'
 docker compose -f infra/compose.production.example.yaml --profile operations run --rm restore-drill
 ```
 
-- 每日调度 `backup` 一次，并监控非零退出码。
+- 每日由目标平台调度 `backup` 一次，并监控非零退出码；`backup` 与 `restore-drill` 都是一次性任务，容器内不实现睡眠循环。
 - `.dump` 与同名 `.manifest.json` 必须作为一组复制到加密外部存储；复制后再次执行清单校验。
 - 至少每月运行一次 `restore-drill`。默认自动删除隔离数据库，不得将目标改为主库或系统库。
 - 外部存储凭据和加密密钥只存在于目标环境秘密存储，不写入 Compose、镜像、日志或仓库。
 
-## 3. 告警基线
+## 3. 指标采集与告警
 
-目标环境从结构化 JSON 日志聚合以下规则；阈值是单实例初始值，完成容量测试后再调整：
+本地开发时，API 和 Worker 继续运行在宿主机，可通过独立 profile 启动持久化指标采集：
+
+```powershell
+docker compose -f infra/compose.yaml --profile monitoring up -d prometheus
+```
+
+本地配置通过 `host.docker.internal` 抓取 `3000` 和 `9464` 端口，指标保留 15 天，Prometheus 默认只绑定 `127.0.0.1:9090`。启动前必须先运行 API 和 Worker；该 profile 不改变默认的 PostgreSQL、Redis 或应用启动方式。
+
+采集满 24 小时后运行来源漏斗评估：
+
+```powershell
+npm run evaluate:source-quality -- http://127.0.0.1:9090 24
+```
+
+报告通过 Worker `up` 的分钟 range 判断窗口是否完整，再按来源汇总成功/失败、候选获取、拒绝原因和最终精选贡献。`insufficient_data` 表示观察覆盖不足、Worker 可用率不足或窗口内没有来源尝试；`review_required` 表示至少一个来源命中重复失败、成功但零候选、低精选率或单来源占比规则。评估只读取固定 connector ID、来源类型和有限结果标签，不查询用户、关键词、URL 或运行 ID。
+
+仓库提供可选 `monitoring` profile，使用固定版本 Prometheus 加载仓库内的抓取与告警规则：
+
+```powershell
+docker compose -f infra/compose.production.example.yaml --profile monitoring config --quiet
+docker compose -f infra/compose.production.example.yaml --profile monitoring up -d prometheus
+```
+
+默认只在 `127.0.0.1:9090` 暴露 Prometheus。启动后检查 `http://127.0.0.1:9090/targets` 和 `http://127.0.0.1:9090/alerts`。不要通过设置 `PROMETHEUS_BIND_ADDRESS=0.0.0.0` 直接公开管理界面；远程访问应由目标环境通过 VPN、端口转发或带认证的 HTTPS 入口提供。
+
+使用镜像内的官方 `promtool` 校验配置和规则：
+
+```powershell
+docker run --rm --entrypoint /bin/promtool `
+  -v "${PWD}\infra\monitoring\prometheus.yml:/etc/prometheus/prometheus.yml:ro" `
+  -v "${PWD}\infra\monitoring\alerts.yml:/etc/prometheus/alerts.yml:ro" `
+  prom/prometheus:v3.5.0 check config /etc/prometheus/prometheus.yml
+
+docker run --rm --entrypoint /bin/promtool `
+  -v "${PWD}\infra\monitoring\alerts.yml:/etc/prometheus/alerts.yml:ro" `
+  prom/prometheus:v3.5.0 check rules /etc/prometheus/alerts.yml
+```
+
+Compose 示例不内置 Alertmanager，也不保存邮件、即时通信或值班系统凭据。目标环境必须把 Prometheus 告警接入自己的 Alertmanager 或托管通知渠道，并为通知失败配置独立监控。
+
+阈值是单实例初始值，完成容量测试后再调整。Prometheus 负责指标规则；结构化 JSON 日志仍由目标环境聚合，用于 trace/run 级诊断和日志告警：
 
 Prometheus 采集目标：
 
@@ -64,11 +104,15 @@ Prometheus 采集目标：
 主要指标：
 
 - `lettermate_api_http_requests_total`
+- `lettermate_api_feed_impression_batches_total`
+- `lettermate_api_feed_impressions_total`
 - `lettermate_api_http_request_duration_seconds`
 - `lettermate_worker_queue_jobs`
 - `lettermate_worker_job_events_total`
 - `lettermate_worker_agent_stage_duration_seconds`
 - `lettermate_worker_agent_stage_items_total`
+- `lettermate_worker_source_attempts_total`
+- `lettermate_worker_source_items_total`
 
 | 严重度 | 条件 | 建议动作 |
 | --- | --- | --- |
@@ -77,9 +121,13 @@ Prometheus 采集目标：
 | High | 任一 `queue.snapshot.counts.failed > 0` 持续 10 分钟 | 按 queue 和安全错误码定位失败任务 |
 | High | waiting 超过 100 且持续 10 分钟 | 检查 Worker 存活、外部限流和任务耗时 |
 | Medium | 同一 connector/source 15 分钟内失败 5 次 | 检查供应商状态、配额和凭据，不停止其他来源 |
+| Medium | 已成功调用的来源连续 24 小时没有候选 | 检查查询路由、供应商返回和时间窗口 |
+| Medium | 单一来源 24 小时内至少 20 条候选但精选率低于 5% | 按 `outcome` 区分正文安全/HTTP/超时/MIME/大小、时间、关键词、事实支持和去重问题 |
+| Medium | 单一来源占 24 小时最终精选的 90% 以上，且总精选不少于 10 条 | 检查其他来源是否失效或长期低产出，不按配额补低质量内容 |
 | Medium | `agent.stage.completed` 耗时持续接近运行超时 | 检查对应 stage、模型延迟和候选规模 |
+| Medium | Feed 曝光批次拒绝率超过 10% 持续 10 分钟 | 检查决策生命周期、客户端版本和 API 所有权校验错误 |
 
-日志告警标签只允许 `service`、`event`、`queue`、`component`、`stage` 和安全 `code`。Prometheus 指标额外允许 method、路由模板、状态类别、result、state 和 kind。不得使用实际路径、用户字段，或把 trace/run/job 标识用于长期高基数指标。
+日志告警标签只允许 `service`、`event`、`queue`、`component`、`stage` 和安全 `code`。Prometheus 指标额外允许 method、路由模板、状态类别、result、state、kind，以及固定 connector ID、`source_type` 和有限 `outcome`。不得使用实际路径、用户字段、关键词、URL，或把 trace/run/job 标识用于长期高基数指标。
 
 ## 4. 密钥轮换
 
@@ -104,6 +152,7 @@ Prometheus 采集目标：
 - 每次部署前记录已配置供应商的套餐、月/日配额、并发限制和重置时间，只记录数值，不记录凭据。
 - 通过显式 live smoke 验证一次最小请求；禁止用批量发现任务测试凭据。
 - 聚合 `AI_RATE_LIMITED`、`CONNECTOR_RATE_LIMITED`、`TREND_SOURCE_RATE_LIMITED` 和 `EMAIL_RATE_LIMITED`。持续限流时降低调度或并发，不绕过供应商限制。
+- `AI_CREDIT_EXHAUSTED` 和 `CONNECTOR_CREDIT_EXHAUSTED` 分别表示 OpenRouter AI 网关与 Web Search 连接器余额或额度不足，均属于不可重试故障；补充额度后再手动刷新，不应通过增加队列重试次数处理。
 - GitHub、YouTube、Reddit、X、搜索和邮件供应商的配额分别管理；一个来源耗尽不能阻塞其他来源。
 
 ## 6. 故障恢复

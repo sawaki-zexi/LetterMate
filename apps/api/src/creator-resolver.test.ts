@@ -5,7 +5,9 @@ import {
   RssCreatorIdentityResolver,
   SafeRemoteTextFetcher,
   XCreatorIdentityResolver,
+  YouTubeCreatorIdentityResolver,
   BilibiliCreatorIdentityResolver,
+  BlueskyCreatorIdentityResolver,
 } from './creator-resolver.js';
 
 const rss = `<?xml version="1.0" encoding="UTF-8"?>
@@ -208,6 +210,60 @@ describe('creator identity resolution', () => {
       .resolves.toEqual({ candidates: [] });
   });
 
+  it('resolves and revalidates a YouTube handle by stable channel ID', async () => {
+    const channel = {
+      id: 'UC1234567890123456789012',
+      snippet: {
+        title: 'Example Engineering',
+        description: 'Long-form engineering videos',
+        customUrl: '@example',
+        thumbnails: { high: { url: 'https://yt3.ggpht.com/example.jpg' } },
+      },
+    };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [channel] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [channel] }), { status: 200 }));
+    const resolver = new YouTubeCreatorIdentityResolver('youtube-key', fetcher as typeof fetch);
+    const service = new CreatorResolutionService([resolver], 'test-resolution-secret');
+
+    const result = await service.resolve('user-a', 'https://www.youtube.com/@example');
+
+    expect(result.candidates).toEqual([expect.objectContaining({
+      platform: 'youtube',
+      displayName: 'Example Engineering',
+      handle: '@example',
+      avatarUrl: 'https://yt3.ggpht.com/example.jpg',
+      profileUrl: 'https://www.youtube.com/channel/UC1234567890123456789012',
+      feedUrl: null,
+    })]);
+    await expect(service.confirm('user-a', [result.candidates[0]!.resolutionToken]))
+      .resolves.toEqual([expect.objectContaining({ accountKey: 'UC1234567890123456789012' })]);
+    expect(new URL(String(fetcher.mock.calls[0]![0])).searchParams.get('forHandle')).toBe('example');
+    expect(new URL(String(fetcher.mock.calls[1]![0])).searchParams.get('id'))
+      .toBe('UC1234567890123456789012');
+  });
+
+  it('searches YouTube channel names and reports missing configuration', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        items: [{ id: { channelId: 'UC1234567890123456789012' } }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{
+        id: 'UC1234567890123456789012',
+        snippet: { title: 'Example Engineering', description: '', thumbnails: {} },
+      }] }), { status: 200 }));
+    const enabled = new YouTubeCreatorIdentityResolver('youtube-key', fetcher as typeof fetch);
+    const disabled = new YouTubeCreatorIdentityResolver(undefined, fetcher as typeof fetch);
+
+    await expect(enabled.resolve('Example Engineering')).resolves.toEqual([
+      expect.objectContaining({ accountKey: 'UC1234567890123456789012', platform: 'youtube' }),
+    ]);
+    expect(new URL(String(fetcher.mock.calls[0]![0])).searchParams.get('type')).toBe('channel');
+    expect(new CreatorResolutionService([disabled]).capabilities()).toEqual([
+      { id: 'youtube', label: 'YouTube', status: 'not_configured' },
+    ]);
+  });
+
   it('resolves Bilibili UP names through signed search results', async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -304,5 +360,49 @@ describe('creator identity resolution', () => {
     await expect(service.resolve('user-a', 'Example')).resolves.toEqual({
       candidates: [expect.objectContaining({ platform: 'x', displayName: 'Example' })],
     });
+  });
+
+  it('resolves a Bluesky handle by DID and revalidates after a handle change', async () => {
+    const profile = {
+      did: 'did:plc:blueskycreator',
+      handle: 'new-name.bsky.social',
+      displayName: 'Bluesky Creator',
+      description: '公开技术动态',
+      avatar: 'https://cdn.example/avatar.jpg',
+    };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ did: profile.did }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(profile), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ did: profile.did }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(profile), { status: 200 }));
+    const resolver = new BlueskyCreatorIdentityResolver(fetcher as typeof fetch);
+    const service = new CreatorResolutionService([resolver], 'test-resolution-secret');
+
+    const result = await service.resolve('user-a', 'https://bsky.app/profile/old-name.bsky.social');
+    expect(result.candidates).toEqual([expect.objectContaining({
+      platform: 'bluesky', displayName: 'Bluesky Creator',
+      handle: '@new-name.bsky.social', profileUrl: 'https://bsky.app/profile/new-name.bsky.social',
+    })]);
+    const token = result.candidates[0]!.resolutionToken;
+    await expect(service.confirm('user-a', [token])).resolves.toEqual([
+      expect.objectContaining({ accountKey: profile.did, handle: '@new-name.bsky.social' }),
+    ]);
+    expect(new URL(String(fetcher.mock.calls[0]![0])).pathname)
+      .toBe('/xrpc/com.atproto.identity.resolveHandle');
+  });
+
+  it('searches Bluesky display names and exposes the public platform without a key', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ actors: [{
+      did: 'did:plc:one', handle: 'one.bsky.social', displayName: 'One', description: 'One bio', avatar: null,
+    }] }), { status: 200 }));
+    const resolver = new BlueskyCreatorIdentityResolver(fetcher as typeof fetch);
+    await expect(resolver.resolve('One')).resolves.toEqual([
+      expect.objectContaining({ platform: 'bluesky', accountKey: 'did:plc:one', displayName: 'One' }),
+    ]);
+    expect(new CreatorResolutionService([resolver]).capabilities()).toEqual([
+      { id: 'bluesky', label: 'Bluesky', status: 'enabled' },
+    ]);
+    expect(new URL(String(fetcher.mock.calls[0]![0])).pathname)
+      .toBe('/xrpc/app.bsky.actor.searchActorsTypeahead');
   });
 });

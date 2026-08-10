@@ -1,8 +1,10 @@
 import {
   creatorIdentityCandidateSchema,
+  creatorPlatformSchema,
   creatorPlatformStatusSchema,
   creatorResolutionResultSchema,
   type CreatorIdentityCandidate,
+  type CreatorPlatform,
   type CreatorPlatformStatus,
   type CreatorResolutionResult,
 } from '@lettermate/contracts';
@@ -46,7 +48,7 @@ export class CreatorResolutionError extends Error {
 }
 
 export interface ResolvedCreatorIdentity {
-  platform: 'rss' | 'x' | 'bilibili';
+  platform: CreatorPlatform;
   accountKey: string;
   resolutionInput: string;
   displayName: string;
@@ -59,7 +61,7 @@ export interface ResolvedCreatorIdentity {
 }
 
 export interface CreatorIdentityResolver {
-  readonly platform: 'rss' | 'x' | 'bilibili';
+  readonly platform: CreatorPlatform;
   readonly label: string;
   readonly status: CreatorPlatformStatus['status'];
   supports(input: string): boolean;
@@ -493,6 +495,282 @@ export class XCreatorIdentityResolver implements CreatorIdentityResolver {
   }
 }
 
+const youtubeThumbnailSchema = z.object({ url: z.string().url() }).passthrough();
+const youtubeChannelSchema = z.object({
+  id: z.string().trim().min(1),
+  snippet: z.object({
+    title: z.string().trim().min(1),
+    description: z.string().optional().default(''),
+    customUrl: z.string().optional().nullable(),
+    thumbnails: z.record(z.string(), youtubeThumbnailSchema).optional().default({}),
+  }).passthrough(),
+}).passthrough();
+const youtubeChannelsResponseSchema = z.object({
+  items: z.array(youtubeChannelSchema).max(50).optional().default([]),
+}).passthrough();
+const youtubeChannelSearchResponseSchema = z.object({
+  items: z.array(z.object({
+    id: z.object({ channelId: z.string().trim().min(1) }).passthrough(),
+  }).passthrough()).max(50).optional().default([]),
+}).passthrough();
+
+type YouTubeReference =
+  | { kind: 'id'; value: string }
+  | { kind: 'handle'; value: string }
+  | { kind: 'username'; value: string }
+  | { kind: 'query'; value: string };
+
+function youtubeReference(input: string): YouTubeReference | null {
+  const value = input.trim();
+  if (!value) return null;
+  if (/^UC[A-Za-z0-9_-]{20,30}$/.test(value)) return { kind: 'id', value };
+  const directHandle = /^@([^\s/@]{2,100})$/u.exec(value);
+  if (directHandle) return { kind: 'handle', value: directHandle[1]! };
+  try {
+    const url = new URL(value);
+    if (!['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(url.hostname.toLowerCase())) return null;
+    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+    if (['videos', 'shorts', 'streams', 'featured', 'about'].includes(parts.at(-1) ?? '')) parts.pop();
+    if (parts.length === 1 && parts[0]!.startsWith('@') && parts[0]!.length > 1) {
+      return { kind: 'handle', value: parts[0]!.slice(1) };
+    }
+    if (parts.length !== 2) return null;
+    if (parts[0] === 'channel' && /^UC[A-Za-z0-9_-]{20,30}$/.test(parts[1]!)) {
+      return { kind: 'id', value: parts[1]! };
+    }
+    if (parts[0] === 'user' && parts[1]) return { kind: 'username', value: parts[1] };
+    if (parts[0] === 'c' && parts[1]) return { kind: 'query', value: parts[1] };
+    return null;
+  } catch {
+    return { kind: 'query', value };
+  }
+}
+
+export class YouTubeCreatorIdentityResolver implements CreatorIdentityResolver {
+  readonly platform = 'youtube' as const;
+  readonly label = 'YouTube';
+  readonly status: CreatorPlatformStatus['status'];
+
+  constructor(
+    private readonly apiKey: string | undefined,
+    private readonly fetcher: typeof fetch = fetch,
+  ) {
+    this.status = apiKey?.trim() ? 'enabled' : 'not_configured';
+  }
+
+  supports(input: string): boolean {
+    return youtubeReference(input) !== null;
+  }
+
+  async resolve(input: string): Promise<ResolvedCreatorIdentity[]> {
+    const key = this.apiKey?.trim();
+    const reference = youtubeReference(input);
+    if (!key || !reference) return [];
+    const channelIds = reference.kind === 'query'
+      ? await this.searchChannels(reference.value, key)
+      : [];
+    const url = new URL('https://www.googleapis.com/youtube/v3/channels');
+    url.searchParams.set('part', 'snippet');
+    url.searchParams.set('key', key);
+    if (reference.kind === 'id') url.searchParams.set('id', reference.value);
+    else if (reference.kind === 'handle') url.searchParams.set('forHandle', reference.value);
+    else if (reference.kind === 'username') url.searchParams.set('forUsername', reference.value);
+    else if (channelIds.length > 0) url.searchParams.set('id', channelIds.join(','));
+    else return [];
+    const response = youtubeChannelsResponseSchema.safeParse(await this.request(url));
+    if (!response.success) {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', 'YouTube 频道响应无效', 400);
+    }
+    return response.data.items.map((channel) => this.toIdentity(channel));
+  }
+
+  private async searchChannels(query: string, key: string): Promise<string[]> {
+    const url = new URL('https://www.googleapis.com/youtube/v3/search');
+    url.searchParams.set('part', 'snippet');
+    url.searchParams.set('type', 'channel');
+    url.searchParams.set('q', query);
+    url.searchParams.set('maxResults', '10');
+    url.searchParams.set('key', key);
+    const response = youtubeChannelSearchResponseSchema.safeParse(await this.request(url));
+    if (!response.success) {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', 'YouTube 频道响应无效', 400);
+    }
+    return [...new Set(response.data.items.map((item) => item.id.channelId))];
+  }
+
+  private toIdentity(channel: z.infer<typeof youtubeChannelSchema>): ResolvedCreatorIdentity {
+    const thumbnail = channel.snippet.thumbnails.high
+      ?? channel.snippet.thumbnails.medium
+      ?? channel.snippet.thumbnails.default;
+    const customUrl = channel.snippet.customUrl?.trim().replace(/^@/, '') || null;
+    const profileUrl = `https://www.youtube.com/channel/${encodeURIComponent(channel.id)}`;
+    return {
+      platform: 'youtube',
+      accountKey: channel.id,
+      resolutionInput: profileUrl,
+      displayName: channel.snippet.title.slice(0, 200),
+      handle: customUrl ? `@${customUrl}`.slice(0, 200) : null,
+      avatarUrl: thumbnail?.url ?? null,
+      bio: channel.snippet.description.trim().slice(0, 1_000) || null,
+      verified: null,
+      profileUrl,
+      feedUrl: null,
+    };
+  }
+
+  private async request(url: URL): Promise<unknown> {
+    let response: Response;
+    try {
+      response = await this.fetcher(url.toString(), { headers: { accept: 'application/json' } });
+    } catch {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_UNAVAILABLE', 'YouTube 频道来源暂时不可用', 503);
+    }
+    if (response.status === 401 || response.status === 403 || response.status === 429 || response.status >= 500) {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_UNAVAILABLE', 'YouTube 频道来源暂时不可用', 503);
+    }
+    if (!response.ok) {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', '无法解析该 YouTube 频道', 400);
+    }
+    try {
+      return await response.json();
+    } catch {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', 'YouTube 频道响应无效', 400);
+    }
+  }
+}
+
+const blueskyProfileSchema = z.object({
+  did: z.string().trim().startsWith('did:'),
+  handle: z.string().trim().min(1),
+  displayName: z.string().optional().nullable(),
+  description: z.string().optional().nullable(),
+  avatar: z.string().url().optional().nullable(),
+}).passthrough();
+
+const blueskyActorSearchSchema = z.object({
+  actors: z.array(blueskyProfileSchema).max(100),
+}).passthrough();
+
+const blueskyHandleSchema = z.object({
+  did: z.string().trim().startsWith('did:'),
+}).passthrough();
+
+const BLUESKY_API_BASE = 'https://public.api.bsky.app/xrpc';
+
+function blueskyReference(input: string): { kind: 'handle' | 'did'; value: string } | { kind: 'query'; value: string } | null {
+  const value = input.trim();
+  if (!value) return null;
+  if (/^did:[a-z0-9]+:[a-z0-9:.%-]+$/i.test(value)) return { kind: 'did', value };
+  try {
+    const url = new URL(value);
+    if (!['bsky.app', 'www.bsky.app'].includes(url.hostname.toLowerCase())) return null;
+    const match = /^\/profile\/([^/?#]+)/i.exec(url.pathname);
+    if (!match?.[1]) return null;
+    const profile = decodeURIComponent(match[1]);
+    if (/^did:/i.test(profile)) return { kind: 'did', value: profile };
+    return { kind: 'handle', value: profile.replace(/^@/, '') };
+  } catch {
+    // Continue with a bare handle or display-name search.
+  }
+  if (/^@?[a-z0-9][a-z0-9.-]*\.[a-z0-9.-]+$/i.test(value)) {
+    return { kind: 'handle', value: value.replace(/^@/, '') };
+  }
+  return { kind: 'query', value };
+}
+
+function blueskyProfileIdentity(profile: z.infer<typeof blueskyProfileSchema>, resolutionInput: string): ResolvedCreatorIdentity {
+  const displayName = (profile.displayName?.trim() || profile.handle).slice(0, 200);
+  const handle = profile.handle.trim().replace(/^@/, '');
+  return {
+    platform: 'bluesky',
+    accountKey: profile.did,
+    resolutionInput,
+    displayName,
+    handle: `@${handle}`.slice(0, 200),
+    avatarUrl: profile.avatar && /^https?:\/\//i.test(profile.avatar) ? profile.avatar : null,
+    bio: profile.description?.trim().slice(0, 1_000) || null,
+    verified: null,
+    profileUrl: `https://bsky.app/profile/${encodeURIComponent(handle)}`,
+    feedUrl: null,
+  };
+}
+
+export class BlueskyCreatorIdentityResolver implements CreatorIdentityResolver {
+  readonly platform = 'bluesky' as const;
+  readonly label = 'Bluesky';
+  readonly status = 'enabled' as const;
+
+  constructor(private readonly fetcher: typeof fetch = fetch) {}
+
+  supports(input: string): boolean {
+    const value = input.trim();
+    if (!value) return false;
+    if (/^did:[a-z0-9]+:[a-z0-9:.%-]+$/i.test(value)) return true;
+    try {
+      const url = new URL(value);
+      return ['bsky.app', 'www.bsky.app'].includes(url.hostname.toLowerCase())
+        && /^\/profile\//i.test(url.pathname);
+    } catch {
+      return true;
+    }
+  }
+
+  async resolve(input: string): Promise<ResolvedCreatorIdentity[]> {
+    const reference = blueskyReference(input);
+    if (!reference) return [];
+    if (reference.kind === 'query') {
+      const url = new URL(`${BLUESKY_API_BASE}/app.bsky.actor.searchActorsTypeahead`);
+      url.searchParams.set('q', reference.value);
+      url.searchParams.set('limit', '12');
+      const payload = await this.request(url);
+      if (payload === null) return [];
+      const parsed = blueskyActorSearchSchema.safeParse(payload);
+      if (!parsed.success) throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', 'Bluesky 账号响应无效', 400);
+      return parsed.data.actors.map((actor) => blueskyProfileIdentity(actor, input));
+    }
+
+    const did = reference.kind === 'did' ? reference.value : await this.resolveHandle(reference.value);
+    if (!did) return [];
+    const url = new URL(`${BLUESKY_API_BASE}/app.bsky.actor.getProfile`);
+    url.searchParams.set('actor', did);
+    const payload = await this.request(url);
+    if (payload === null) return [];
+    const parsed = blueskyProfileSchema.safeParse(payload);
+    if (!parsed.success) throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', 'Bluesky 账号响应无效', 400);
+    if (parsed.data.did !== did) return [];
+    return [blueskyProfileIdentity(parsed.data, input)];
+  }
+
+  private async resolveHandle(handle: string): Promise<string | null> {
+    const url = new URL(`${BLUESKY_API_BASE}/com.atproto.identity.resolveHandle`);
+    url.searchParams.set('handle', handle);
+    const payload = await this.request(url);
+    if (payload === null) return null;
+    const parsed = blueskyHandleSchema.safeParse(payload);
+    if (!parsed.success) throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', 'Bluesky Handle 无效', 400);
+    return parsed.data.did;
+  }
+
+  private async request(url: URL): Promise<unknown | null> {
+    let response: Response;
+    try {
+      response = await this.fetcher(url.toString(), { headers: { accept: 'application/json' } });
+    } catch {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_UNAVAILABLE', 'Bluesky 账号来源暂时不可用', 503);
+    }
+    if (response.status === 429 || response.status >= 500) {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_UNAVAILABLE', 'Bluesky 账号来源暂时不可用', 503);
+    }
+    if (response.status === 400 || response.status === 404) return null;
+    if (!response.ok) throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', '无法解析该 Bluesky 账号', 400);
+    try {
+      return await response.json();
+    } catch {
+      throw new CreatorResolutionError('CREATOR_IDENTITY_INVALID', 'Bluesky 账号响应无效', 400);
+    }
+  }
+}
+
 const bilibiliCardSchema = z.object({
   mid: z.union([z.string(), z.number()]).transform(String),
   name: z.string().trim().min(1),
@@ -697,7 +975,7 @@ export class BilibiliCreatorIdentityResolver implements CreatorIdentityResolver 
 }
 
 const tokenCandidateSchema = z.strictObject({
-  platform: z.enum(['rss', 'x', 'bilibili']),
+  platform: creatorPlatformSchema,
   accountKey: z.string().trim().min(1).max(2_000),
   resolutionInput: z.string().trim().min(1).max(2_000),
   displayName: z.string().trim().min(1).max(200),

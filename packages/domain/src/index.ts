@@ -5,5 +5,7 @@ export * from './keyword-profile.js';
 export * from './localization.js';
 export * from './personalization.js';
 export * from './quality.js';
+export * from './semantic-recall-evaluation.js';
 export * from './source.js';
+export * from './source-quality-evaluation.js';
 export * from './url.js';

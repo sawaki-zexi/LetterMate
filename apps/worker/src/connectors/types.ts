@@ -27,11 +27,19 @@ export interface SourceConnector {
 export interface ConnectorResult {
   candidates: SourceCandidate[];
   requestCount?: number;
+  degradations?: ConnectorDegradation[];
   identity?: {
     displayName: string;
     profileUrl: string;
     handle: string | null;
   };
+}
+
+/** Safe, provider-agnostic information about a source stream that was skipped. */
+export interface ConnectorDegradation {
+  source: string;
+  code: string;
+  retryable: boolean;
 }
 
 export interface ConnectorFailure {

@@ -1,5 +1,6 @@
 import type { PrismaClient } from '@prisma/client';
 import { describe, expect, it, vi } from 'vitest';
+import type { DigestBriefGenerator } from './digest-brief-generator.js';
 import {
   type ClaimedDigestRun,
   PrismaDigestDeliveryRepository,
@@ -14,6 +15,8 @@ const claimedRun: ClaimedDigestRun = {
   items: [{
     contentKey: 'https://example.com/1', position: 0, title: '标题',
     summary: '摘要', reason: '理由', sourceUrl: 'https://example.com/1',
+    citationUrls: ['https://example.com/1'], platform: 'Example', publishedAt: null,
+    evidence: '理由', uncertainty: '仍需核验原文。', followUp: '继续关注后续更新。',
   }],
 };
 
@@ -120,16 +123,108 @@ describe('PrismaDigestScheduleRepository', () => {
     });
     expect(transaction.digestRun.create).toHaveBeenCalledWith({
       data: {
+        id: expect.any(String),
         userId: 'user-a',
         scheduledLocalDate: '2026-08-08',
         windowStart: boundary,
         windowEnd: now,
         status: 'skipped',
         finishedAt: now,
+        briefGenerationStatus: 'fallback',
+        briefGenerationVersion: 'digest-brief-fallback-v1',
+        briefGenerationErrorCode: null,
       },
       select: { id: true },
     });
     expect(transaction.contentInterestTag.findMany).not.toHaveBeenCalled();
+  });
+
+  it('builds one frozen cross-source snapshot and excludes an adjacent exploration trend', async () => {
+    const source = (id: string, url: string) => ({
+      id, kind: 'quality' as const, title: `标题 ${id}`, summary: `摘要 ${id}`, reason: `理由 ${id}`,
+      sourceUrls: [url], canonicalPrimaryUrl: url, publishedAt: now,
+      discoveredAt: now, sourceType: 'web' as const, platform: 'Example',
+      authorName: null, authorHandle: null, externalId: id, provenanceKind: 'fetched_page' as const,
+    });
+    const followed = {
+      ...source('topic', 'https://example.com/followed'),
+      topicId: 'topic-1', topicKeyword: 'AI Agent', topic: { deletedAt: null, keyword: 'AI Agent' },
+    };
+    const adjacent = source('adjacent', 'https://example.com/adjacent');
+    const creator = {
+      ...source('creator', 'https://example.com/creator'),
+      creatorId: 'creator-1', contentType: 'original' as const,
+      creator: { displayName: 'Followed Creator' },
+    };
+    const create = vi.fn().mockResolvedValue({ id: 'run-ranked' });
+    const transaction = {
+      $executeRaw: vi.fn().mockResolvedValue(1),
+      digestRun: {
+        findUnique: vi.fn().mockResolvedValue(null), findFirst: vi.fn().mockResolvedValue(null), create,
+      },
+      discoveryItem: { findMany: vi.fn().mockResolvedValue([followed]) },
+      radarItem: { findMany: vi.fn().mockResolvedValue([
+        { ...source('trend-duplicate', followed.canonicalPrimaryUrl), canonicalPrimaryUrl: followed.canonicalPrimaryUrl },
+        adjacent,
+      ]) },
+      creatorItem: { findMany: vi.fn().mockResolvedValue([creator]) },
+      digestItem: { findMany: vi.fn().mockResolvedValue([]) },
+      interestMemorySettings: { findUnique: vi.fn().mockResolvedValue({ personalizationEnabled: true }) },
+      userInterestProfile: { findMany: vi.fn().mockResolvedValue([{
+        tagId: 'tag-core', shortScore: 5, longScore: 3, negativeScore: 0,
+        evidenceUpdatedAt: now, sourceKinds: ['interested'],
+      }]) },
+      forgottenInterestTag: { findMany: vi.fn().mockResolvedValue([]) },
+      contentInterestTag: { findMany: vi.fn().mockResolvedValue([
+        { contentKey: adjacent.canonicalPrimaryUrl, tagId: 'tag-edge', confidence: 0.95 },
+        { contentKey: creator.canonicalPrimaryUrl, tagId: 'tag-core', confidence: 0.95 },
+      ]) },
+      interestTagAdjacency: { findMany: vi.fn().mockResolvedValue([
+        { leftTagId: 'tag-core', rightTagId: 'tag-edge' },
+      ]) },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback: (value: typeof transaction) => unknown) => callback(transaction)),
+    } as unknown as PrismaClient;
+    const briefGenerator = {
+      generate: vi.fn(async ({ snapshots }: Parameters<DigestBriefGenerator['generate']>[0]) => ({
+        items: snapshots.map((snapshot) => ({
+          ...snapshot,
+          summary: `AI 结论：${snapshot.summary}`,
+          evidence: `AI 证据：${snapshot.reason}`,
+          uncertainty: 'AI 标记的材料限制。',
+          followUp: 'AI 建议的后续关注点。',
+        })),
+        status: 'generated' as const,
+        version: 'digest-brief-grounded-v1',
+        errorCode: null,
+      })),
+    };
+
+    await expect(new PrismaDigestScheduleRepository(prisma, briefGenerator).ensureRun({
+      userId: 'user-a', scheduledLocalDate: '2026-08-08', windowEnd: now, now,
+    })).resolves.toEqual({ runId: 'run-ranked', userId: 'user-a', status: 'queued' });
+
+    const frozen = create.mock.calls[0]?.[0].data.items.create;
+    expect(frozen).toHaveLength(2);
+    expect(frozen.every((item: { summary: string }) => item.summary.startsWith('AI 结论：'))).toBe(true);
+    expect(frozen.map((item: { contentKey: string }) => item.contentKey)).toEqual(expect.arrayContaining([
+      followed.canonicalPrimaryUrl, creator.canonicalPrimaryUrl,
+    ]));
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        briefGenerationStatus: 'generated',
+        briefGenerationVersion: 'digest-brief-grounded-v1',
+        briefGenerationErrorCode: null,
+      }),
+    }));
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(briefGenerator.generate).toHaveBeenCalledTimes(1);
+    expect(briefGenerator.generate.mock.calls[0]?.[0].runId)
+      .toBe(create.mock.calls[0]?.[0].data.id);
+    expect(transaction.interestTagAdjacency.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ relationVersion: 'qualified-content-cooccurrence-v1' }),
+    }));
   });
 });
 

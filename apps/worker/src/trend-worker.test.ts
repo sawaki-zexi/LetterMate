@@ -147,6 +147,21 @@ describe('trend job handler', () => {
     expect(queue.add).not.toHaveBeenCalled();
   });
 
+  it('stops BullMQ retries for an explicit non-retryable provider failure', async () => {
+    const error = new AiGatewayError('AI_AUTH_FAILED', 'Private provider message', false);
+    const service = {
+      run: vi.fn().mockRejectedValue(error),
+      acknowledgeManualFollowUp: vi.fn(),
+    } as unknown as Pick<TrendDiscoveryService, 'run' | 'acknowledgeManualFollowUp'>;
+    const queue = { add: vi.fn() };
+
+    await expect(createTrendJobHandler(service, queue)(job(0))).rejects.toMatchObject({
+      name: 'CodedUnrecoverableError',
+      code: 'AI_AUTH_FAILED',
+    });
+    expect(queue.add).not.toHaveBeenCalled();
+  });
+
   it('marks the final retry and enqueues one deterministic manual follow-up', async () => {
     const service = {
       run: vi.fn().mockResolvedValue({ followUpManualRunId: 'manual-follow-up-1' }),

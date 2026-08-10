@@ -541,9 +541,11 @@ describe('topic store multi-source mappings', () => {
     expect(feed.map((item) => item.id)).toEqual([older.id, newer.id]);
     expect(feed[0]?.recommendation).toEqual({
       lane: 'exploration', reason: 'exploration', isExploration: true,
+      decisionId: 'decision-1',
     });
     expect(feed[1]?.recommendation).toEqual({
       lane: 'subscription', reason: 'followed_topic', isExploration: false,
+      decisionId: 'decision-1',
     });
     expect(select).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'user-1', surface: 'feed',

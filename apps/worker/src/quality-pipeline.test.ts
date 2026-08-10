@@ -1,6 +1,7 @@
 import { validateSourceCandidate, type ValidatedSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it, vi } from 'vitest';
 import { buildKeywordPolicy } from './keyword-policy.js';
+import { ContentFetchError } from './content-fetcher.js';
 import { QualityPipeline, type QualityAiGateway } from './quality-pipeline.js';
 
 const candidate = (id: string, overrides: Partial<ValidatedSourceCandidate> = {}) => validateSourceCandidate({
@@ -33,6 +34,53 @@ const gateway = (overrides: Partial<QualityAiGateway> = {}): QualityAiGateway =>
 const agentsPolicy = buildKeywordPolicy('agents');
 
 describe('QualityPipeline', () => {
+  it('reports source funnel rejection causes and final accepted contribution', async () => {
+    const accepted = candidate('accepted', {
+      content: 'Agents architecture with migration details, measurements, and limitations.',
+    });
+    const unsupported = candidate('unsupported', {
+      content: 'Agents claim with enough detail to reach factual support assessment.',
+    });
+    const stale = candidate('stale', {
+      content: 'Agents historical architecture article with complete implementation details.',
+      publishedAt: '2026-07-01T12:00:00.000Z',
+    });
+    const sourceTelemetry = {
+      recordSourceAttempt: vi.fn(),
+      recordSourceItems: vi.fn(),
+    };
+    const evaluateCandidates = vi.fn(async ({ candidates }) => candidates.map(
+      ({ id }: { id: string }) => id === unsupported.canonicalUrl
+        ? { id, accepted: false, kind: null, reason: 'unsupported', claimSupport: 'unsupported' as const }
+        : { id, accepted: true, kind: 'quality' as const, reason: 'supported', claimSupport: 'supported' as const },
+    ));
+
+    const result = await new QualityPipeline(
+      { fetchText: vi.fn() } as never,
+      gateway({ evaluateCandidates }),
+      sourceTelemetry,
+    ).run({
+      keyword: 'agents', matchPolicy: agentsPolicy,
+      candidates: [accepted, unsupported, stale], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z',
+      windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+
+    expect(result).toHaveLength(1);
+    expect(sourceTelemetry.recordSourceItems).toHaveBeenCalledWith({
+      source: 'search-brave', sourceType: 'web', outcome: 'retrieved', count: 3,
+    });
+    expect(sourceTelemetry.recordSourceItems).toHaveBeenCalledWith({
+      source: 'search-brave', sourceType: 'web', outcome: 'stale_rejected', count: 1,
+    });
+    expect(sourceTelemetry.recordSourceItems).toHaveBeenCalledWith({
+      source: 'search-brave', sourceType: 'web', outcome: 'unsupported_claim', count: 1,
+    });
+    expect(sourceTelemetry.recordSourceItems).toHaveBeenCalledWith({
+      source: 'search-brave', sourceType: 'web', outcome: 'accepted', count: 1,
+    });
+  });
+
   it('enriches only body-dependent web candidates before assessment', async () => {
     const web = candidate('1');
     const social = candidate('2', {
@@ -81,6 +129,63 @@ describe('QualityPipeline', () => {
     expect(fetchText).toHaveBeenCalledOnce();
     expect(evaluateCandidates).toHaveBeenCalledOnce();
     expect(result).toHaveLength(1);
+  });
+
+  it.each([
+    ['UNSAFE_SOURCE_URL', 'body_unsafe_rejected'],
+    ['CONTENT_FETCH_TIMEOUT', 'body_timeout_rejected'],
+    ['UNSUPPORTED_CONTENT_TYPE', 'body_type_rejected'],
+    ['CONTENT_TOO_LARGE', 'body_size_rejected'],
+    ['TOO_MANY_REDIRECTS', 'body_redirect_rejected'],
+    ['CONTENT_FETCH_ABORTED', 'body_aborted_rejected'],
+  ] as const)('reports safe body fetch outcome %s', async (code, outcome) => {
+    const source = candidate(`body-${code.toLowerCase()}`, {
+      title: 'Agents article', content: null, excerpt: null,
+    });
+    const sourceTelemetry = {
+      recordSourceAttempt: vi.fn(),
+      recordSourceItems: vi.fn(),
+    };
+    const pipeline = new QualityPipeline({
+      fetchText: vi.fn().mockRejectedValue(new ContentFetchError(code, 'safe failure')),
+    }, gateway(), sourceTelemetry);
+
+    await expect(pipeline.run({
+      keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z',
+      windowEnd: '2026-07-27T00:00:00.000Z',
+    })).resolves.toEqual([]);
+    expect(sourceTelemetry.recordSourceItems).toHaveBeenCalledWith({
+      source: 'search-brave', sourceType: 'web', outcome, count: 1,
+    });
+  });
+
+  it.each([
+    [403, 'body_http_client_rejected'],
+    [503, 'body_http_server_rejected'],
+    [undefined, 'body_network_rejected'],
+  ] as const)('reports bounded HTTP fetch outcome for status %s', async (status, outcome) => {
+    const source = candidate(`body-http-${status ?? 'network'}`, {
+      title: 'Agents article', content: null, excerpt: null,
+    });
+    const sourceTelemetry = {
+      recordSourceAttempt: vi.fn(),
+      recordSourceItems: vi.fn(),
+    };
+    const pipeline = new QualityPipeline({
+      fetchText: vi.fn().mockRejectedValue(
+        new ContentFetchError('CONTENT_FETCH_FAILED', 'safe failure', status),
+      ),
+    }, gateway(), sourceTelemetry);
+
+    await pipeline.run({
+      keyword: 'agents', matchPolicy: agentsPolicy, candidates: [source], historyUrls: [],
+      windowStart: '2026-07-20T00:00:00.000Z',
+      windowEnd: '2026-07-27T00:00:00.000Z',
+    });
+    expect(sourceTelemetry.recordSourceItems).toHaveBeenCalledWith({
+      source: 'search-brave', sourceType: 'web', outcome, count: 1,
+    });
   });
 
   it('deduplicates matching fetched bodies before AI review', async () => {

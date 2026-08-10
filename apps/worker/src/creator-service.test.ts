@@ -1,6 +1,7 @@
 import type { CreatorJobData, DiscoveryCandidate } from '@lettermate/contracts';
 import { validateSourceCandidate } from '@lettermate/domain';
 import { describe, expect, it, vi } from 'vitest';
+import { AiGatewayError } from './ai-gateway.js';
 import {
   CreatorDiscoveryService,
   PrismaCreatorRepository,
@@ -141,13 +142,41 @@ describe('creator discovery service', () => {
     expect(repo.saveFailure).not.toHaveBeenCalled();
   });
 
+  it('persists a degraded terminal state when a connector returns usable content with a restricted stream', async () => {
+    const repo = repository();
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn().mockResolvedValue([item]) },
+      archiveLocalizer: archiveLocalizer(),
+      createConnector: () => ({
+        search: vi.fn().mockResolvedValue({
+          candidates: [sourceCandidate],
+          degradations: [{ source: 'dynamic', code: 'CONNECTOR_ACCESS_RESTRICTED', retryable: true }],
+        }),
+      }),
+      now: () => new Date(now),
+    });
+
+    await service.run(job);
+
+    expect(repo.saveSuccess).toHaveBeenCalledWith(expect.objectContaining({
+      degradations: [{ source: 'dynamic', code: 'CONNECTOR_ACCESS_RESTRICTED', retryable: true }],
+    }));
+    expect(repo.saveFailure).not.toHaveBeenCalled();
+  });
+
   it('persists a retryable queued state before BullMQ retries', async () => {
     const repo = repository();
+    const sourceTelemetry = {
+      recordSourceAttempt: vi.fn(),
+      recordSourceItems: vi.fn(),
+    };
     const service = new CreatorDiscoveryService({
       repository: repo,
       qualityPipeline: { run: vi.fn() },
       archiveLocalizer: archiveLocalizer(),
       createConnector: () => ({ search: vi.fn().mockRejectedValue(new Error('feed unavailable')) }),
+      sourceTelemetry,
       now: () => new Date(now),
     });
 
@@ -156,6 +185,30 @@ describe('creator discovery service', () => {
       runId: 'run-1',
       status: 'queued',
       error: { code: 'CREATOR_RUN_FAILED', message: '博主内容同步暂时不可用' },
+    }));
+    expect(sourceTelemetry.recordSourceAttempt).toHaveBeenCalledWith({
+      source: 'rss', sourceType: 'feed', result: 'failure', code: 'CREATOR_CONNECTOR_FAILED',
+    });
+  });
+
+  it('makes an explicit non-retryable failure terminal on the first attempt', async () => {
+    const repo = repository();
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn() },
+      archiveLocalizer: archiveLocalizer(),
+      createConnector: () => ({
+        search: vi.fn().mockRejectedValue(
+          new AiGatewayError('AI_AUTH_FAILED', 'Authentication failed', false),
+        ),
+      }),
+      now: () => new Date(now),
+    });
+
+    await expect(service.run(job, { finalAttempt: false }))
+      .rejects.toMatchObject({ code: 'AI_AUTH_FAILED' });
+    expect(repo.saveFailure).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
     }));
   });
 
@@ -189,6 +242,59 @@ describe('creator discovery service', () => {
     expect(createConnector).toHaveBeenCalledWith(expect.objectContaining({
       platform: 'x', accountKey: '44196397', feedUrl: null,
     }));
+    expect(search.mock.calls[0]?.[0]).toMatchObject({ sourceTypes: ['social'] });
+  });
+
+  it('routes YouTube subscriptions through the video pipeline using the stable channel ID', async () => {
+    const repo = repository();
+    vi.mocked(repo.claimRun).mockResolvedValue({
+      state: 'claimed',
+      runId: 'run-youtube',
+      creator: {
+        id: 'creator-1',
+        userId: 'user-1',
+        platform: 'youtube',
+        accountKey: 'UC1234567890123456789012',
+        displayName: 'Example Channel',
+        profileUrl: 'https://www.youtube.com/channel/UC1234567890123456789012',
+        feedUrl: null,
+      },
+    });
+    const search = vi.fn().mockResolvedValue({ candidates: [sourceCandidate], requestCount: 1 });
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn().mockResolvedValue([item]) },
+      archiveLocalizer: archiveLocalizer(),
+      createConnector: () => ({ search }),
+      now: () => new Date(now),
+    });
+
+    await service.run(job);
+
+    expect(search.mock.calls[0]?.[0]).toMatchObject({ sourceTypes: ['video'] });
+  });
+
+  it('routes Bluesky subscriptions through the social pipeline using the stable DID', async () => {
+    const repo = repository();
+    vi.mocked(repo.claimRun).mockResolvedValue({
+      state: 'claimed', runId: 'run-bluesky',
+      creator: {
+        id: 'creator-1', userId: 'user-1', platform: 'bluesky',
+        accountKey: 'did:plc:creator', displayName: 'Example Creator',
+        profileUrl: 'https://bsky.app/profile/example.bsky.social', feedUrl: null,
+      },
+    });
+    const search = vi.fn().mockResolvedValue({ candidates: [sourceCandidate], requestCount: 1 });
+    const service = new CreatorDiscoveryService({
+      repository: repo,
+      qualityPipeline: { run: vi.fn().mockResolvedValue([item]) },
+      archiveLocalizer: archiveLocalizer(),
+      createConnector: () => ({ search }),
+      now: () => new Date(now),
+    });
+
+    await service.run(job);
+
     expect(search.mock.calls[0]?.[0]).toMatchObject({ sourceTypes: ['social'] });
   });
 
@@ -404,5 +510,40 @@ describe('PrismaCreatorRepository archive localization', () => {
         parentContentText: 'The parent post remains original evidence.',
       }),
     ]));
+  });
+
+  it('stores degraded status and safe source metadata without provider details', async () => {
+    const candidate = validateSourceCandidate(sourceCandidate);
+    const transaction = {
+      creatorSubscription: {
+        findFirst: vi.fn().mockResolvedValue({ id: 'creator-1' }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      creatorItem: {
+        findMany: vi.fn().mockResolvedValue([]),
+        upsert: vi.fn().mockResolvedValue({}),
+        updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+      },
+      creatorRun: { update: vi.fn().mockResolvedValue({}) },
+    };
+    const prisma = { $transaction: vi.fn(async (callback) => callback(transaction)) };
+
+    await new PrismaCreatorRepository(prisma as never).saveSuccess({
+      runId: 'run-1', creatorId: 'creator-1', userId: 'user-1', trigger: 'manual',
+      candidates: [candidate], items: [item], archiveLocalizations: [],
+      degradations: [{ source: 'dynamic', code: 'CONNECTOR_ACCESS_RESTRICTED', retryable: true }],
+      finishedAt: now,
+    });
+
+    expect(transaction.creatorRun.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        status: 'degraded',
+        degradedSources: [{ source: 'dynamic', code: 'CONNECTOR_ACCESS_RESTRICTED', retryable: true }],
+        error: { code: 'CREATOR_PARTIAL_SYNC', message: '部分来源暂时不可用，已保留可用内容' },
+      }),
+    }));
+    expect(transaction.creatorSubscription.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ runStatus: 'degraded' }),
+    }));
   });
 });

@@ -47,16 +47,16 @@ describe('OpenRouterSearchConnector', () => {
   });
 
   it.each([
-    [401, 'OpenRouter API Key 无效或已被撤销'],
-    [402, 'OpenRouter 账户余额或额度不足'],
-    [403, 'OpenRouter API Key 没有执行此请求的权限'],
-  ])('reports the specific OpenRouter error for HTTP %i', async (status, message) => {
+    [401, 'CONNECTOR_AUTH_FAILED', 'OpenRouter API Key 无效或已被撤销'],
+    [402, 'CONNECTOR_CREDIT_EXHAUSTED', 'OpenRouter 账户余额或额度不足'],
+    [403, 'CONNECTOR_AUTH_FAILED', 'OpenRouter API Key 没有执行此请求的权限'],
+  ])('reports the specific OpenRouter error for HTTP %i', async (status, code, message) => {
     const connector = new OpenRouterSearchConnector({
       apiKey: 'openrouter-key', model: 'openrouter/auto', webSearch: true, timeoutMs: 60_000,
     }, vi.fn().mockResolvedValue(new Response(null, { status })) as typeof fetch);
 
     await expect(connector.search(plan, new AbortController().signal)).rejects.toMatchObject({
-      code: 'CONNECTOR_AUTH_FAILED',
+      code,
       message,
       retryable: false,
     });

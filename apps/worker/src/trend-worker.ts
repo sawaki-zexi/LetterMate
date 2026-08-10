@@ -12,6 +12,7 @@ import { z } from 'zod';
 import type { TrendDiscoveryService } from './trend-service.js';
 import type { LegacyTrendJobData } from './trend-service.js';
 import { backoffStrategy } from './worker.js';
+import { toWorkerFailure } from './retry-policy.js';
 
 interface TrendWorkerQueue {
   add(
@@ -46,7 +47,12 @@ export function createTrendJobHandler(
       : legacyTrendJobDataSchema.parse(job.data);
     const attempts = job.opts.attempts ?? 1;
     const finalAttempt = job.attemptsMade + 1 >= attempts;
-    const result = await service.run(data, { finalAttempt });
+    let result: Awaited<ReturnType<typeof service.run>>;
+    try {
+      result = await service.run(data, { finalAttempt });
+    } catch (error) {
+      throw toWorkerFailure(error);
+    }
     if (!result.followUpManualRunId) return;
     const followUpRunId = result.followUpManualRunId;
     await queue.add(

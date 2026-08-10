@@ -11,6 +11,11 @@ export interface ApiRequestMetricsSink {
   recordRequest(metric: ApiRequestMetric): void;
 }
 
+export interface FeedImpressionMetrics {
+  status: 'accepted' | 'rejected';
+  recorded: number;
+}
+
 const statusClass = (statusCode: number): string => `${Math.floor(statusCode / 100)}xx`;
 
 export class ApiMetrics implements ApiRequestMetricsSink {
@@ -28,6 +33,17 @@ export class ApiMetrics implements ApiRequestMetricsSink {
     buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
     registers: [this.registry],
   });
+  private readonly impressionBatches = new Counter({
+    name: 'lettermate_api_feed_impression_batches_total',
+    help: 'Feed impression batches accepted or rejected by the API.',
+    labelNames: ['status'] as const,
+    registers: [this.registry],
+  });
+  private readonly impressions = new Counter({
+    name: 'lettermate_api_feed_impressions_total',
+    help: 'Feed impressions recorded by the API.',
+    registers: [this.registry],
+  });
 
   recordRequest(metric: ApiRequestMetric): void {
     const labels = {
@@ -37,6 +53,11 @@ export class ApiMetrics implements ApiRequestMetricsSink {
     };
     this.requestCount.inc(labels);
     this.requestDuration.observe(labels, Math.max(0, metric.durationMs) / 1_000);
+  }
+
+  recordFeedImpression(input: FeedImpressionMetrics): void {
+    this.impressionBatches.inc({ status: input.status });
+    if (input.recorded > 0) this.impressions.inc(input.recorded);
   }
 
   render(): Promise<string> {

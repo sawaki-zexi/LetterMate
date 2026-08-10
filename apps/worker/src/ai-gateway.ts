@@ -9,6 +9,8 @@ export const TREND_CLASSIFICATION_MAX_ID_LENGTH = 100;
 export const TREND_CLASSIFICATION_MAX_QUERY_LENGTH = 300;
 export const TREND_CLASSIFICATION_MAX_TERM_LENGTH = 100;
 export const CREATOR_ARCHIVE_LOCALIZATION_MAX_ITEMS = 8;
+export const DIGEST_BRIEF_MAX_ITEMS = 10;
+export const DIGEST_BRIEF_MAX_SOURCES_PER_ITEM = 20;
 export const EVIDENCE_FOLLOWUP_MAX_CONNECTORS = 4;
 export const EVIDENCE_FOLLOWUP_MAX_CANDIDATES = 12;
 export const EVIDENCE_FOLLOWUP_MAX_REQUIRED_TERMS = 6;
@@ -67,6 +69,29 @@ export interface CreatorArchiveLocalization {
   id: string;
   title: string;
   summary: string;
+}
+
+export interface DigestBriefCandidate {
+  id: string;
+  title: string;
+  summary: string;
+  reason: string;
+  platform: string;
+  publishedAt: string | null;
+  sources: Array<{
+    id: string;
+    platform: string;
+    publishedAt: string | null;
+  }>;
+}
+
+export interface DigestBriefDraft {
+  id: string;
+  conclusion: string;
+  evidence: string;
+  uncertainty: string;
+  followUp: string;
+  citationIds: string[];
 }
 
 export interface TrendSeedClassificationInput {
@@ -145,11 +170,17 @@ export interface AiGateway {
     execution?: AiExecutionContext;
     signal?: AbortSignal;
   }): Promise<CreatorArchiveLocalization[]>;
+  composeDigestBriefs(input: {
+    candidates: DigestBriefCandidate[];
+    execution?: AiExecutionContext;
+    signal?: AbortSignal;
+  }): Promise<DigestBriefDraft[]>;
 }
 
 export type AiGatewayErrorCode =
   | 'AI_RATE_LIMITED'
   | 'AI_AUTH_FAILED'
+  | 'AI_CREDIT_EXHAUSTED'
   | 'AI_MODEL_UNAVAILABLE'
   | 'AI_UPSTREAM_UNAVAILABLE'
   | 'AI_RESPONSE_INVALID'

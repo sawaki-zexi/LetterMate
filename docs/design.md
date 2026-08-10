@@ -2,7 +2,7 @@
 
 **状态：** 当前实现基线
 
-**更新日期：** 2026-08-08
+**更新日期：** 2026-08-10
 
 ## 1. 架构
 
@@ -111,7 +111,9 @@ Topic 与 Trend 编排通过可选遥测接口输出 `plan | collect | classify 
 - 客户端只能提交短期 `resolutionToken`，不能自造账号 ID。
 - 订阅固定平台稳定账号 ID，改名不会创建新关注。
 
-当前实现 RSS/Atom、X 和 Bilibili 博主内容。X 支持原创、连续帖、引用、转发和带父帖上下文的高价值回复；转发保留原作者，回复缺少父帖时不能进入 Feed。Bilibili 订阅固定 `mid`，并行读取公开 WBI 视频搜索与公开动态流；动态流覆盖纯动态、专栏、Opus、视频卡片和转发动态。视频卡片按 `bvid` 与公开视频去重；转发使用发布者动态作为主链接，并保存原作者、原动态 ID、原帖链接和原文上下文。无法解析原帖的转发不会进入候选池。
+当前实现 RSS/Atom、X、Bilibili、YouTube 和 Bluesky 博主内容。X 支持原创、连续帖、引用、转发和带父帖上下文的高价值回复；转发保留原作者，回复缺少父帖时不能进入 Feed。YouTube Resolver 将频道名、Handle 或频道主页解析为稳定 `channelId`，Connector 读取频道 uploads playlist 并用视频详情接口补充描述、发布时间和公开互动数据。Bilibili 订阅固定 `mid`，并行读取公开 WBI 视频搜索与公开动态流；动态流覆盖纯动态、专栏、Opus、视频卡片和转发动态。视频卡片按 `bvid` 与公开视频去重；转发使用发布者动态作为主链接，并保存原作者、原动态 ID、原帖链接和原文上下文。无法解析原帖的转发不会进入候选池。Bilibili 对视频和动态接口独立风控；动态流受限、限流或暂时异常时降级为公开视频同步，不把整个博主标记为不可用，父级任务取消仍会立即终止同步。Bluesky Resolver 通过公开 Actor 搜索、Handle 解析和 Profile 接口得到稳定 DID；Connector 使用 `app.bsky.feed.getAuthorFeed`，按 DID 校验作者，保留原创、引用、转发和带父帖上下文的回复，缺失父帖的回复不进入候选池。
+
+Creator 同步状态使用 `queued | running | succeeded | degraded | failed`。当连接器返回有效候选且同时报告安全的来源降级信息时，运行保存为 `degraded`，并仅记录来源标识、受控错误码和是否可重试；不保存 provider 原始响应、URL 或账号数据。降级状态仍是终态，允许下一次自动或手动同步。
 
 `CreatorItem` 保存全部结构有效且已中文化的公开内容；只有 `feedEligible=true` 的内容进入 Feed 和邮件候选。单个平台失败不阻塞其他博主、Topic 或 Trend。
 
@@ -127,15 +129,21 @@ Topic 与 Trend 编排通过可选遥测接口输出 `plan | collect | classify 
 
 Feed 先完成质量和筛选，再应用稳定兴趣排序。明确订阅不会因负向偏好消失。探索内容来自正向兴趣的相邻技术标签，最多约 10%，候选不足时为零，并永久排除在每日邮件之外。
 
-## 6. 每日邮件
+## 6. 每日研究简报
 
 数据模型：
 
 - `DigestPreference`：启用状态和本地发送时间；时区来自 User。
 - `DigestRun`：计划日期、选择窗口、状态、租约、安全错误和提供商消息 ID。
-- `DigestItem`：冻结的内容键、顺序、中文内容和原始链接快照。
+- `DigestItem`：冻结的内容键、顺序、中文结论、证据、不确定性、后续关注点、平台、发布时间和原始引用快照。
 
 调度器扫描已到本地发送时间且当天没有运行的用户。没有合格内容时创建 `skipped` 运行但不调用邮件服务。任务重试复用同一 `DigestRun` 和 `DigestItem` 快照；失败不推进成功窗口。
+
+邮件快照在 Topic、Trend 与 Creator 合并去重后加载当前兴趣画像、内容标签和版本化兴趣邻接关系。选择器使用与 Feed 相同的探索资格判定，先排除所有仅因相邻兴趣进入候选池的内容，再执行最多 10 条的个性化排序；明确 Topic 和 Creator 订阅不会被该过滤移除。API 预览、Worker 冻结快照和邮件渲染共享结构化简报契约，每项引用均绑定内容键、平台、发布时间和已验证 HTTP(S) URL。
+
+`DigestBriefGenerator.generate(...)` 是来源约束生成的唯一接口。它把每条候选和引用映射为稳定 `item-*`、`source-*` ID，模型只接收 ID 与已验证的中文内容，不接收或返回 URL。OpenRouter 适配器使用质量模型输出结论、证据、不确定性、后续关注点和引用 ID；生成器再次校验条目全集、中文字段、URL 禁止和逐条引用白名单，再把 ID 映射回冻结 URL。未配置 AI、预算耗尽、上游失败或校验失败时，整个批次回退为已有链接摘要，不混合部分生成结果。
+
+候选读取、远程生成和最终冻结不处于同一个长事务中。最终短事务重新检查当天运行与已成功发送的引用，原子写入 `DigestRun`、`DigestItem` 和生成状态；只有完整快照提交后才入投递队列。`DigestRun.briefGenerationStatus/version/errorCode` 记录生成或安全回退，AI usage 账本以 `digest` 运行和 `digest_brief` 任务记录模型路由与预算。投递重试只读取冻结快照，不再次调用模型。
 
 `EmailGateway` 隔离投递提供商。默认测试使用 `FakeEmailGateway`；生产运行在完整 SMTP 配置存在时使用 `SmtpEmailGateway`。未配置 SMTP 时 API 返回 `not_configured`，Worker 不启动邮件队列、消费者或调度器，其他发现能力继续运行。
 
@@ -170,13 +178,14 @@ SMTP 使用确定性 `Message-ID`、TLS、连接超时、安全错误分类和�
 - `/api/v1/health` 是不检查依赖的存活探针；`/api/v1/health/ready` 检查 PostgreSQL 与 Redis，健康时返回 200，必需依赖异常或探针缺失时返回 503。AI 未配置单独显示但不阻止 API 提供非发现能力。
 - API 收到 SIGINT/SIGTERM 后幂等关闭 Nest 应用、队列、Redis 与 Prisma 资源并输出脱敏生命周期事件；Worker 使用同样的信号边界停止调度器、消费者和连接。
 - Worker 使用统一 JSON 日志记录 queue/job/run 状态，每分钟输出 waiting/active/delayed/failed 队列快照，并为连接器、趋势来源和邮件任务输出可聚合的安全错误码。日志不包含用户 ID、邮箱、查询词、来源 URL、供应商响应或原始异常文本。
-- Worker 在独立内部端口暴露 `/health` 和 `/metrics`，指标覆盖队列状态、任务结果、安全错误码、Agent stage 耗时及聚合输入/输出/失败数。只允许固定 queue、result、component、stage 和受限 code 标签。
+- Worker 在独立内部端口暴露 `/health` 和 `/metrics`，指标覆盖队列状态、任务结果、安全错误码、Agent stage 耗时及聚合输入/输出/失败数。来源漏斗另按稳定 connector ID、有限 `source_type/outcome` 和安全失败 `code` 聚合连接器尝试、候选获取、规则拒绝、正文失败、事实支持、多样性和最终精选贡献；用户、关键词、URL、run/job ID 不进入这些指标。
 - 邮箱、密码、API Key、授权头和供应商原始响应不能进入客户端或日志。
 - 开发环境可使用 `ALLOW_DEV_IDENTITY=true` 的开发身份；生产必须使用真实登录、服务端 Session 和 CSRF，并设置 `ALLOW_DEV_IDENTITY=false`。Session Token 只以 `SESSION_SECRET` HMAC 后的摘要持久化，临近过期时滑动续期；登录失败按客户端与规范化邮箱在 API 进程内限流，成功登录会自动升级旧 scrypt 参数。横向扩展 API 前应把限流状态迁移到 Redis。
 - PostgreSQL 使用 custom-format 备份和独立 SHA-256 清单。默认保留最近 14 天全部备份、随后 8 周每周最新一份、再保留 12 个月每月最新一份；无效或不完整备份不参与自动删除。
 - 恢复验证只允许写入临时隔离数据库，执行 `pg_restore --exit-on-error` 后校验 public 表数量与 `_prisma_migrations`。工具明确拒绝主库和 PostgreSQL 系统库；生产主库恢复必须经过停机、外部副本确认和人工审批。
 - 备份命令通过 `PostgresCommandRunner` 隔离执行环境。本地模式继续使用 `docker compose exec`；生产 direct 模式将 `DATABASE_URL` 拆分为 libpq `PG*` 环境变量后调用 PostgreSQL 客户端，密码不进入进程参数，也不需要 Docker Socket。
 - 根 Dockerfile 提供非 root API/Worker 和 Nginx Web 构建目标；生产 Compose 示例不发布 PostgreSQL/Redis 端口，使用一次性迁移服务并按健康状态启动应用。Web 容器不负责 TLS，目标环境必须提供 HTTPS 入口和秘密存储。
+- 生产 Compose 的可选 `monitoring` profile 使用固定版本 Prometheus 抓取 API 与 Worker 内部指标，并加载仓库内的初始告警规则。管理端口默认只绑定 `127.0.0.1`；Alertmanager、通知凭据和日志聚合由目标环境提供。
 - `postgres-ops` 镜像目标提供一次性备份和隔离恢复任务，共享独立备份卷。每日调度、加密外部副本和演练通知由目标平台提供。
 - `ops:doctor` 默认离线验证配置并输出脱敏来源能力；显式 `live` 模式只探测 PostgreSQL 与 Redis。原始异常、连接 URL 和凭据不进入报告，只有 `error` 状态返回非零退出码。
 - 外部连接器需要在目标环境验证配额、限流和故障恢复。
@@ -192,6 +201,9 @@ npm run lint
 npm run typecheck
 npm test
 npm run evaluate:quality
+npm run evaluate:source-quality -- http://127.0.0.1:9090 24
+npm run evaluate:interest-effects -- 2026-08-10
+npm run evaluate:semantic-recall -- 2026-08-10 14
 npm run build
 npm run test:e2e
 ```

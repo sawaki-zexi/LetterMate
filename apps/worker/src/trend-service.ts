@@ -23,6 +23,7 @@ import {
 import type { QualityPipelineInput } from './quality-pipeline.js';
 import type { ContentInterestTagger } from './content-interest-tagger.js';
 import type { AiExecutionContext } from './ai-runtime.js';
+import { isExplicitlyNonRetryable } from './retry-policy.js';
 import type { AgentStageTelemetry } from './observability.js';
 import type { RunStageManager } from './run-stage.js';
 import type { EvidenceGapRetriever } from './evidence-gap-retriever.js';
@@ -902,12 +903,13 @@ export class TrendDiscoveryService {
       const failure = controller.signal.aborted
         ? new TrendOrchestrationError('TREND_RUN_TIMEOUT', 'Trend run exceeded its time limit', true)
         : error;
+      const terminalFailure = context.finalAttempt || isExplicitlyNonRetryable(failure);
       const completed = await this.options.repository.completeFailure({
         runId: claim.runId, monitorId: claim.monitorId, userId, trigger,
         error: safeError(failure), finishedAt: this.now(),
-        status: context.finalAttempt ? 'failed' : 'queued',
+        status: terminalFailure ? 'failed' : 'queued',
       });
-      if (completed.followUpManualRunId && context.finalAttempt) {
+      if (completed.followUpManualRunId && terminalFailure) {
         return { followUpManualRunId: completed.followUpManualRunId };
       }
       throw failure;

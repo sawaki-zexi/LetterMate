@@ -37,6 +37,7 @@ describe('AI runtime policy', () => {
       providerOrder: ['Provider A'], allowProviderFallbacks: true,
     });
     expect(first.route('candidate_assessment').model).toBe('quality/model');
+    expect(first.route('digest_brief').model).toBe('quality/model');
     expect(first.route('creator_localization').model).toBe('localization/model');
     expect(first.route('item_chinese_repair').reservedCostMicros).toBe(250_000);
   });

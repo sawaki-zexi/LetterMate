@@ -183,6 +183,12 @@ export interface DigestEmailItem {
   summary: string;
   reason: string;
   sourceUrl: string;
+  citationUrls?: readonly string[];
+  platform?: string;
+  publishedAt?: Date | string | null;
+  evidence?: string;
+  uncertainty?: string;
+  followUp?: string;
 }
 
 const escapeHtml = (value: string): string => value
@@ -197,31 +203,49 @@ export function renderDigestEmail(input: {
   scheduledLocalDate: string;
   items: readonly DigestEmailItem[];
 }): EmailMessage {
-  const subject = `LetterMate 每日重点 | ${input.scheduledLocalDate}`;
-  const textItems = input.items.map((item, index) => [
+  const subject = `LetterMate 每日研究简报 | ${input.scheduledLocalDate}`;
+  const textItems = input.items.map((item, index) => {
+    const citations = [...new Set(item.citationUrls?.length ? item.citationUrls : [item.sourceUrl])];
+    const publishedAt = item.publishedAt
+      ? new Date(item.publishedAt).toISOString()
+      : '发布时间未知';
+    return [
     `${index + 1}. ${item.title}`,
-    item.summary,
-    `推荐理由：${item.reason}`,
-    `原文：${item.sourceUrl}`,
-  ].join('\n')).join('\n\n');
-  const htmlItems = input.items.map((item, index) => [
+    `结论：${item.summary}`,
+    `证据：${item.evidence ?? item.reason}`,
+    `不确定性：${item.uncertainty ?? '请打开原文核验，邮件摘要不替代原文。'}`,
+    `后续关注：${item.followUp ?? '继续关注后续更新或独立来源。'}`,
+    `来源平台：${item.platform ?? 'Web'} | 发布时间：${publishedAt}`,
+    `引用：${citations.join(', ')}`,
+  ].join('\n');
+  }).join('\n\n');
+  const htmlItems = input.items.map((item, index) => {
+    const citations = [...new Set(item.citationUrls?.length ? item.citationUrls : [item.sourceUrl])];
+    const publishedAt = item.publishedAt
+      ? new Date(item.publishedAt).toISOString()
+      : '发布时间未知';
+    return [
     '<article>',
     `<h2>${index + 1}. ${escapeHtml(item.title)}</h2>`,
-    `<p>${escapeHtml(item.summary)}</p>`,
-    `<p><strong>推荐理由：</strong>${escapeHtml(item.reason)}</p>`,
-    `<p><a href="${escapeHtml(item.sourceUrl)}">查看原文</a></p>`,
+    `<p><strong>结论：</strong>${escapeHtml(item.summary)}</p>`,
+    `<p><strong>证据：</strong>${escapeHtml(item.evidence ?? item.reason)}</p>`,
+    `<p><strong>不确定性：</strong>${escapeHtml(item.uncertainty ?? '请打开原文核验，邮件摘要不替代原文。')}</p>`,
+    `<p><strong>后续关注：</strong>${escapeHtml(item.followUp ?? '继续关注后续更新或独立来源。')}</p>`,
+    `<p><strong>来源平台：</strong>${escapeHtml(item.platform ?? 'Web')} <strong>发布时间：</strong>${escapeHtml(publishedAt)}</p>`,
+    `<p>${citations.map((url) => `<a href="${escapeHtml(url)}">查看引用原文</a>`).join(' | ')}</p>`,
     '</article>',
-  ].join('')).join('');
+  ].join('');
+  }).join('');
   return {
     to: input.recipient,
     subject,
-    text: `LetterMate 每日重点\n${input.scheduledLocalDate}\n\n${textItems}`,
+    text: `LetterMate 每日研究简报\n${input.scheduledLocalDate}\n\n${textItems}`,
     html: [
       '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">',
       '<meta charset="utf-8"></head>',
       '<body style="margin:0;background:#f4f6f8;color:#18201d;font-family:Arial,sans-serif">',
       '<main style="max-width:640px;margin:0 auto;padding:24px 16px;background:#ffffff">',
-      `<h1 style="font-size:24px;margin:0 0 24px">LetterMate 每日重点</h1>${htmlItems}`,
+      `<h1 style="font-size:24px;margin:0 0 24px">LetterMate 每日研究简报</h1>${htmlItems}`,
       '</main></body></html>',
     ].join(''),
   };

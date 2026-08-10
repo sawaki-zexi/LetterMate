@@ -45,6 +45,21 @@ describe('discovery job handler', () => {
     );
   });
 
+  it('stops BullMQ retries for an explicit non-retryable provider failure', async () => {
+    const error = new AiGatewayError('AI_AUTH_FAILED', 'Private provider message', false);
+    const service = {
+      run: vi.fn().mockRejectedValue(error),
+    } as unknown as Pick<TopicDiscoveryService, 'run'>;
+
+    await expect(createDiscoveryJobHandler(service)(job(0))).rejects.toMatchObject({
+      name: 'CodedUnrecoverableError',
+      code: 'AI_AUTH_FAILED',
+    });
+    expect(service.run).toHaveBeenCalledWith(
+      'topic-1', 'user-a', 'scheduled', { finalAttempt: false },
+    );
+  });
+
   it('preserves a manual trigger', async () => {
     const service = {
       run: vi.fn().mockResolvedValue(undefined),

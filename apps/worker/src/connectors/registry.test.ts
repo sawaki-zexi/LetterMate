@@ -286,6 +286,38 @@ describe('ConnectorRegistry', () => {
     }));
   });
 
+  it('records one bounded attempt result per selected connector without affecting search', async () => {
+    const sourceTelemetry = {
+      recordSourceAttempt: vi.fn(),
+      recordSourceItems: vi.fn(),
+    };
+    const registry = new ConnectorRegistry([
+      connector('working', {
+        sourceType: 'web',
+        search: async () => ({ candidates: [candidate('working')] }),
+      }),
+      connector('broken', {
+        sourceType: 'code',
+        search: async () => {
+          throw new ConnectorError('CONNECTOR_RATE_LIMITED', 'Rate limited', true);
+        },
+      }),
+    ], { concurrency: 2, timeoutMs: 1_000, sourceTelemetry });
+
+    await expect(registry.search(plan)).resolves.toMatchObject({
+      successfulConnectorIds: ['working'],
+      failures: [expect.objectContaining({ connectorId: 'broken' })],
+    });
+    expect(sourceTelemetry.recordSourceAttempt.mock.calls.map(([input]) => input)).toEqual([
+      { source: 'working', sourceType: 'web', result: 'success' },
+      {
+        source: 'broken', sourceType: 'code', result: 'failure',
+        code: 'CONNECTOR_RATE_LIMITED',
+      },
+    ]);
+    expect(sourceTelemetry.recordSourceItems).not.toHaveBeenCalled();
+  });
+
   it('maps unknown errors to a generic safe failure', async () => {
     const registry = new ConnectorRegistry([
       connector('unknown', {

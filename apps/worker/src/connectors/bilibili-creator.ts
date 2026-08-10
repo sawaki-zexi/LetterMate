@@ -216,19 +216,26 @@ export class BilibiliCreatorConnector {
       if (response.data.data.result.length === 0 || (pages !== undefined && page >= pages)) break;
     }
 
-    let offset: string | null = null;
-    for (let page = 1; page <= this.pageBudget; page += 1) {
-      const url = new URL('/x/polymer/web-dynamic/v1/feed/space', API_BASE_URL);
-      url.searchParams.set('host_mid', this.config.mid);
-      if (offset) url.searchParams.set('offset', offset);
-      const payload = await this.request(url, signal);
-      requestCount += 1;
-      const response = dynamicResponseSchema.safeParse(payload);
-      if (!response.success || response.data.code !== 0 || !response.data.data) throw providerError(payload);
-      response.data.data.items.forEach((item) => this.addDynamic(drafts, item, card.name, plan));
-      const nextOffset = response.data.data.offset?.trim() || null;
-      if (!response.data.data.has_more || response.data.data.items.length === 0 || !nextOffset) break;
-      offset = nextOffset;
+    const degradations: NonNullable<ConnectorResult['degradations']> = [];
+    try {
+      let offset: string | null = null;
+      for (let page = 1; page <= this.pageBudget; page += 1) {
+        const url = new URL('/x/polymer/web-dynamic/v1/feed/space', API_BASE_URL);
+        url.searchParams.set('host_mid', this.config.mid);
+        if (offset) url.searchParams.set('offset', offset);
+        const payload = await this.request(url, signal);
+        requestCount += 1;
+        const response = dynamicResponseSchema.safeParse(payload);
+        if (!response.success || response.data.code !== 0 || !response.data.data) throw providerError(payload);
+        response.data.data.items.forEach((item) => this.addDynamic(drafts, item, card.name, plan));
+        const nextOffset = response.data.data.offset?.trim() || null;
+        if (!response.data.data.has_more || response.data.data.items.length === 0 || !nextOffset) break;
+        offset = nextOffset;
+      }
+    } catch (error) {
+      // Bilibili risk-controls its public video and dynamic APIs independently.
+      if (!(error instanceof ConnectorError) || error.code === 'CONNECTOR_ABORTED') throw error;
+      degradations.push({ source: 'dynamic', code: error.code, retryable: error.retryable });
     }
 
     return {
@@ -243,6 +250,7 @@ export class BilibiliCreatorConnector {
         profileUrl: `https://space.bilibili.com/${this.config.mid}`,
         handle: `UID ${this.config.mid}`,
       },
+      ...(degradations.length > 0 ? { degradations } : {}),
     };
   }
 

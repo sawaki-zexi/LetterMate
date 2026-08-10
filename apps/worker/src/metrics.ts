@@ -2,6 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Counter, Gauge, Histogram, Registry } from 'prom-client';
 import type { AgentRunStage } from '@lettermate/contracts';
+import type { SourceFunnelSink } from './source-observability.js';
 
 export interface WorkerQueueCounts {
   waiting: number;
@@ -31,7 +32,7 @@ export interface WorkerMetricsSink {
   }): void;
 }
 
-export class WorkerMetrics implements WorkerMetricsSink {
+export class WorkerMetrics implements WorkerMetricsSink, SourceFunnelSink {
   readonly registry = new Registry();
   private readonly queueJobs = new Gauge({
     name: 'lettermate_worker_queue_jobs',
@@ -56,6 +57,18 @@ export class WorkerMetrics implements WorkerMetricsSink {
     name: 'lettermate_worker_agent_stage_items_total',
     help: 'Aggregate item counts reported by LetterMate Agent stages.',
     labelNames: ['component', 'stage', 'kind'] as const,
+    registers: [this.registry],
+  });
+  private readonly sourceAttempts = new Counter({
+    name: 'lettermate_worker_source_attempts_total',
+    help: 'Discovery source attempts by bounded source identity and result.',
+    labelNames: ['source', 'source_type', 'result', 'code'] as const,
+    registers: [this.registry],
+  });
+  private readonly sourceItems = new Counter({
+    name: 'lettermate_worker_source_items_total',
+    help: 'Discovery candidates reaching a bounded source funnel outcome.',
+    labelNames: ['source', 'source_type', 'outcome'] as const,
     registers: [this.registry],
   });
 
@@ -85,6 +98,24 @@ export class WorkerMetrics implements WorkerMetricsSink {
     for (const [kind, count] of counts) {
       if (count !== undefined && count > 0) this.stageItems.inc({ ...labels, kind }, count);
     }
+  }
+
+  recordSourceAttempt(input: Parameters<SourceFunnelSink['recordSourceAttempt']>[0]): void {
+    this.sourceAttempts.inc({
+      source: boundedMetricIdentifier(input.source),
+      source_type: input.sourceType,
+      result: input.result,
+      code: boundedMetricIdentifier(input.code ?? 'none'),
+    });
+  }
+
+  recordSourceItems(input: Parameters<SourceFunnelSink['recordSourceItems']>[0]): void {
+    if (!Number.isFinite(input.count) || input.count < 0) return;
+    this.sourceItems.inc({
+      source: boundedMetricIdentifier(input.source),
+      source_type: input.sourceType,
+      outcome: input.outcome,
+    }, input.count);
   }
 
   render(): Promise<string> {

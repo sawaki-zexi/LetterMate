@@ -68,7 +68,7 @@ export class OpenRouterSearchConnector implements SourceConnector {
       });
       if (response.status === 429) throw new ConnectorError('CONNECTOR_RATE_LIMITED', 'OpenRouter Web Search rate limit reached', true);
       if (response.status === 401) throw new ConnectorError('CONNECTOR_AUTH_FAILED', 'OpenRouter API Key 无效或已被撤销', false);
-      if (response.status === 402) throw new ConnectorError('CONNECTOR_AUTH_FAILED', 'OpenRouter 账户余额或额度不足', false);
+      if (response.status === 402) throw new ConnectorError('CONNECTOR_CREDIT_EXHAUSTED', 'OpenRouter 账户余额或额度不足', false);
       if (response.status === 403) throw new ConnectorError('CONNECTOR_AUTH_FAILED', 'OpenRouter API Key 没有执行此请求的权限', false);
       if (!response.ok) throw new ConnectorError('CONNECTOR_UPSTREAM_UNAVAILABLE', 'OpenRouter Web Search is temporarily unavailable', response.status >= 500);
       let payload: unknown; try { payload = await response.json(); } catch { throw new ConnectorError('CONNECTOR_RESPONSE_INVALID', 'OpenRouter Web Search returned an invalid response', false); }

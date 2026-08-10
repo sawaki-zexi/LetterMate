@@ -166,6 +166,75 @@ describe('OpenRouterAiGateway', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it('generates digest briefs with source IDs only and records the quality-model task', async () => {
+    const ledger = new MemoryAiUsageLedger();
+    const runtimePolicy = createAiRuntimePolicy({
+      defaultModel: 'default/model', qualityModel: 'quality/model',
+      reservedCostUsdPerCall: 0.001,
+      budget: {
+        maxCalls: 2, maxInputTokens: 100_000, maxOutputTokens: 20_000, maxCostUsd: 1,
+      },
+    });
+    const response = {
+      items: [{
+        id: 'item-1',
+        conclusion: '官方已经发布新的工具调用能力。',
+        evidence: '输入摘要明确记录了这项版本变化。',
+        uncertainty: '当前材料没有覆盖所有客户端兼容情况。',
+        followUp: '继续关注后续迁移和兼容性说明。',
+        citationIds: ['item-1-source-1'],
+      }],
+    };
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify(response)));
+    const gateway = new OpenRouterAiGateway({
+      apiKey: 'secret-key', model: 'default/model', webSearch: true, timeoutMs: 60_000,
+      runtimePolicy, usageLedger: ledger,
+    }, fetcher);
+
+    await expect(gateway.composeDigestBriefs({
+      candidates: [{
+        id: 'item-1', title: '模型更新', summary: '新增了工具调用能力。',
+        reason: '这是重要版本变化。', platform: 'Example', publishedAt: null,
+        sources: [{ id: 'item-1-source-1', platform: 'Example', publishedAt: null }],
+      }],
+      execution: { runId: 'digest-run-1', userId: 'user-1', runKind: 'digest' },
+    })).resolves.toEqual(response.items);
+
+    const body = JSON.parse(String((fetcher.mock.calls[0] as [string, RequestInit])[1].body));
+    expect(body.model).toBe('quality/model');
+    expect(body.plugins).toBeUndefined();
+    expect(body.messages[0].content).toContain('Never output, copy, infer, or invent a URL');
+    expect(ledger.records()).toEqual([expect.objectContaining({
+      task: 'digest_brief', status: 'succeeded',
+      execution: expect.objectContaining({ runKind: 'digest' }),
+    })]);
+  });
+
+  it('rejects digest citations that cross item source allowlists', async () => {
+    const fetcher = vi.fn().mockResolvedValue(openRouterResponse(JSON.stringify({ items: [{
+      id: 'item-1', conclusion: '中文结论。', evidence: '中文证据。',
+      uncertainty: '中文不确定性。', followUp: '中文后续关注。',
+      citationIds: ['item-2-source-1'],
+    }, {
+      id: 'item-2', conclusion: '另一条中文结论。', evidence: '另一条中文证据。',
+      uncertainty: '另一条中文不确定性。', followUp: '另一条中文后续关注。',
+      citationIds: ['item-2-source-1'],
+    }] })));
+
+    await expect(makeGateway(fetcher).composeDigestBriefs({
+      candidates: [{
+        id: 'item-1', title: '更新一', summary: '摘要一。', reason: '理由一。',
+        platform: 'Example', publishedAt: null,
+        sources: [{ id: 'item-1-source-1', platform: 'Example', publishedAt: null }],
+      }, {
+        id: 'item-2', title: '更新二', summary: '摘要二。', reason: '理由二。',
+        platform: 'Example', publishedAt: null,
+        sources: [{ id: 'item-2-source-1', platform: 'Example', publishedAt: null }],
+      }],
+    })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     {
       title: 'React 19.1 improves server rendering',
@@ -667,6 +736,7 @@ describe('OpenRouterAiGateway', () => {
   it.each([
     [429, 'AI_RATE_LIMITED', true],
     [401, 'AI_AUTH_FAILED', false],
+    [402, 'AI_CREDIT_EXHAUSTED', false],
     [404, 'AI_MODEL_UNAVAILABLE', false],
     [500, 'AI_UPSTREAM_UNAVAILABLE', true],
   ] as const)('maps HTTP %i to %s', async (status, code, retryable) => {

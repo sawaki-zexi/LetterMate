@@ -27,6 +27,9 @@
     "test:e2e:mobile": "playwright test --project=mobile",
     "test:e2e:compact-mobile": "playwright test --project=compact-mobile",
     "evaluate:quality": "tsx apps/worker/src/quality-evaluation.ts",
+    "evaluate:source-quality": "npm run evaluate:source-quality -w @lettermate/worker --",
+    "evaluate:interest-effects": "npm run evaluate:interest-effects -w @lettermate/worker",
+    "evaluate:semantic-recall": "npm run evaluate:semantic-recall -w @lettermate/worker",
     "ops:doctor": "tsx apps/api/src/ops-doctor-cli.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
@@ -57,7 +60,8 @@
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
     "vite": "^7.0.5",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "yaml": "^2.9.0"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.5",

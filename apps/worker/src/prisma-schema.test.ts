@@ -334,7 +334,7 @@ describe('multi-source Prisma schema', () => {
   });
 
   it('supports stable X creator accounts and content relationships', () => {
-    expect(schema).toContain('enum CreatorPlatform {\n  rss\n  x\n  bilibili\n}');
+      expect(schema).toContain('enum CreatorPlatform {\n  rss\n  x\n  bilibili\n  youtube\n  bluesky\n}');
     expect(fieldLine('CreatorSubscription', 'feedUrl')).toMatch(/^String\?/);
     expect(fieldNames('CreatorItem')).toEqual(expect.arrayContaining([
       'contentType', 'originalAuthorName', 'originalAuthorHandle', 'originalContentId',
@@ -347,6 +347,12 @@ describe('multi-source Prisma schema', () => {
     const bilibiliMigrationPath = join(process.cwd(), 'prisma', 'migrations', '20260807_bilibili_creator_support', 'migration.sql');
     const bilibiliMigration = existsSync(bilibiliMigrationPath) ? readFileSync(bilibiliMigrationPath, 'utf8') : '';
     expect(bilibiliMigration).toContain('ALTER TYPE "CreatorPlatform" ADD VALUE \'bilibili\';');
+    const youtubeMigrationPath = join(process.cwd(), 'prisma', 'migrations', '20260810_youtube_creator', 'migration.sql');
+    const youtubeMigration = existsSync(youtubeMigrationPath) ? readFileSync(youtubeMigrationPath, 'utf8') : '';
+    expect(youtubeMigration).toContain('ALTER TYPE "CreatorPlatform" ADD VALUE IF NOT EXISTS \'youtube\';');
+    const blueskyMigrationPath = join(process.cwd(), 'prisma', 'migrations', '20260810_bluesky_creator', 'migration.sql');
+    const blueskyMigration = existsSync(blueskyMigrationPath) ? readFileSync(blueskyMigrationPath, 'utf8') : '';
+    expect(blueskyMigration).toContain('ALTER TYPE "CreatorPlatform" ADD VALUE IF NOT EXISTS \'bluesky\';');
   });
 
   it('stores one user-owned feedback value per normalized content key', () => {
@@ -477,10 +483,12 @@ describe('multi-source Prisma schema', () => {
     expect(fieldNames('DigestRun')).toEqual(expect.arrayContaining([
       'userId', 'scheduledLocalDate', 'windowStart', 'windowEnd', 'status',
       'sentAt', 'providerMessageId', 'runLeaseUntil', 'attemptCount',
+      'briefGenerationStatus', 'briefGenerationVersion', 'briefGenerationErrorCode',
     ]));
     expect(uniqueConstraints('DigestRun')).toContainEqual(['userId', 'scheduledLocalDate']);
     expect(fieldNames('DigestItem')).toEqual(expect.arrayContaining([
       'runId', 'contentKey', 'position', 'title', 'summary', 'reason', 'sourceUrl',
+      'citationUrls', 'platform', 'publishedAt', 'evidence', 'uncertainty', 'followUp',
     ]));
 
     const migrationPath = join(
@@ -491,12 +499,28 @@ describe('multi-source Prisma schema', () => {
     expect(migration).toContain('CREATE TABLE "DigestPreference"');
     expect(migration).toContain('CREATE TABLE "DigestRun"');
     expect(migration).toContain('CREATE TABLE "DigestItem"');
+    const citationMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260810_digest_citations', 'migration.sql',
+    );
+    const citationMigration = existsSync(citationMigrationPath)
+      ? readFileSync(citationMigrationPath, 'utf8') : '';
+    expect(citationMigration).toContain('ADD COLUMN "citationUrls"');
+    expect(citationMigration).toContain('ADD COLUMN "platform"');
+    const generationMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260810_digest_brief_generation', 'migration.sql',
+    );
+    const generationMigration = existsSync(generationMigrationPath)
+      ? readFileSync(generationMigrationPath, 'utf8') : '';
+    expect(generationMigration).toContain('ALTER TYPE "AiRunKind" ADD VALUE \'digest\'');
+    expect(generationMigration).toContain('ALTER TYPE "AiTask" ADD VALUE \'digest_brief\'');
+    expect(generationMigration).toContain('ADD COLUMN "briefGenerationStatus"');
   });
 
   it('stores rebuildable profiles and versioned shadow recommendation decisions', () => {
     expect(modelNames()).toEqual(expect.arrayContaining([
       'UserInterestProfile', 'InterestProfileVersion',
-      'RecommendationDecision', 'RecommendationDecisionItem',
+      'RecommendationDecision', 'RecommendationDecisionItem', 'FeedImpression',
     ]));
     expect(fieldNames('UserInterestProfile')).toEqual(expect.arrayContaining([
       'userId', 'tagId', 'shortScore', 'longScore', 'negativeScore',
@@ -515,6 +539,12 @@ describe('multi-source Prisma schema', () => {
     expect(fieldNames('RecommendationDecisionItem')).toEqual(expect.arrayContaining([
       'decisionId', 'contentKey', 'position', 'lane', 'isExploration', 'reasonCodes',
     ]));
+    expect(fieldNames('FeedImpression')).toEqual(expect.arrayContaining([
+      'userId', 'decisionId', 'contentKey', 'position', 'surface', 'bucketStart', 'shownAt',
+    ]));
+    expect(uniqueConstraints('FeedImpression')).toContainEqual([
+      'userId', 'decisionId', 'contentKey', 'bucketStart',
+    ]);
 
     const migrationPath = join(
       process.cwd(), 'prisma', 'migrations',
@@ -527,6 +557,15 @@ describe('multi-source Prisma schema', () => {
     expect(migration).toContain('CREATE TABLE "RecommendationDecisionItem"');
     expect(migration).toContain(
       'CREATE UNIQUE INDEX "RecommendationDecision_userId_surface_requestKey_key"',
+    );
+    const impressionMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260810_feed_impressions', 'migration.sql',
+    );
+    const impressionMigration = existsSync(impressionMigrationPath)
+      ? readFileSync(impressionMigrationPath, 'utf8') : '';
+    expect(impressionMigration).toContain('CREATE TABLE "FeedImpression"');
+    expect(impressionMigration).toContain(
+      'FeedImpression_userId_decisionId_contentKey_bucketStart_key',
     );
   });
 

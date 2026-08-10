@@ -918,6 +918,22 @@ describe('TopicDiscoveryService multi-source orchestration', () => {
     expect(repository.saveFailure.mock.calls[0]?.[0]).not.toHaveProperty('schedule');
   });
 
+  it('makes an explicit non-retryable failure terminal on the first attempt', async () => {
+    const { service, repository, registry } = createOrchestration();
+    registry.search.mockRejectedValue(
+      new AiGatewayError('AI_AUTH_FAILED', 'Authentication failed', false),
+    );
+
+    await expect(service.run(
+      'topic-1', 'user-1', 'scheduled', { finalAttempt: false },
+    )).rejects.toMatchObject({ code: 'AI_AUTH_FAILED' });
+
+    expect(repository.saveFailure).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+      schedule: expect.objectContaining({ scheduleIntervalHours: 24 }),
+    }));
+  });
+
   it('does not start a run for a topic owned by another user', async () => {
     const { service, repository, gateway } = createOrchestration();
     repository.findOwnedTopic.mockResolvedValue(null);

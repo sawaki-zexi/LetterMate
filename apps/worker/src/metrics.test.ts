@@ -33,6 +33,16 @@ describe('Worker metrics', () => {
       outputCount: 3,
       failureCount: 1,
     });
+    metrics.recordSourceAttempt({ source: 'github', sourceType: 'code', result: 'success' });
+    metrics.recordSourceItems({
+      source: 'github', sourceType: 'code', outcome: 'retrieved', count: 7,
+    });
+    metrics.recordSourceItems({
+      source: 'github', sourceType: 'code', outcome: 'accepted', count: 2,
+    });
+    metrics.recordSourceAttempt({
+      source: 'private user@example.com', sourceType: 'web', result: 'failure',
+    });
 
     const output = await metrics.render();
     expect(output).toContain(
@@ -42,6 +52,12 @@ describe('Worker metrics', () => {
     expect(output).toContain('queue="unknown",result="failed",code="unknown"');
     expect(output).not.toContain('secret.example.com');
     expect(output).toContain('component="topic",stage="quality_gate"');
+    expect(output).toContain(
+      'lettermate_worker_source_attempts_total{source="github",source_type="code",result="success",code="none"} 1',
+    );
+    expect(output).toContain('source="github",source_type="code",outcome="retrieved"} 7');
+    expect(output).toContain('source="github",source_type="code",outcome="accepted"} 2');
+    expect(output).toContain('source="unknown",source_type="web",result="failure",code="none"');
     expect(output).not.toContain('runId');
   });
 

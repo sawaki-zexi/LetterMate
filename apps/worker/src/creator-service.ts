@@ -14,9 +14,11 @@ import type {
   CreatorArchiveLocalizationCandidate,
 } from './ai-gateway.js';
 import { RssConnector } from './connectors/rss.js';
-import type { ConnectorResult, SourceQueryPlan } from './connectors/types.js';
+import type { ConnectorDegradation, ConnectorResult, SourceQueryPlan } from './connectors/types.js';
 import { XCreatorConnector } from './connectors/x-creator.js';
 import { BilibiliCreatorConnector } from './connectors/bilibili-creator.js';
+import { YouTubeCreatorConnector } from './connectors/youtube-creator.js';
+import { BlueskyCreatorConnector } from './connectors/bluesky-creator.js';
 import { QualityPipeline } from './quality-pipeline.js';
 import { buildKeywordPolicy } from './keyword-policy.js';
 import { ContentFetcher } from './content-fetcher.js';
@@ -24,10 +26,35 @@ import type { ContentInterestTagger } from './content-interest-tagger.js';
 import type { AiExecutionContext } from './ai-runtime.js';
 import type { RunStageManager } from './run-stage.js';
 import { isChineseContent } from './chinese-content.js';
+import {
+  recordSourceAttemptSafely,
+  type SourceFunnelSink,
+} from './source-observability.js';
+import { isExplicitlyNonRetryable } from './retry-policy.js';
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const ARCHIVE_LOCALIZATION_BATCH_SIZE = 8;
 const ARCHIVE_LOCALIZATION_BACKFILL_LIMIT = 30;
+const CREATOR_PARTIAL_SYNC_ERROR: SafeError = {
+  code: 'CREATOR_PARTIAL_SYNC',
+  message: '部分来源暂时不可用，已保留可用内容',
+};
+
+const creatorSourceIdentity = (platform: CreatorSubscription['platform']) => {
+  if (platform === 'x') {
+    return { source: 'twitterapi-io-x-creator', sourceType: 'social' as const };
+  }
+  if (platform === 'bilibili') {
+    return { source: 'bilibili-creator', sourceType: 'feed' as const };
+  }
+  if (platform === 'youtube') {
+    return { source: 'youtube-creator', sourceType: 'video' as const };
+  }
+  if (platform === 'bluesky') {
+    return { source: 'bluesky-creator', sourceType: 'social' as const };
+  }
+  return { source: 'rss', sourceType: 'feed' as const };
+};
 
 export interface CreatorRunClaim {
   state: 'claimed' | 'active' | 'missing';
@@ -51,6 +78,7 @@ export interface CreatorRepository {
     candidates: ValidatedSourceCandidate[];
     items: DiscoveryCandidate[];
     archiveLocalizations: CreatorArchiveLocalization[];
+    degradations?: ConnectorDegradation[];
     identity?: { displayName: string; profileUrl: string; handle: string | null };
     finishedAt: Date;
   }): Promise<number>;
@@ -81,10 +109,12 @@ export interface CreatorDiscoveryServiceOptions {
     search(plan: SourceQueryPlan, signal: AbortSignal): Promise<ConnectorResult>;
   };
   twitterApiKey?: string | undefined;
+  youtubeApiKey?: string | undefined;
   timeoutMs?: number;
   now?: () => Date;
   interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>;
   stageManager?: RunStageManager;
+  sourceTelemetry?: SourceFunnelSink;
 }
 
 export class CreatorDiscoveryService {
@@ -99,6 +129,12 @@ export class CreatorDiscoveryService {
       }
       if (creator.platform === 'bilibili') {
         return new BilibiliCreatorConnector({ mid: creator.accountKey });
+      }
+      if (creator.platform === 'youtube') {
+        return new YouTubeCreatorConnector({ apiKey: options.youtubeApiKey, channelId: creator.accountKey });
+      }
+      if (creator.platform === 'bluesky') {
+        return new BlueskyCreatorConnector({ did: creator.accountKey });
       }
       if (!creator.feedUrl) throw new Error('RSS creator is missing a feed URL');
       return new RssConnector({ feedUrls: [creator.feedUrl], maxEntriesPerFeed: 30 });
@@ -125,17 +161,46 @@ export class CreatorDiscoveryService {
         keyword: claim.creator.displayName,
         expandedTerms: [],
         queries: [claim.creator.displayName],
-        sourceTypes: [claim.creator.platform === 'x' ? 'social' : 'feed'],
+        sourceTypes: [claim.creator.platform === 'x' || claim.creator.platform === 'bluesky'
+          ? 'social'
+          : claim.creator.platform === 'youtube' ? 'video' : 'feed'],
         windowStart: windowStart.toISOString(),
         windowEnd: windowEnd.toISOString(),
         maxCandidates: 30,
         matchPolicy: buildKeywordPolicy(claim.creator.displayName),
       };
-      const [result, historyUrls, archiveBackfill] = await Promise.all([
-        this.runStage(
-          execution, 'retrieve', { creatorId: creator.id, plan },
-          () => this.createConnector(creator).search(plan, controller.signal),
-        ),
+      const sourceIdentity = creatorSourceIdentity(creator.platform);
+      let connector: ReturnType<NonNullable<CreatorDiscoveryServiceOptions['createConnector']>>;
+      try {
+        connector = this.createConnector(creator);
+      } catch (error) {
+        recordSourceAttemptSafely(this.options.sourceTelemetry, {
+          ...sourceIdentity,
+          result: 'failure',
+          code: 'CREATOR_CONNECTOR_FAILED',
+        });
+        throw error;
+      }
+      const retrieval = this.runStage(
+        execution, 'retrieve', { creatorId: creator.id, plan },
+        () => connector.search(plan, controller.signal),
+      ).then((result) => {
+        const candidates = result.candidates.map((candidate) => validateSourceCandidate(candidate));
+        recordSourceAttemptSafely(this.options.sourceTelemetry, {
+          ...sourceIdentity,
+          result: 'success',
+        });
+        return { result, candidates };
+      }).catch((error: unknown) => {
+        recordSourceAttemptSafely(this.options.sourceTelemetry, {
+          ...sourceIdentity,
+          result: 'failure',
+          code: 'CREATOR_CONNECTOR_FAILED',
+        });
+        throw error;
+      });
+      const [{ result, candidates }, historyUrls, archiveBackfill] = await Promise.all([
+        retrieval,
         this.options.repository.listHistoryUrls(claim.creator.id),
         this.options.repository.listArchiveItemsNeedingLocalization(
           claim.creator.id,
@@ -143,7 +208,6 @@ export class CreatorDiscoveryService {
         ),
       ]);
       if (controller.signal.aborted) throw new Error('Creator run timed out');
-      const candidates = result.candidates.map((candidate) => validateSourceCandidate(candidate));
       const items = await this.runStage(
         execution, 'quality_gate', { keyword: creator.displayName, plan, candidates, historyUrls },
         () => this.options.qualityPipeline.run({
@@ -192,18 +256,20 @@ export class CreatorDiscoveryService {
         candidates,
         items,
         archiveLocalizations,
+        ...(result.degradations ? { degradations: result.degradations } : {}),
         ...(result.identity ? { identity: result.identity } : {}),
         finishedAt,
       });
       await this.options.interestTagger?.tagCandidates(items, controller.signal, execution);
     } catch (error) {
+      const terminalFailure = context.finalAttempt || isExplicitlyNonRetryable(error);
       await this.options.repository.saveFailure({
         runId: claim.runId,
         creatorId: claim.creator.id,
         userId: claim.creator.userId,
         error: safeError(error),
         finishedAt: this.now(),
-        status: context.finalAttempt ? 'failed' : 'queued',
+        status: terminalFailure ? 'failed' : 'queued',
         trigger: parsed.trigger,
       });
       throw error;
@@ -416,6 +482,7 @@ export class PrismaCreatorRepository implements CreatorRepository {
     runId: string; creatorId: string; userId: string; trigger: DiscoveryTrigger;
     candidates: ValidatedSourceCandidate[]; items: DiscoveryCandidate[];
     archiveLocalizations: CreatorArchiveLocalization[]; finishedAt: Date;
+    degradations?: ConnectorDegradation[];
     identity?: { displayName: string; profileUrl: string; handle: string | null };
   }): Promise<number> {
     return this.prisma.$transaction(async (transaction) => {
@@ -481,9 +548,23 @@ export class PrismaCreatorRepository implements CreatorRepository {
         });
         if (!existing.has(source.canonicalUrl)) inserted += 1;
       }
+      const degraded = (input.degradations?.length ?? 0) > 0;
+      const finalStatus = degraded ? 'degraded' : 'succeeded';
+      const safePartialError = degraded ? CREATOR_PARTIAL_SYNC_ERROR : null;
+      const degradedSources = input.degradations?.length
+        ? input.degradations.map((source) => ({ ...source })) as Prisma.InputJsonValue
+        : Prisma.DbNull;
       await transaction.creatorRun.update({
         where: { id: input.runId },
-        data: { status: 'succeeded', finishedAt: input.finishedAt, candidateCount: input.candidates.length, acceptedCount: input.items.length, newItemCount: inserted },
+        data: {
+          status: finalStatus,
+          finishedAt: input.finishedAt,
+          candidateCount: input.candidates.length,
+          acceptedCount: input.items.length,
+          newItemCount: inserted,
+          degradedSources,
+          error: safePartialError ?? Prisma.DbNull,
+        },
       });
       await transaction.creatorSubscription.update({
         where: { id: input.creatorId },
@@ -492,12 +573,13 @@ export class PrismaCreatorRepository implements CreatorRepository {
             displayName: input.identity.displayName,
             profileUrl: input.identity.profileUrl,
           } : {}),
-          runStatus: 'succeeded',
+          runStatus: finalStatus,
           activeRunId: null,
           runLeaseUntil: null,
           lastRunAt: input.finishedAt,
           nextRunAt: new Date(input.finishedAt.getTime() + DAY_MS),
-          lastError: Prisma.DbNull,
+          lastError: safePartialError ?? Prisma.DbNull,
+          degradedSources,
         },
       });
       return inserted;
@@ -519,7 +601,12 @@ export class PrismaCreatorRepository implements CreatorRepository {
       if (ownership.count !== 1) return;
       await transaction.creatorRun.update({
         where: { id: input.runId },
-        data: { status: input.status, finishedAt: input.finishedAt, error: input.error },
+        data: {
+          status: input.status,
+          finishedAt: input.finishedAt,
+          error: input.error,
+          degradedSources: Prisma.DbNull,
+        },
       });
       await transaction.creatorSubscription.update({
         where: { id: input.creatorId },
@@ -528,6 +615,7 @@ export class PrismaCreatorRepository implements CreatorRepository {
           lastRunAt: input.finishedAt,
           nextRunAt: new Date(input.finishedAt.getTime() + DAY_MS),
           lastError: input.error,
+          degradedSources: Prisma.DbNull,
         },
       });
     });
@@ -539,16 +627,20 @@ export function createCreatorDiscoveryService(
   gateway: Pick<AiGateway, 'evaluateCandidates' | 'composeItems' | 'localizeCreatorItems'>,
   timeoutMs: number,
   twitterApiKey?: string,
+  youtubeApiKey?: string,
   interestTagger?: Pick<ContentInterestTagger, 'tagCandidates'>,
   stageManager?: RunStageManager,
+  sourceTelemetry?: SourceFunnelSink,
 ): CreatorDiscoveryService {
   return new CreatorDiscoveryService({
     repository: new PrismaCreatorRepository(prisma),
-    qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway),
+    qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway, sourceTelemetry),
     archiveLocalizer: gateway,
     timeoutMs,
     twitterApiKey,
+    youtubeApiKey,
     ...(interestTagger ? { interestTagger } : {}),
     ...(stageManager ? { stageManager } : {}),
+    ...(sourceTelemetry ? { sourceTelemetry } : {}),
   });
 }

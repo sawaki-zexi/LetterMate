@@ -82,6 +82,7 @@ LetterMate 不向用户展示可信分数、来源排名、证据数量、内部
 | Feed 与社区 | RSS/Atom、Hacker News、Reddit | RSS 需要 URL；Reddit 需要 OAuth 凭据 |
 | 研究与代码 | arXiv、GitHub | arXiv 无 Key；GitHub Token 可选 |
 | 视频 | YouTube、Bilibili | YouTube 需要 Key；Bilibili 无 Key |
+| 社交博主 | X、Bluesky | X 需要 TwitterAPI.io Key；Bluesky 无 Key |
 | 通用搜索 | Brave-compatible Search、Tavily、国内 Bing | Brave/Tavily 需要 Key；国内 Bing 无 Key |
 
 趋势输入包括 X Trends、Hacker News Top Stories、YouTube Most Popular、指定 Reddit 社区 Hot、Bilibili 热门和 Google Trends RSS。趋势输入只提供 `TrendSeed`；进入 Feed 前仍必须经过主发现和质量管线。
@@ -293,6 +294,9 @@ Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend|creator`、`k
 | `npm run typecheck` | TypeScript project references 检查 |
 | `npm test` | Vitest 单元与集成测试 |
 | `npm run evaluate:quality` | 运行离线 Agent golden fixtures 质量门槛 |
+| `npm run evaluate:source-quality -- http://127.0.0.1:9090 24` | 从 Prometheus 评估最近 24 小时来源漏斗和窗口完整性 |
+| `npm run evaluate:interest-effects -- YYYY-MM-DD` | 汇总指定 UTC 日的曝光、显式反馈与订阅保护效果 |
+| `npm run evaluate:semantic-recall -- YYYY-MM-DD 14` | 以指定日期为末日运行 14 天 rolling-split 标签召回准入评估 |
 | `npm run ops:doctor` | 脱敏检查配置和可用来源，不访问外部服务 |
 | `npm run ops:doctor -- live` | 额外探测 PostgreSQL 与 Redis |
 | `npm run build` | 构建 Web、API 与 Worker |
@@ -321,6 +325,14 @@ $env:RUN_LIVE_BILIBILI_TESTS='1'
 $env:BILIBILI_LIVE_MID='目标 UP 主 mid'
 npm test -- apps/worker/src/bilibili-creator.live.test.ts
 
+$env:RUN_LIVE_YOUTUBE_TESTS='1'
+$env:YOUTUBE_LIVE_CHANNEL_ID='目标频道 channelId'
+npm test -- apps/worker/src/youtube-creator.live.test.ts
+
+$env:RUN_LIVE_BLUESKY_TESTS='1'
+$env:BLUESKY_LIVE_DID='目标账号 DID'
+npm test -- apps/worker/src/bluesky-creator.live.test.ts
+
 $env:RUN_LIVE_EMAIL_TESTS='1'
 npm test -- apps/worker/src/smtp-email.live.test.ts
 ```
@@ -329,18 +341,27 @@ SMTP live smoke 还需要完整 SMTP 配置和 `SMTP_SMOKE_RECIPIENT`。普通 S
 
 数据库备份默认写入 `.backups/postgres`，保留最近 14 天的全部备份、随后 8 周每周最新一份、再保留 12 个月每月最新一份。只有文件与清单均有效的完整备份会参与自动清理；恢复验证始终使用独立数据库，并拒绝 `lettermate`、`postgres`、`template0` 和 `template1`。生产主库恢复不提供自动覆盖命令，必须在停机、外部备份可用和人工审批后按运行手册执行。
 
+生产 Compose 提供可选的本地 Prometheus 基线：
+
+```powershell
+docker compose -f infra/compose.production.example.yaml --profile monitoring config --quiet
+docker compose -f infra/compose.production.example.yaml --profile monitoring up -d prometheus
+```
+
+Prometheus 默认只绑定 `127.0.0.1:9090`。通知渠道和 Alertmanager 由目标环境提供，仓库不保存通知凭据；完整校验和接入步骤见 [运行手册](./docs/operations-runbook.md)。
+
 ## 项目状态
 
 已实现：
 
 - Topic 与趋势两条持久化发现管线。
-- RSS/Atom、X 与 Bilibili 博主关注；Bilibili 支持公开视频、公开动态、专栏和带原帖上下文的转发动态。
+- RSS/Atom、X、Bilibili、YouTube 与 Bluesky 博主关注；YouTube 固定 `channelId` 并同步 uploads playlist，Bilibili 支持公开视频、公开动态、专栏和带原帖上下文的转发动态，Bluesky 固定 DID 并同步原创、引用、转发和带父帖上下文的回复。
 - 可审计兴趣事件、版本化内容标签、短期/长期/负向画像和个性化 Feed 排序。
-- 相邻兴趣探索、每日邮件预览、调度、重试和可选生产 SMTP 投递。
+- 对现有候选的相邻兴趣识别、约 10% 探索编排，以及每日邮件预览、调度、重试和可选生产 SMTP 投递。
 - 14 个主发现连接器和 6 个趋势输入。
 - 调度、租约恢复、幂等刷新和运行摘要。
 - API 统一 `x-trace-id`、脱敏结构化请求日志、Worker 队列快照与任务/连接器失败事件。
-- API `/metrics` 与 Worker `:9464/metrics` 的低基数 Prometheus 指标，覆盖请求、队列、任务和 Agent 阶段。
+- API `/metrics` 与 Worker `:9464/metrics` 的低基数 Prometheus 指标，覆盖请求、队列、任务、Agent 阶段，以及按稳定连接器聚合的来源尝试、拒绝原因和最终精选贡献。
 - API 存活/就绪检查、依赖异常 503、SIGINT/SIGTERM 优雅退出，以及 API/Worker/Web 容器与一次性迁移 Compose 基线。
 - 脱敏 `ops:doctor` 配置/依赖诊断，以及密钥轮换、配额、告警与故障恢复手册。
 - PostgreSQL custom-format 备份、SHA-256 清单、14 日/8 周/12 月分层保留和隔离恢复验证。
@@ -351,7 +372,7 @@ SMTP live smoke 还需要完整 SMTP 配置和 `SMTP_SMOKE_RECIPIENT`。普通 S
 
 - 在生产环境配置 `SESSION_SECRET`、`CSRF_SECRET`，并设置 `ALLOW_DEV_IDENTITY=false`。真实登录、服务端会话和 CSRF 已实现；开发环境默认保留 `ALLOW_DEV_IDENTITY=true` 以兼容本地调试。
 - 在目标环境逐一验证外部连接器、配额、限流和故障恢复。
-- 将结构化日志和队列快照接入目标环境的指标聚合与告警。
+- 将仓库内 Prometheus 规则和结构化日志接入目标环境的 Alertmanager、通知渠道与日志聚合。
 - 在目标环境完成 TLS 入口、秘密存储、容量基线和部署演练。
 - 为数据库备份配置定时任务、加密外部副本和周期恢复演练，并建立部署、主库恢复审批、密钥轮换和安全响应流程。
 

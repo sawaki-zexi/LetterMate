@@ -10,10 +10,11 @@ export const aiTasks = [
   'item_chinese_repair',
   'creator_localization',
   'interest_tagging',
+  'digest_brief',
 ] as const;
 
 export type AiTask = typeof aiTasks[number];
-export type AiRunKind = 'topic' | 'trend' | 'creator';
+export type AiRunKind = 'topic' | 'trend' | 'creator' | 'digest';
 
 export interface AiExecutionContext {
   runId: string;
@@ -161,6 +162,7 @@ export function createAiRuntimePolicy(input: AiRuntimePolicyInput): AiRuntimePol
     item_chinese_repair: localizationModel,
     creator_localization: localizationModel,
     interest_tagging: fastModel,
+    digest_brief: qualityModel,
   };
   const routeInput = aiTasks.map((task) => ({
     task,

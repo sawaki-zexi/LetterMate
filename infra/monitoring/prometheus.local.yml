@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: lettermate-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: [host.docker.internal:3000]
+
+  - job_name: lettermate-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: [host.docker.internal:9464]

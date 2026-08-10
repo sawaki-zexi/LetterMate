@@ -21,6 +21,12 @@ const claimedRun = (): ClaimedDigestRun => ({
     summary: '冻结摘要',
     reason: '冻结理由',
     sourceUrl: 'https://example.com/1',
+    citationUrls: ['https://example.com/1'],
+    platform: 'Example',
+    publishedAt: null,
+    evidence: '冻结理由',
+    uncertainty: '仍需核验原文。',
+    followUp: '继续关注后续更新。',
   }],
 });
 

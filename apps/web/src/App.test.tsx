@@ -248,7 +248,7 @@ function installFetchMock({
         profileUrl: candidate?.profileUrl ?? body.url,
         feedUrl: candidate?.feedUrl ?? body.url,
         createdAt: now.toISOString(), pausedAt: null,
-        lastRunAt: null, nextRunAt: null, runStatus: 'queued', lastError: null, lastRun: null,
+        lastRunAt: null, nextRunAt: null, runStatus: 'queued', lastError: null, degradedSources: [], lastRun: null,
       };
       currentCreators = [creator, ...currentCreators];
       return Response.json(body.resolutionTokens ? [creator] : creator, { status: 202 });
@@ -995,7 +995,7 @@ describe('discovery workspace', () => {
       id: 'creator-1', userId: 'user-a', platform: 'x', displayName: 'Example Engineering',
       profileUrl: 'https://x.com/example', feedUrl: null, createdAt: now.toISOString(),
       pausedAt: null, lastRunAt: now.toISOString(), nextRunAt: null, runStatus: 'succeeded',
-      lastError: null, lastRun: null,
+      lastError: null, degradedSources: [], lastRun: null,
     };
     const common: Omit<CreatorItem, 'id' | 'title' | 'contentType' | 'feedEligible'> = {
       creatorId: creator.id,
@@ -1111,6 +1111,8 @@ describe('discovery workspace', () => {
         { id: 'rss', label: 'RSS/Atom', status: 'enabled' },
         { id: 'x', label: 'X', status: 'enabled' },
         { id: 'bilibili', label: 'Bilibili', status: 'enabled' },
+        { id: 'youtube', label: 'YouTube', status: 'not_configured' },
+        { id: 'bluesky', label: 'Bluesky', status: 'enabled' },
       ],
       creatorCandidates: [{
         resolutionToken: 'b'.repeat(32),
@@ -1135,11 +1137,30 @@ describe('discovery workspace', () => {
     expect(screen.getByLabelText('选择 影视飓风 Bilibili')).toBeChecked();
     expect(screen.getByText('UID 946974')).toBeVisible();
     expect(screen.getAllByText('Bilibili').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('YouTube')).toBeVisible();
+    expect(screen.getByText('未配置')).toBeVisible();
+    expect(screen.getByText('Bluesky')).toBeVisible();
     const avatar = document.querySelector<HTMLImageElement>('img[src="https://i0.hdslb.com/avatar.jpg"]');
     expect(avatar).toHaveAttribute('referrerpolicy', 'no-referrer');
     fireEvent.error(avatar!);
     expect(document.querySelector('img[src="https://i0.hdslb.com/avatar.jpg"]')).not.toBeInTheDocument();
     expect(document.querySelector('.creator-candidate__avatar')).toBeInTheDocument();
+  });
+
+  it('shows a degraded creator sync and keeps manual refresh available', async () => {
+    const creator: Creator = {
+      id: 'creator-degraded', userId: 'user-a', platform: 'bilibili', displayName: '影视飓风',
+      profileUrl: 'https://space.bilibili.com/946974', feedUrl: null,
+      createdAt: now.toISOString(), pausedAt: null, lastRunAt: now.toISOString(), nextRunAt: now.toISOString(),
+      runStatus: 'degraded', lastError: { code: 'CREATOR_PARTIAL_SYNC', message: '部分来源暂时不可用，已保留可用内容' },
+      degradedSources: [{ source: 'dynamic', code: 'CONNECTOR_ACCESS_RESTRICTED', retryable: true }], lastRun: null,
+    };
+    installFetchMock({ creators: [creator] });
+    renderApp('/creators');
+
+    expect(await screen.findByText('部分同步')).toBeVisible();
+    expect(screen.getByText('动态流 暂不可用，已保留可用内容')).toBeVisible();
+    expect(screen.getByLabelText('立即同步 影视飓风')).toBeEnabled();
   });
 
   it('edits only the main keyword and lets the worker regenerate variants', async () => {
@@ -1274,6 +1295,19 @@ describe('discovery workspace', () => {
           reason: '包含重要版本变化。',
           sourceUrl: 'https://example.com/digest-item',
           publishedAt: now.toISOString(),
+          platform: 'OpenAI',
+          brief: {
+            conclusion: '已持久化的中文摘要。',
+            evidence: '包含重要版本变化。',
+            uncertainty: '仍需核验完整原文。',
+            followUp: '继续关注兼容性更新。',
+          },
+          citations: [{
+            contentKey: 'https://example.com/digest-item',
+            url: 'https://example.com/digest-item',
+            platform: 'OpenAI',
+            publishedAt: now.toISOString(),
+          }],
         }],
       },
     });
@@ -1284,9 +1318,10 @@ describe('discovery workspace', () => {
     expect(screen.getByText(/下次发送：2026-08-09 08:00/)).toBeVisible();
     expect(screen.getByText('已发送')).toBeVisible();
     expect(screen.getByText('4 条内容')).toBeVisible();
-    expect(screen.getByRole('link', { name: '查看原文' })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: /OpenAI/ })).toHaveAttribute(
       'href', 'https://example.com/digest-item',
     );
+    expect(screen.getByText('仍需核验完整原文。')).toBeVisible();
     expect(screen.queryByText(/tag-|置信度|收件地址|内部排序/i)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('checkbox', { name: '每日邮件' }));

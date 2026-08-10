@@ -6,6 +6,10 @@ import {
   type SourceQueryPlan,
 } from './types.js';
 import { type ValidatedSourceCandidate, validateSourceCandidate } from '@lettermate/domain';
+import {
+  recordSourceAttemptSafely,
+  type SourceFunnelSink,
+} from '../source-observability.js';
 
 interface ValidatedConnectorResult {
   candidates: ValidatedSourceCandidate[];
@@ -16,6 +20,7 @@ export interface ConnectorRegistryOptions {
   concurrency: number;
   timeoutMs: number;
   onFailure?: (failure: ConnectorFailure) => void;
+  sourceTelemetry?: SourceFunnelSink;
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> => {
@@ -220,9 +225,17 @@ export class ConnectorRegistry {
     const failures: ConnectorFailure[] = [];
     for (const [index, result] of results.entries()) {
       if (result === undefined) continue;
+      const connector = this.connectors[index];
+      if (connector !== undefined) {
+        recordSourceAttemptSafely(this.options.sourceTelemetry, {
+          source: connector.id,
+          sourceType: connector.sourceType,
+          result: 'candidates' in result ? 'success' : 'failure',
+          ...('candidates' in result ? {} : { code: result.code }),
+        });
+      }
       if ('candidates' in result) {
         candidateLists.push(result.candidates);
-        const connector = this.connectors[index];
         if (connector !== undefined) successfulConnectorIds.push(connector.id);
       } else {
         failures.push(result);

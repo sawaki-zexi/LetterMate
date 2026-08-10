@@ -39,6 +39,8 @@ const defaultPreference = (): DigestPreference => ({
   localTime: '08:00',
   timezone: 'Asia/Shanghai',
 });
+const DIGEST_UNCERTAINTY = '邮件摘要仅基于已验证的原始来源，不替代对完整原文的独立核验。';
+const DIGEST_FOLLOW_UP = '打开原文核验关键细节，并继续关注后续更新或独立来源。';
 
 export class MemoryDigestPreferenceStore implements DigestPreferenceStore {
   constructor(private readonly facts: () => MemoryDigestFacts) {}
@@ -237,7 +239,10 @@ export class DefaultDigestService implements DigestService {
       generatedAt: generatedAt.toISOString(),
       items: selection.ranked.slice(0, 10).flatMap((ranked) => {
         const item = itemByKey.get(ranked.contentKey);
-        const sourceUrl = item?.sourceUrls[0];
+        const citationUrls = [...new Set(item?.sourceUrls.filter((url) => {
+          try { return ['http:', 'https:'].includes(new URL(url).protocol); } catch { return false; }
+        }) ?? [])];
+        const sourceUrl = citationUrls[0];
         return item && sourceUrl ? [{
           contentKey: item.contentKey,
           title: item.title,
@@ -245,6 +250,19 @@ export class DefaultDigestService implements DigestService {
           reason: item.reason,
           sourceUrl,
           publishedAt: item.publishedAt,
+          platform: item.platform,
+          brief: {
+            conclusion: item.summary,
+            evidence: item.reason,
+            uncertainty: DIGEST_UNCERTAINTY,
+            followUp: DIGEST_FOLLOW_UP,
+          },
+          citations: citationUrls.map((url) => ({
+            contentKey: item.contentKey,
+            url,
+            platform: item.platform,
+            publishedAt: item.publishedAt,
+          })),
         }] : [];
       }),
     });

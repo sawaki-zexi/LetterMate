@@ -1,5 +1,6 @@
 import {
   creatorFeedItemSchema,
+  creatorDegradedSourceSchema,
   contentFeedbackSchema,
   creatorItemSchema,
   creatorSchema,
@@ -18,6 +19,8 @@ import {
   type DiscoveryItem,
   type DiscoveryKind,
   type FeedItem,
+  type FeedImpressionInput,
+  type FeedImpressionReceipt,
   type FeedRecommendation,
   type FeedbackValue,
   type FeedOrigin,
@@ -95,6 +98,10 @@ export interface TopicStore {
     userId: string,
     filter: FeedStoreFilter,
   ): Promise<FeedItem[]>;
+  recordFeedImpressions(
+    userId: string,
+    input: FeedImpressionInput,
+  ): Promise<FeedImpressionReceipt | null>;
   setFeedback(
     userId: string,
     contentKey: string,
@@ -124,7 +131,7 @@ export interface TopicUpdate {
 }
 
 export interface CreatorCreateInput {
-  platform: 'rss' | 'x' | 'bilibili';
+  platform: 'rss' | 'x' | 'bilibili' | 'youtube' | 'bluesky';
   accountKey: string;
   displayName: string;
   profileUrl: string;
@@ -194,7 +201,7 @@ function mapRunSummary(
     status: run.status,
     startedAt: run.startedAt.toISOString(),
     finishedAt: unfinished ? null : run.finishedAt?.toISOString() ?? null,
-    newItemCount: run.status === 'succeeded' ? run.newItemCount : null,
+    newItemCount: run.status === 'succeeded' || run.status === 'degraded' ? run.newItemCount : null,
   });
 }
 
@@ -319,7 +326,7 @@ export class PrismaTopicStore implements TopicStore {
         const item = itemByKey.get(ranked.contentKey);
         if (!item) return [];
         itemByKey.delete(ranked.contentKey);
-        return [{ ...item, recommendation: publicRecommendation(ranked) }];
+        return [{ ...item, recommendation: publicRecommendation(ranked, selection.decisionId) }];
       });
       return [...personalized, ...itemByKey.values()];
     } catch {
@@ -446,6 +453,7 @@ export class PrismaTopicStore implements TopicStore {
                 nextRunAt: null,
                 runStatus: 'queued',
                 lastError: Prisma.DbNull,
+                degradedSources: Prisma.DbNull,
               },
               include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
             })
@@ -519,7 +527,13 @@ export class PrismaTopicStore implements TopicStore {
         where: { id },
         data: input.paused
           ? { pausedAt: occurredAt, nextRunAt: null }
-          : { pausedAt: null, nextRunAt: null, runStatus: 'succeeded', lastError: Prisma.DbNull },
+          : {
+            pausedAt: null,
+            nextRunAt: null,
+            runStatus: 'succeeded',
+            lastError: Prisma.DbNull,
+            degradedSources: Prisma.DbNull,
+          },
         include: { runs: { orderBy: [{ startedAt: 'desc' }, { id: 'desc' }], take: 1 } },
       });
       await appendInterestEvent(transaction, {
@@ -581,8 +595,8 @@ export class PrismaTopicStore implements TopicStore {
         return { creator: mapCreator(creator), shouldEnqueue: false };
       }
       const updated = await transaction.creatorSubscription.updateMany({
-        where: { id, userId, cancelledAt: null, runStatus: { in: ['succeeded', 'failed'] } },
-        data: { runStatus: 'queued', lastError: Prisma.DbNull },
+        where: { id, userId, cancelledAt: null, runStatus: { in: ['succeeded', 'degraded', 'failed'] } },
+        data: { runStatus: 'queued', lastError: Prisma.DbNull, degradedSources: Prisma.DbNull },
       });
       creator = await transaction.creatorSubscription.findFirstOrThrow({
         where: { id, userId, cancelledAt: null },
@@ -1019,6 +1033,43 @@ export class PrismaTopicStore implements TopicStore {
     });
   }
 
+  async recordFeedImpressions(
+    userId: string,
+    input: FeedImpressionInput,
+  ): Promise<FeedImpressionReceipt | null> {
+    const contentKeys = [...new Set(input.contentKeys.map((key) => canonicalizeUrl(key)))];
+    return this.prisma.$transaction(async (transaction) => {
+      const decision = await transaction.recommendationDecision.findFirst({
+        where: { id: input.decisionId, userId, surface: 'feed' },
+        include: {
+          items: {
+            where: { contentKey: { in: contentKeys } },
+            select: { contentKey: true, position: true },
+          },
+        },
+      });
+      if (!decision || decision.items.length !== contentKeys.length) return null;
+
+      const now = new Date();
+      const bucketStart = new Date(now);
+      bucketStart.setUTCSeconds(0, 0);
+      const positions = new Map(decision.items.map((item) => [item.contentKey, item.position]));
+      const result = await transaction.feedImpression.createMany({
+        data: contentKeys.map((contentKey) => ({
+          userId,
+          decisionId: decision.id,
+          contentKey,
+          position: positions.get(contentKey)!,
+          surface: 'feed' as const,
+          bucketStart,
+          shownAt: now,
+        })),
+        skipDuplicates: true,
+      });
+      return { recorded: result.count };
+    });
+  }
+
   async listInterestEvents(userId: string): Promise<InterestEvent[]> {
     const events = await this.prisma.interestEvent.findMany({
       where: { userId },
@@ -1235,6 +1286,8 @@ export class MemoryTopicStore implements TopicStore {
   private readonly items: Array<DiscoveryItem & { topicKeyword: string }> = [];
   private readonly radarItems: Array<TrendFeedItem & { userId: string }> = [];
   private readonly feedback = new Map<string, FeedbackValue>();
+  private readonly feedDecisions = new Map<string, Set<string>>();
+  private readonly feedImpressions = new Set<string>();
   private readonly interestEvents: InterestEvent[] = [];
   private readonly pendingManualRefreshes = new Set<string>();
   private readonly trendMonitors = new Map<string, TrendStatus & {
@@ -1258,12 +1311,13 @@ export class MemoryTopicStore implements TopicStore {
         asOf: this.now(),
       });
       if (!selection.personalizationEnabled) return items;
+      this.rememberFeedDecision(userId, selection.decisionId, selection.ranked.map((item) => item.contentKey));
       const itemByKey = new Map(items.map((item) => [item.contentKey, item]));
       const personalized = selection.ranked.flatMap((ranked) => {
         const item = itemByKey.get(ranked.contentKey);
         if (!item) return [];
         itemByKey.delete(ranked.contentKey);
-        return [{ ...item, recommendation: publicRecommendation(ranked) }];
+        return [{ ...item, recommendation: publicRecommendation(ranked, selection.decisionId) }];
       });
       return [...personalized, ...itemByKey.values()];
     } catch {
@@ -1391,6 +1445,7 @@ export class MemoryTopicStore implements TopicStore {
         nextRunAt: null,
         runStatus: 'queued',
         lastError: null,
+        degradedSources: [],
         lastRun: null,
         cancelledAt: null,
         accountKey: input.accountKey,
@@ -1444,6 +1499,7 @@ export class MemoryTopicStore implements TopicStore {
       creator.nextRunAt = this.now().toISOString();
       creator.runStatus = 'succeeded';
       creator.lastError = null;
+      creator.degradedSources = [];
     }
     appendMemoryInterestEvent(this.interestEvents, {
       userId,
@@ -1502,6 +1558,7 @@ export class MemoryTopicStore implements TopicStore {
     }
     creator.runStatus = 'queued';
     creator.lastError = null;
+    creator.degradedSources = [];
     return { creator: structuredClone(creator), shouldEnqueue: true };
   }
 
@@ -1746,6 +1803,34 @@ export class MemoryTopicStore implements TopicStore {
       mergeFeedItems(sortFeed([...topicItems, ...radarItems, ...creatorItems])),
     ).map((item) => structuredClone(item));
     return this.personalizeFeed(userId, feed);
+  }
+
+  private rememberFeedDecision(userId: string, decisionId: string, contentKeys: string[]): void {
+    this.feedDecisions.set(
+      `${userId}\u0000${decisionId}`,
+      new Set(contentKeys.map((key) => canonicalizeUrl(key))),
+    );
+  }
+
+  async recordFeedImpressions(
+    userId: string,
+    input: FeedImpressionInput,
+  ): Promise<FeedImpressionReceipt | null> {
+    const allowed = this.feedDecisions.get(`${userId}\u0000${input.decisionId}`);
+    const contentKeys = [...new Set(input.contentKeys.map((key) => canonicalizeUrl(key)))];
+    if (!allowed || contentKeys.some((key) => !allowed.has(key))) return null;
+    const bucketStart = new Date(this.now());
+    bucketStart.setUTCSeconds(0, 0);
+    let recorded = 0;
+    for (const contentKey of contentKeys) {
+      const impressionKey = [
+        userId, input.decisionId, contentKey, bucketStart.toISOString(),
+      ].join('\u0000');
+      if (this.feedImpressions.has(impressionKey)) continue;
+      this.feedImpressions.add(impressionKey);
+      recorded += 1;
+    }
+    return { recorded };
   }
 
   async setFeedback(
@@ -2264,6 +2349,7 @@ export class MemoryTopicStore implements TopicStore {
 
 function publicRecommendation(
   ranked: PersonalizedSlate['ranked'][number],
+  decisionId: string,
 ): FeedRecommendation {
   const reason = ranked.isExploration
     ? 'exploration'
@@ -2274,13 +2360,24 @@ function publicRecommendation(
         : ranked.reasonCodes.includes('RELATED_INTEREST')
           ? 'related_interest'
           : 'recent_hot';
-  return { lane: ranked.lane, reason, isExploration: ranked.isExploration };
+  return {
+    lane: ranked.lane,
+    reason,
+    isExploration: ranked.isExploration,
+    decisionId,
+  };
 }
 
 type CreatorWithRuns = PrismaCreatorSubscription & { runs?: PrismaCreatorRun[] };
 
 function mapCreator(creator: CreatorWithRuns): Creator {
   const error = safeErrorSchema.safeParse(creator.lastError);
+  const degradedSources = Array.isArray(creator.degradedSources)
+    ? creator.degradedSources.flatMap((source) => {
+      const parsed = creatorDegradedSourceSchema.safeParse(source);
+      return parsed.success ? [parsed.data] : [];
+    })
+    : [];
   return creatorSchema.parse({
     id: creator.id,
     userId: creator.userId,
@@ -2294,6 +2391,7 @@ function mapCreator(creator: CreatorWithRuns): Creator {
     nextRunAt: creator.nextRunAt?.toISOString() ?? null,
     runStatus: creator.runStatus,
     lastError: error.success ? error.data : null,
+    degradedSources,
     lastRun: mapRunSummary(creator.runs?.[0]),
   });
 }

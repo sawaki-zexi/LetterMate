@@ -1,0 +1,147 @@
+groups:
+  - name: lettermate-availability
+    rules:
+      - alert: LetterMateApiMetricsDown
+        expr: up{job="lettermate-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: LetterMate API metrics target is unavailable
+
+      - alert: LetterMateWorkerMetricsDown
+        expr: up{job="lettermate-worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: LetterMate Worker metrics target is unavailable
+
+      - alert: LetterMateApiHighErrorRatio
+        expr: |
+          sum(rate(lettermate_api_http_requests_total{status_class="5xx"}[5m]))
+            / clamp_min(sum(rate(lettermate_api_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          summary: LetterMate API 5xx ratio is above five percent
+
+      - alert: LetterMateFeedImpressionRejected
+        expr: |
+          sum(rate(lettermate_api_feed_impression_batches_total{status="rejected"}[15m]))
+            / clamp_min(sum(rate(lettermate_api_feed_impression_batches_total[15m])), 0.001) > 0.10
+        for: 10m
+        labels:
+          severity: medium
+        annotations:
+          summary: More than ten percent of Feed impression batches are rejected
+
+  - name: lettermate-queues
+    rules:
+      - alert: LetterMateQueueFailedJobs
+        expr: lettermate_worker_queue_jobs{state="failed"} > 0
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          summary: A LetterMate queue has persistent failed jobs
+
+      - alert: LetterMateQueueBacklog
+        expr: lettermate_worker_queue_jobs{state="waiting"} > 100
+        for: 10m
+        labels:
+          severity: high
+        annotations:
+          summary: A LetterMate queue has a persistent waiting backlog
+
+      - alert: LetterMateWorkerJobFailures
+        expr: sum by (queue, code) (increase(lettermate_worker_job_events_total{result=~"failed|worker_error"}[15m])) >= 5
+        labels:
+          severity: medium
+        annotations:
+          summary: LetterMate Worker jobs are repeatedly failing
+
+  - name: lettermate-agent-stages
+    rules:
+      - alert: LetterMateAgentStageSlow
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, component, stage) (
+              rate(lettermate_worker_agent_stage_duration_seconds_bucket[15m])
+            )
+          ) > 45
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          summary: A LetterMate discovery stage has sustained high latency
+
+  - name: lettermate-sources
+    rules:
+      - alert: LetterMateSourceRepeatedFailures
+        expr: sum by (source) (increase(lettermate_worker_source_attempts_total{result="failure"}[15m])) >= 5
+        labels:
+          severity: medium
+        annotations:
+          summary: A configured discovery source is repeatedly failing
+
+      - alert: LetterMateSourceNoCandidates
+        expr: |
+          sum by (source) (
+            increase(lettermate_worker_source_attempts_total{result="success"}[24h])
+          ) > 0
+          unless
+          sum by (source) (
+            increase(lettermate_worker_source_items_total{outcome="retrieved"}[24h])
+          ) > 0
+        labels:
+          severity: medium
+        annotations:
+          summary: A successful discovery source produced no candidates in twenty-four hours
+
+      - alert: LetterMateSourceLowAcceptanceYield
+        expr: |
+          (
+            (
+              sum by (source) (
+                increase(lettermate_worker_source_items_total{outcome="accepted"}[24h])
+              )
+              or
+              0 * sum by (source) (
+                increase(lettermate_worker_source_items_total{outcome="retrieved"}[24h])
+              )
+            )
+            /
+            clamp_min(
+              sum by (source) (
+                increase(lettermate_worker_source_items_total{outcome="retrieved"}[24h])
+              ),
+              1
+            )
+          ) < 0.05
+          and
+          sum by (source) (
+            increase(lettermate_worker_source_items_total{outcome="retrieved"}[24h])
+          ) >= 20
+        labels:
+          severity: medium
+        annotations:
+          summary: A discovery source has less than five percent accepted content
+
+      - alert: LetterMateSingleSourceDominance
+        expr: |
+          (
+            sum by (source) (
+              increase(lettermate_worker_source_items_total{outcome="accepted"}[24h])
+            )
+            /
+            scalar(sum(increase(lettermate_worker_source_items_total{outcome="accepted"}[24h])))
+          ) > 0.90
+          and on ()
+          sum(increase(lettermate_worker_source_items_total{outcome="accepted"}[24h])) >= 10
+        labels:
+          severity: medium
+        annotations:
+          summary: One discovery source contributes more than ninety percent of accepted content

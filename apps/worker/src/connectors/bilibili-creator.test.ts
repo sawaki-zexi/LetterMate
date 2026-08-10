@@ -238,4 +238,26 @@ describe('BilibiliCreatorConnector', () => {
       message: 'Bilibili public API is temporarily restricted',
     });
   });
+
+  it('keeps video sync available when the optional dynamic stream is access restricted', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0, data: { card: { mid: '946974', name: '影视飓风' } },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(nav), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0,
+        data: { result: [{ mid: 946974, uname: '影视飓风', res: [video()] }] },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: 0, data: { numPages: 1, result: [video()] },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response('risk challenge', { status: 412 }));
+    const connector = new BilibiliCreatorConnector({ mid: '946974', pageBudget: 1 }, fetcher as typeof fetch);
+
+    await expect(connector.search(plan, new AbortController().signal)).resolves.toMatchObject({
+      candidates: [expect.objectContaining({ externalId: 'BV1example' })],
+      degradations: [{ source: 'dynamic', code: 'CONNECTOR_ACCESS_RESTRICTED', retryable: true }],
+    });
+  });
 });

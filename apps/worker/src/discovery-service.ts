@@ -21,6 +21,7 @@ import { buildKeywordPolicy } from './keyword-policy.js';
 import type { QualityPipelineInput } from './quality-pipeline.js';
 import type { ContentInterestTagger } from './content-interest-tagger.js';
 import type { AiExecutionContext } from './ai-runtime.js';
+import { isExplicitlyNonRetryable } from './retry-policy.js';
 import type { AgentStageTelemetry } from './observability.js';
 import type { RunStageManager } from './run-stage.js';
 import type { EvidenceGapRetriever } from './evidence-gap-retriever.js';
@@ -674,18 +675,19 @@ export class TopicDiscoveryService {
           )
         : error;
       const finishedAt = this.now();
+      const terminalFailure = context.finalAttempt || isExplicitlyNonRetryable(failure);
       const saved = await this.repository.saveFailure({
         runId,
         topicId,
         error: toSafeAiError(failure),
         finishedAt,
-        status: context.finalAttempt ? 'failed' : 'queued',
+        status: terminalFailure ? 'failed' : 'queued',
         trigger,
-        ...(context.finalAttempt && trigger === 'scheduled'
+        ...(terminalFailure && trigger === 'scheduled'
           ? { schedule: calculateFailureSchedule(finishedAt) }
           : {}),
       });
-      if (saved.pendingManualRefresh && context.finalAttempt) {
+      if (saved.pendingManualRefresh && terminalFailure) {
         clearTimeout(timeout);
         try {
           await this.run(topicId, userId, 'manual', context);

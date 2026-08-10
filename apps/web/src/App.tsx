@@ -49,7 +49,14 @@ import {
   UserPlus,
   X,
 } from 'lucide-react';
-import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type FormEvent,
+} from 'react';
 import { Link, NavLink, Route, Routes, useParams } from 'react-router-dom';
 import { api } from './api.js';
 import { DiscoveryCard } from './components/DiscoveryCard.js';
@@ -84,12 +91,19 @@ const creatorPlatformLabels = {
   rss: 'RSS/Atom',
   x: 'X',
   bilibili: 'Bilibili',
+  youtube: 'YouTube',
+  bluesky: 'Bluesky',
 } as const;
+
+const creatorDegradedSourceLabels: Record<string, string> = {
+  dynamic: '动态流',
+};
 
 const statusLabel: Record<Topic['runStatus'], string> = {
   queued: '等待多源发现',
   running: '多源发现中',
   succeeded: '已完成',
+  degraded: '部分同步',
   failed: '失败',
 };
 
@@ -306,6 +320,31 @@ function FeedPage() {
       ));
     },
   });
+  const impressionQueue = useRef(new Map<string, Set<string>>());
+  const impressionTimer = useRef<number | null>(null);
+  const flushImpressions = useCallback(() => {
+    if (impressionTimer.current !== null) {
+      window.clearTimeout(impressionTimer.current);
+      impressionTimer.current = null;
+    }
+    const pending = impressionQueue.current;
+    impressionQueue.current = new Map();
+    for (const [decisionId, contentKeys] of pending) {
+      void api.recordFeedImpressions({ decisionId, contentKeys: [...contentKeys] })
+        .catch(() => undefined);
+    }
+  }, []);
+  const queueImpression = useCallback((item: FeedItem) => {
+    const decisionId = item.recommendation?.decisionId;
+    if (!decisionId) return;
+    const contentKeys = impressionQueue.current.get(decisionId) ?? new Set<string>();
+    contentKeys.add(item.contentKey);
+    impressionQueue.current.set(decisionId, contentKeys);
+    if (impressionTimer.current === null) {
+      impressionTimer.current = window.setTimeout(flushImpressions, 250);
+    }
+  }, [flushImpressions]);
+  useEffect(() => () => flushImpressions(), [flushImpressions]);
   const refresh = useRefreshCoordinator({
     topics: topics.data ?? [],
     trendStatus: trendStatus.data,
@@ -477,6 +516,7 @@ function FeedPage() {
                     headingLevel={3}
                     feedbackPending={feedback.isPending && feedback.variables?.contentKey === item.contentKey}
                     onFeedback={(value) => feedback.mutate({ contentKey: item.contentKey, value })}
+                    onImpression={() => queueImpression(item)}
                   />
                 );
               })}
@@ -750,6 +790,13 @@ function CreatorRow({
               ? `下次同步 ${new Date(creator.nextRunAt).toLocaleString('zh-CN')}`
               : active ? '首次同步已入队' : '等待下次同步'
         }</p>
+        {creator.runStatus === 'degraded' && creator.degradedSources.length > 0 && (
+          <p className="inline-warning">
+            <AlertCircle size={14} />
+            {creator.degradedSources.map((source) => creatorDegradedSourceLabels[source.source] ?? source.source).join('、')}
+            {' '}暂不可用，已保留可用内容
+          </p>
+        )}
         {creator.lastError && <p className="inline-error"><AlertCircle size={14} />{creator.lastError.message}</p>}
       </div>
       <div className="topic-row__actions">
@@ -1210,7 +1257,7 @@ function DigestPage() {
   };
 
   return (
-    <Page title="每日邮件" description="设置本地发送时间并预览下一封摘要">
+    <Page title="每日邮件" description="设置本地发送时间并预览下一封引用型研究简报">
       <DigestDeliveryStatusView
         status={status.data}
         loading={status.isLoading}
@@ -1302,11 +1349,20 @@ function DigestPage() {
           <div className="digest-preview-list">{preview.data.items.map((item) => (
             <article className="digest-preview-item" key={item.contentKey}>
               <h3>{item.title}</h3>
-              <p>{item.summary}</p>
-              <p className="digest-preview-item__reason"><strong>推荐理由</strong>{item.reason}</p>
-              <a href={item.sourceUrl} target="_blank" rel="noreferrer noopener">
-                <ExternalLink size={15} />查看原文
-              </a>
+              <p><strong>结论</strong>{item.brief.conclusion}</p>
+              <p><strong>证据</strong>{item.brief.evidence}</p>
+              <p><strong>不确定性</strong>{item.brief.uncertainty}</p>
+              <p><strong>后续关注</strong>{item.brief.followUp}</p>
+              <div className="digest-preview-item__citations">
+                {item.citations.map((citation) => (
+                  <a href={citation.url} target="_blank" rel="noreferrer noopener" key={citation.url}>
+                    <ExternalLink size={15} />
+                    {citation.platform}{citation.publishedAt
+                      ? ` · ${new Date(citation.publishedAt).toLocaleDateString('zh-CN')}`
+                      : ''}
+                  </a>
+                ))}
+              </div>
             </article>
           ))}</div>
         )}

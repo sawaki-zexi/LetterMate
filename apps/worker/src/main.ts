@@ -59,6 +59,7 @@ import {
   PrismaContentInterestTagRepository,
 } from './content-interest-tagger.js';
 import { createSmtpEmailGateway } from './digest-email.js';
+import { DigestBriefGenerator } from './digest-brief-generator.js';
 import {
   DigestDeliveryService,
   PrismaDigestDeliveryRepository,
@@ -97,6 +98,37 @@ const metricsServer = await startWorkerMetricsServer(metrics, config.METRICS_POR
 schedulers.push(metricsServer);
 writeOperationalLog(console, { level: 'info', event: 'metrics.started' });
 
+const aiRuntime = config.AI_API_KEY ? (() => {
+  const runtimePolicy = createAiRuntimePolicy({
+    defaultModel: config.AI_MODEL,
+    ...(config.AI_FAST_MODEL ? { fastModel: config.AI_FAST_MODEL } : {}),
+    ...(config.AI_QUALITY_MODEL ? { qualityModel: config.AI_QUALITY_MODEL } : {}),
+    ...(config.AI_LOCALIZATION_MODEL
+      ? { localizationModel: config.AI_LOCALIZATION_MODEL } : {}),
+    fallbackModels: config.AI_FALLBACK_MODELS,
+    providerOrder: config.AI_PROVIDER_ORDER,
+    allowProviderFallbacks: config.AI_PROVIDER_FALLBACKS,
+    reservedCostUsdPerCall: config.AI_RESERVED_COST_USD_PER_CALL,
+    budget: {
+      maxCalls: config.AI_RUN_MAX_CALLS,
+      maxInputTokens: config.AI_RUN_MAX_INPUT_TOKENS,
+      maxOutputTokens: config.AI_RUN_MAX_OUTPUT_TOKENS,
+      maxCostUsd: config.AI_RUN_MAX_COST_USD,
+    },
+  });
+  return {
+    runtimePolicy,
+    gateway: new OpenRouterAiGateway({
+      apiKey: config.AI_API_KEY,
+      model: config.AI_MODEL,
+      webSearch: config.AI_WEB_SEARCH,
+      timeoutMs: config.AI_TIMEOUT_MS,
+      runtimePolicy,
+      usageLedger: new PrismaAiUsageLedger(prisma),
+    }),
+  };
+})() : null;
+
 if (config.SMTP_ENABLED && config.SMTP_HOST && config.SMTP_FROM) {
   const digestQueue = new Queue<DigestJobData>(digestQueueName, { connection: redis });
   const digestGateway = createSmtpEmailGateway({
@@ -118,7 +150,10 @@ if (config.SMTP_ENABLED && config.SMTP_HOST && config.SMTP_FROM) {
   );
   attachWorkerLogging(digestWorker, digestQueueName, console, () => new Date(), metrics);
   const digestScheduler = startDigestScheduler(new DigestScheduleService(
-    new PrismaDigestScheduleRepository(prisma),
+    new PrismaDigestScheduleRepository(
+      prisma,
+      new DigestBriefGenerator(aiRuntime?.gateway),
+    ),
     digestQueue,
   ));
   schedulers.push(digestScheduler);
@@ -132,42 +167,18 @@ if (config.SMTP_ENABLED && config.SMTP_HOST && config.SMTP_FROM) {
   });
 }
 
-if (!config.AI_API_KEY) {
+if (!aiRuntime) {
   writeOperationalLog(console, {
     level: 'warn', event: 'discovery.disabled',
     code: 'DISCOVERY_WORKERS_NOT_STARTED', dependency: 'external',
   });
 } else {
+  const { gateway, runtimePolicy } = aiRuntime;
   const queue = new Queue<DiscoveryJobData>(discoveryQueueName, { connection: redis });
   const trendQueue = new Queue<TrendJobData>(trendQueueName, { connection: redis });
   const creatorQueue = new Queue<CreatorJobData>(creatorQueueName, { connection: redis });
-  const runtimePolicy = createAiRuntimePolicy({
-    defaultModel: config.AI_MODEL,
-    ...(config.AI_FAST_MODEL ? { fastModel: config.AI_FAST_MODEL } : {}),
-    ...(config.AI_QUALITY_MODEL ? { qualityModel: config.AI_QUALITY_MODEL } : {}),
-    ...(config.AI_LOCALIZATION_MODEL
-      ? { localizationModel: config.AI_LOCALIZATION_MODEL } : {}),
-    fallbackModels: config.AI_FALLBACK_MODELS,
-    providerOrder: config.AI_PROVIDER_ORDER,
-    allowProviderFallbacks: config.AI_PROVIDER_FALLBACKS,
-    reservedCostUsdPerCall: config.AI_RESERVED_COST_USD_PER_CALL,
-    budget: {
-      maxCalls: config.AI_RUN_MAX_CALLS,
-      maxInputTokens: config.AI_RUN_MAX_INPUT_TOKENS,
-      maxOutputTokens: config.AI_RUN_MAX_OUTPUT_TOKENS,
-      maxCostUsd: config.AI_RUN_MAX_COST_USD,
-    },
-  });
   const stageManager = new RunStageManager(new PrismaRunStageStore(prisma), {
     policyVersion: `${RUN_STAGE_POLICY_VERSION}:${runtimePolicy.version}`,
-  });
-  const gateway = new OpenRouterAiGateway({
-    apiKey: config.AI_API_KEY,
-    model: config.AI_MODEL,
-    webSearch: config.AI_WEB_SEARCH,
-    timeoutMs: config.AI_TIMEOUT_MS,
-    runtimePolicy,
-    usageLedger: new PrismaAiUsageLedger(prisma),
   });
   const interestTagger = new ContentInterestTagger(
     new PrismaContentInterestTagRepository(prisma),
@@ -176,6 +187,7 @@ if (!config.AI_API_KEY) {
   const registry = new ConnectorRegistry(createSourceConnectors(config), {
     concurrency: config.DISCOVERY_CONNECTOR_CONCURRENCY,
     timeoutMs: Math.min(config.DISCOVERY_RUN_TIMEOUT_MS, 120_000),
+    sourceTelemetry: metrics,
     onFailure: (failure) => writeOperationalLog(console, {
       level: 'warn', event: 'connector.failed', component: failure.connectorId,
       code: failure.code, dependency: 'external',
@@ -189,7 +201,7 @@ if (!config.AI_API_KEY) {
   const service = new TopicDiscoveryService({
     gateway,
     registry,
-    qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway),
+    qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway, metrics),
     repository,
     timeoutMs: config.DISCOVERY_RUN_TIMEOUT_MS,
     interestTagger,
@@ -216,7 +228,7 @@ if (!config.AI_API_KEY) {
     trendSources: trendRegistry,
     gateway,
     connectors: registry,
-    qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway),
+    qualityPipeline: new QualityPipeline(new ContentFetcher(), gateway, metrics),
     timeoutMs: config.DISCOVERY_RUN_TIMEOUT_MS,
     interestTagger,
     stageManager,
@@ -229,8 +241,10 @@ if (!config.AI_API_KEY) {
     gateway,
     config.DISCOVERY_RUN_TIMEOUT_MS,
     config.TWITTERAPI_IO_API_KEY,
+    config.YOUTUBE_API_KEY,
     interestTagger,
     stageManager,
+    metrics,
   );
   const creatorWorker = createCreatorWorker(redis, creatorService);
   attachWorkerLogging(trendWorker, trendQueueName, console, () => new Date(), metrics);

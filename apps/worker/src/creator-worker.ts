@@ -2,12 +2,17 @@ import { creatorJobDataSchema, creatorQueueName, type CreatorJobData } from '@le
 import { Worker, type ConnectionOptions, type Job } from 'bullmq';
 import type { CreatorDiscoveryService } from './creator-service.js';
 import { backoffStrategy } from './worker.js';
+import { toWorkerFailure } from './retry-policy.js';
 
 export function createCreatorJobHandler(service: Pick<CreatorDiscoveryService, 'run'>) {
   return async (job: Job<CreatorJobData>): Promise<void> => {
     const data = creatorJobDataSchema.parse(job.data);
     const attempts = job.opts.attempts ?? 1;
-    await service.run(data, { finalAttempt: job.attemptsMade + 1 >= attempts });
+    try {
+      await service.run(data, { finalAttempt: job.attemptsMade + 1 >= attempts });
+    } catch (error) {
+      throw toWorkerFailure(error);
+    }
   };
 }
 

@@ -10,6 +10,8 @@ import {
   digestPreviewSchema,
   digestStatusSchema,
   discoverySourceStatusSchema,
+  feedImpressionInputSchema,
+  feedImpressionReceiptSchema,
   feedbackInputSchema,
   creatorInputSchema,
   creatorUpdateInputSchema,
@@ -80,7 +82,9 @@ import {
   CreatorResolutionService,
   RssCreatorIdentityResolver,
   XCreatorIdentityResolver,
+  YouTubeCreatorIdentityResolver,
   BilibiliCreatorIdentityResolver,
+  BlueskyCreatorIdentityResolver,
   type CreatorResolutionGateway,
   type ResolvedCreatorIdentity,
 } from './creator-resolver.js';
@@ -181,6 +185,7 @@ class ApiController {
     @Inject(AUTH_SERVICE) private readonly auth: AuthService,
     @Inject(ALLOW_DEV_IDENTITY) private readonly allowDevIdentity: boolean,
     @Inject(SECURE_COOKIES) private readonly secureCookies: boolean,
+    @Inject(API_METRICS) private readonly metrics: ApiMetrics,
   ) {}
 
   @Get('health')
@@ -685,6 +690,22 @@ class ApiController {
     return feedback;
   }
 
+  @Post('impressions')
+  @HttpCode(202)
+  async recordImpressions(
+    @Headers('x-user-id') header: string | undefined,
+    @Body() body: unknown,
+  ) {
+    const input = parseOrThrow(feedImpressionInputSchema, body, '曝光记录无效');
+    const receipt = await this.store.recordFeedImpressions(authenticatedUser(header), input);
+    if (!receipt) {
+      this.metrics.recordFeedImpression({ status: 'rejected', recorded: 0 });
+      throw new NotFoundException(errorBody('NOT_FOUND', '推荐决策不存在'));
+    }
+    this.metrics.recordFeedImpression({ status: 'accepted', recorded: receipt.recorded });
+    return feedImpressionReceiptSchema.parse(receipt);
+  }
+
   @Get('items/:id')
   async getItem(
     @Headers('x-user-id') header: string | undefined,
@@ -900,6 +921,8 @@ export async function createApiApp(
       new RssCreatorIdentityResolver(),
       new XCreatorIdentityResolver(config.TWITTERAPI_IO_API_KEY),
       new BilibiliCreatorIdentityResolver(),
+      new YouTubeCreatorIdentityResolver(config.YOUTUBE_API_KEY),
+      new BlueskyCreatorIdentityResolver(),
     ],
     config.SESSION_SECRET ?? randomBytes(32).toString('base64url'),
     options.now ?? (() => new Date()),

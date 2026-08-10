@@ -6,7 +6,7 @@ import { useTopicRefreshManager } from './use-topic-refresh-manager.js';
 
 function run(id: string, status: RunSummary['status'], newItemCount = 0): RunSummary {
   const startedAt = '2026-07-29T00:00:00.000Z';
-  if (status === 'succeeded') {
+  if (status === 'succeeded' || status === 'degraded') {
     return { id, trigger: 'manual', status, startedAt, finishedAt: startedAt, newItemCount };
   }
   if (status === 'failed') {

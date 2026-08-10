@@ -18,6 +18,8 @@ import {
   discoverySourceStatusSchema,
   contentFeedbackSchema,
   feedbackInputSchema,
+  feedImpressionInputSchema,
+  feedImpressionReceiptSchema,
   interestEventSchema,
   interestTagExtractionSchema,
   interestMemorySchema,
@@ -174,6 +176,20 @@ describe('AI discovery contracts', () => {
       profileUrl: 'https://space.bilibili.com/946974',
       feedUrl: null,
     })).toMatchObject({ platform: 'bilibili', handle: 'UID 946974', feedUrl: null });
+    expect(creatorIdentityCandidateSchema.parse({
+      ...candidate,
+      platform: 'youtube',
+      handle: '@example',
+      profileUrl: 'https://www.youtube.com/channel/UC1234567890123456789012',
+      feedUrl: null,
+    })).toMatchObject({ platform: 'youtube', handle: '@example', feedUrl: null });
+    expect(creatorIdentityCandidateSchema.parse({
+      ...candidate,
+      platform: 'bluesky',
+      handle: '@example.bsky.social',
+      profileUrl: 'https://bsky.app/profile/example.bsky.social',
+      feedUrl: null,
+    })).toMatchObject({ platform: 'bluesky', handle: '@example.bsky.social', feedUrl: null });
     expect(creatorJobDataSchema.parse({
       creatorId: 'creator-1', userId: 'user-1', trigger: 'scheduled',
     })).toEqual({ creatorId: 'creator-1', userId: 'user-1', trigger: 'scheduled' });
@@ -299,6 +315,12 @@ describe('AI discovery contracts', () => {
       },
       {
         ...baseRun,
+        status: 'degraded' as const,
+        finishedAt: '2026-07-28T00:01:00.000Z',
+        newItemCount: 2,
+      },
+      {
+        ...baseRun,
         status: 'failed' as const,
         finishedAt: '2026-07-28T00:01:00.000Z',
         newItemCount: null,
@@ -309,6 +331,7 @@ describe('AI discovery contracts', () => {
       'queued',
       'running',
       'succeeded',
+      'degraded',
       'failed',
     ]);
   });
@@ -633,6 +656,18 @@ describe('AI discovery contracts', () => {
       origin: 'trend', topicId: null, origins: [trendOriginFixture],
       recommendation: { ...recommendation, score: 9 },
     })).toThrow();
+    expect(feedImpressionInputSchema.parse({
+      decisionId: 'decision-1',
+      contentKeys: ['https://example.com/article', 'https://example.com/other'],
+    })).toEqual({
+      decisionId: 'decision-1',
+      contentKeys: ['https://example.com/article', 'https://example.com/other'],
+    });
+    expect(() => feedImpressionInputSchema.parse({
+      decisionId: 'decision-1',
+      contentKeys: ['https://example.com/article', 'https://EXAMPLE.com/article'],
+    })).toThrow();
+    expect(feedImpressionReceiptSchema.parse({ recorded: 2 })).toEqual({ recorded: 2 });
   });
 
   it('accepts only safe daily digest preferences and persisted preview fields', () => {
@@ -658,6 +693,19 @@ describe('AI discovery contracts', () => {
         reason: '包含重要且可回溯的变化。',
         sourceUrl: 'https://example.com/article',
         publishedAt: '2026-08-08T07:00:00.000Z',
+        platform: 'Example',
+        brief: {
+          conclusion: '已经持久化的中文摘要。',
+          evidence: '包含重要且可回溯的变化。',
+          uncertainty: '仍需核验原文。',
+          followUp: '继续关注后续更新。',
+        },
+        citations: [{
+          contentKey: 'https://example.com/article',
+          url: 'https://example.com/article',
+          platform: 'Example',
+          publishedAt: '2026-08-08T07:00:00.000Z',
+        }],
       }],
     };
     expect(digestPreviewSchema.parse(preview)).toEqual(preview);
