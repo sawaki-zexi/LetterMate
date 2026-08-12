@@ -1,7 +1,12 @@
 import 'reflect-metadata';
-import type { InterestEvent } from '@lettermate/contracts';
+import type { DigestRecipient, InterestEvent } from '@lettermate/contracts';
 import { INTEREST_ADJACENCY_VERSION } from '@lettermate/domain';
 import { createApiApp } from './app.js';
+import {
+  DigestRecipientService,
+  MemoryDigestRecipientRepository,
+} from './digest-recipient-service.js';
+import { MemoryDigestVerificationQueue } from './digest-verification-queue.js';
 import {
   MemoryPersonalizationMemory,
   type MemoryPersonalizationFacts,
@@ -186,6 +191,23 @@ const creatorQueue: CreatorQueue = {
   async close() {},
 };
 
+class VerifiedDigestRecipientRepository extends MemoryDigestRecipientRepository {
+  override async get(userId: string): Promise<DigestRecipient> {
+    return {
+      email: `${userId}@example.local`,
+      status: 'verified',
+      verifiedAt: '2026-08-08T00:00:00.000Z',
+    };
+  }
+}
+
+const digestRecipientService = new DigestRecipientService(
+  new VerifiedDigestRecipientRepository(),
+  new MemoryDigestVerificationQueue(),
+  'http://127.0.0.1:5410',
+  false,
+);
+
 const app = await createApiApp({
   store,
   queue,
@@ -193,5 +215,6 @@ const app = await createApiApp({
   creatorQueue,
   aiConfigured: true,
   personalizationMemory: personalization,
+  digestRecipientService,
 });
 await app.listen(Number(process.env.PORT ?? 3001), '0.0.0.0');

@@ -151,9 +151,20 @@ BING_SEARCH_ENABLED=true
 
 Brave remains available through `SEARCH_PROVIDER=brave` and `SEARCH_API_KEY`. Restart the Worker after changing `.env`.
 
-Daily email is disabled until SMTP is configured. A minimal production configuration is:
+Daily email is disabled until an email provider is configured. Resend's idempotent HTTP API is the recommended production path:
 
 ```env
+EMAIL_PROVIDER=resend
+EMAIL_UNSUBSCRIBE_SECRET=replace-with-a-random-secret-at-least-32-characters
+RESEND_API_KEY=re_your_server_key
+RESEND_WEBHOOK_SECRET=whsec_your_resend_signing_secret
+RESEND_FROM=LetterMate <digest@mail.example.com>
+```
+
+Keep both the API key and webhook secret in server-side secret storage, verify the sender domain, and configure Resend to call `POST /api/v1/email-webhooks/resend`. Production Resend configuration fails closed when the webhook secret is missing. SMTP remains a compatibility path:
+
+```env
+EMAIL_PROVIDER=smtp
 SMTP_ENABLED=true
 SMTP_HOST=smtp.example.com
 SMTP_PORT=587
@@ -164,9 +175,17 @@ SMTP_USER=
 SMTP_PASSWORD=
 ```
 
-Leave both authentication values empty for an unauthenticated local relay. If SMTP is not configured, discovery and Feed remain available and digest scheduling is not started.
+Leave both authentication values empty for an unauthenticated local relay. Existing deployments that only set `SMTP_ENABLED=true` continue to select SMTP. With `EMAIL_PROVIDER=none`, discovery and Feed remain available and digest scheduling is not started.
 
-To rotate credentials, update the server-side secret and restart the Worker, verify the new live smoke, then revoke the old credential. Set `SMTP_ENABLED=false` and restart the Worker to disable delivery.
+Users do not enter SMTP settings. After signing in, they enter a recipient on the Daily Email page and LetterMate sends a one-time verification link that expires after 24 hours. Only a verified recipient can enable daily email. Changing the recipient invalidates the previous verification state and unused links, immediately pauses scheduling, and requires explicit re-enabling after the new address is verified. Each created run freezes its recipient, so retries never switch to a later settings value. Mailbox passwords, authorization codes, and provider API keys never enter the browser.
+
+After verification, the user can send a clearly labelled test email. At most three new tests are created per hour, and repeated clicks for the same address within five minutes reuse one request. Test delivery never changes digest run history or the last-success boundary.
+
+Every production digest includes a visible unsubscribe link plus RFC 8058 one-click headers. Unsubscribe is public and immediately stops future scheduling without deleting prior runs, mail, or Feed data. Re-enabling is available only as an explicit authenticated action and still requires a verified, non-suppressed recipient. Tokens expose neither user IDs nor addresses; changing the recipient or re-enabling revokes old links.
+
+An explicit permanent bounce, complaint, or provider suppression from Resend immediately suppresses that recipient and stops future scheduling. Temporary bounces, delivery delays, and general failures do not suppress automatically. The same suppressed address cannot be reverified; the user must enter and verify a different address. Webhooks map users only through locally persisted provider message IDs, never through an address supplied in the payload.
+
+To rotate credentials, update the server-side secret and restart the Worker, verify the new live smoke, then revoke the old credential. Set `EMAIL_PROVIDER=none` and restart API and Worker to disable delivery.
 
 ### 3. Start infrastructure and apply migrations
 
@@ -243,7 +262,9 @@ See [`.env.example`](./.env.example) for the complete definition and non-sensiti
 | Discovery scheduling | `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | Timeout, concurrency, and Topic scheduling |
 | Trend scheduling | `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | Trend switch and initial interval for a missing monitor |
 | Trend scope | `TREND_X_WOEIDS`, `TREND_YOUTUBE_REGION`, `TREND_REDDIT_COMMUNITIES` | Regions and communities |
-| Daily email | `SMTP_ENABLED`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_REQUIRE_TLS`, `SMTP_FROM` | Production SMTP delivery and TLS |
+| Daily email | `EMAIL_PROVIDER`, `EMAIL_UNSUBSCRIBE_SECRET` | Select `none`, `resend`, or `smtp`, plus the shared API/Worker unsubscribe signing secret required for production delivery |
+| Resend | `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`, `RESEND_FROM`, `RESEND_API_BASE_URL`, `RESEND_TIMEOUT_MS` | Recommended production HTTP API, Svix webhook verification, sender identity, and timeout |
+| SMTP compatibility | `SMTP_ENABLED`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_REQUIRE_TLS`, `SMTP_FROM` | Compatibility SMTP delivery and TLS |
 | Email authentication | `SMTP_USER`, `SMTP_PASSWORD` | Optional SMTP authentication; configure both together |
 
 Missing optional credentials disable only the corresponding connectors. `TREND_INTERVAL_HOURS` is used only when provisioning a missing TrendMonitor; existing records always use their persisted `intervalHours`.
@@ -269,6 +290,15 @@ All business endpoints are under `/api/v1`:
 | `GET` | `/feed` | Query the unified Feed |
 | `GET` | `/items/:id` | Read Topic or trend item details |
 | `GET` | `/discovery-sources` | Read redacted connector availability |
+| `GET/PUT` | `/digest-preference` | Read or update daily email settings |
+| `GET` | `/digest-recipient` | Read the recipient and verification status |
+| `POST` | `/digest-recipient/verification` | Save a recipient and send its verification email |
+| `GET` | `/digest-recipient/confirm?token=...` | Confirm a recipient from the public email link |
+| `GET/POST` | `/digest/unsubscribe?token=...` | Publicly stop future daily email; POST supports mail-client one-click unsubscribe |
+| `POST` | `/digest-test-email` | Send a test message to the current verified recipient |
+| `GET` | `/digest-test-email/:id` | Read safe test-delivery status |
+| `GET` | `/digest-preview` | Preview the next digest candidates |
+| `GET` | `/digest-status` | Read delivery capability and recent run status |
 
 The Feed supports `range=1d|3d|7d|30d|90d|all`, `origin=all|topic|trend|creator`, `kind=hot|quality`, and optional `topicId`. `topicId` cannot be combined with `origin=trend|creator`.
 
@@ -311,9 +341,12 @@ npm test -- apps/worker/src/bilibili-creator.live.test.ts
 
 $env:RUN_LIVE_EMAIL_TESTS='1'
 npm test -- apps/worker/src/smtp-email.live.test.ts
+
+$env:RUN_LIVE_RESEND_TESTS='1'
+npm test -- apps/worker/src/resend-email.live.test.ts
 ```
 
-The SMTP smoke test also requires complete SMTP configuration and `SMTP_SMOKE_RECIPIENT`. A deterministic `Message-ID` provides best-effort retry deduplication, but standard SMTP cannot guarantee strict idempotency after an ambiguous accepted delivery.
+The Resend smoke test requires `EMAIL_PROVIDER=resend`, complete Resend configuration, and `RESEND_SMOKE_RECIPIENT`; the SMTP smoke test requires complete SMTP configuration and `SMTP_SMOKE_RECIPIENT`. Resend receives the stable DigestRun key as its provider idempotency key. SMTP keeps deterministic `Message-ID` best-effort deduplication.
 
 Database backups default to `.backups/postgres`. Retention keeps every backup for the latest 14 days, the newest backup from each of the following 8 weeks, and the newest backup from each of the following 12 months. Invalid or incomplete backups are never deleted automatically. Restore verification always uses an isolated database and rejects `lettermate`, `postgres`, `template0`, and `template1`. There is intentionally no command that overwrites the production database; a production restore requires downtime, a verified external copy, and manual approval.
 
@@ -324,7 +357,7 @@ Implemented:
 - Persisted Topic and trend discovery pipelines.
 - RSS/Atom, X, and Bilibili creator subscriptions; Bilibili includes public videos, dynamics, articles, and reposts with original-post context.
 - Interest memory, personalized ranking, adjacent-interest exploration, and explicit feedback.
-- Daily digest preview, scheduling, retry recovery, and optional production SMTP delivery.
+- Daily digest recipient verification, test delivery, verified-only scheduling, frozen-snapshot retry recovery, one-click unsubscribe, preview, and optional Resend/SMTP production delivery.
 - 14 main discovery connectors and 6 trend inputs.
 - Scheduling, lease recovery, idempotent refresh, and run summaries.
 - Unified API `x-trace-id`, redacted structured request logs, Worker queue snapshots, and safe job/connector failure events.

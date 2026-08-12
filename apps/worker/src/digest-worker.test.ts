@@ -13,6 +13,7 @@ const claimedRun = (): ClaimedDigestRun => ({
   userId: 'user-a',
   scheduledLocalDate: '2026-08-08',
   recipient: 'student@example.com',
+  unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
   leaseUntil: new Date('2026-08-08T00:10:00.000Z'),
   items: [{
     contentKey: 'https://example.com/1',
@@ -39,7 +40,7 @@ const repositoryFor = (run: ClaimedDigestRun | null): DigestDeliveryRepository =
 });
 
 describe('digest delivery worker', () => {
-  it('sends the frozen snapshot to the account email and marks success', async () => {
+  it('sends the frozen snapshot to the verified recipient and marks success', async () => {
     const run = claimedRun();
     const repository = repositoryFor(run);
     const gateway = new FakeEmailGateway();
@@ -53,6 +54,10 @@ describe('digest delivery worker', () => {
 
     expect(gateway.messages[0]).toMatchObject({ to: 'student@example.com' });
     expect(gateway.messages[0]?.text).toContain('冻结标题');
+    expect(gateway.messages[0]?.text).toContain('/digest/unsubscribe?token=');
+    expect(gateway.messages[0]?.headers?.['List-Unsubscribe']).toContain(
+      '/api/v1/digest/unsubscribe?token=',
+    );
     expect(repository.succeed).toHaveBeenCalledWith(
       run, 'fake-1', new Date('2026-08-08T00:00:01.000Z'),
     );

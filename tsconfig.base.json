@@ -18,7 +18,8 @@
     "paths": {
       "@lettermate/contracts": ["packages/contracts/src/index.ts"],
       "@lettermate/config": ["packages/config/src/index.ts"],
-      "@lettermate/domain": ["packages/domain/src/index.ts"]
+      "@lettermate/domain": ["packages/domain/src/index.ts"],
+      "@lettermate/domain/*": ["packages/domain/src/*.ts"]
     }
   }
 }

@@ -1,4 +1,4 @@
-import type { AppConfig } from '@lettermate/config';
+import { isEmailDeliveryConfigured, type AppConfig } from '@lettermate/config';
 import { configuredDiscoverySources } from './discovery-sources.js';
 
 export type DoctorCheckStatus = 'ok' | 'warning' | 'error' | 'not_configured';
@@ -88,8 +88,8 @@ export async function runOperationalDoctor(
     config.AI_API_KEY
       ? { id: 'ai', status: 'ok' }
       : { id: 'ai', status: 'not_configured', code: 'AI_NOT_CONFIGURED' },
-    config.SMTP_ENABLED
-      ? { id: 'email', status: 'ok' }
+    isEmailDeliveryConfigured(config)
+      ? { id: 'email', status: 'ok', details: { provider: config.EMAIL_PROVIDER } }
       : { id: 'email', status: 'not_configured', code: 'EMAIL_NOT_CONFIGURED' },
     {
       id: 'sources',

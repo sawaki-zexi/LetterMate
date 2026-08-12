@@ -13,7 +13,9 @@ import type {
   DiscoverySourceStatus,
   DigestPreference,
   DigestPreview,
+  DigestRecipient,
   DigestStatus,
+  DigestTestEmail,
   FeedItem,
   InterestMemory,
   RunSummary,
@@ -129,6 +131,8 @@ interface FetchMockOptions {
   digestPreference?: DigestPreference;
   digestPreview?: DigestPreview;
   digestStatus?: DigestStatus;
+  digestRecipient?: DigestRecipient;
+  digestTestEmail?: DigestTestEmail;
   authSession?: AuthSession;
 }
 
@@ -163,6 +167,13 @@ function installFetchMock({
   digestPreview = { generatedAt: now.toISOString(), items: [] },
   digestStatus = {
     deliveryCapability: 'not_configured', nextLocalSend: null, recentRun: null,
+  },
+  digestRecipient: initialDigestRecipient = {
+    email: 'user-a@example.local', status: 'unverified', verifiedAt: null,
+  },
+  digestTestEmail = {
+    id: 'test-email-1', status: 'succeeded', createdAt: now.toISOString(),
+    finishedAt: now.toISOString(), errorCode: null,
   },
   authSession: initialAuthSession = {
     authenticated: true,
@@ -211,6 +222,25 @@ function installFetchMock({
     if (url.endsWith('/digest-preference')) return Response.json(initialDigestPreference);
     if (url.endsWith('/digest-preview')) return Response.json(digestPreview);
     if (url.endsWith('/digest-status')) return Response.json(digestStatus);
+    if (url.endsWith('/digest-test-email') && method === 'POST') {
+      return Response.json(digestTestEmail);
+    }
+    if (url.includes('/digest-test-email/')) return Response.json(digestTestEmail);
+    if (url.endsWith('/digest-recipient/verification') && method === 'POST') {
+      initialDigestRecipient = {
+        email: String(body.email).trim().toLowerCase(),
+        status: 'pending',
+        verifiedAt: null,
+      };
+      return Response.json(initialDigestRecipient);
+    }
+    if (url.includes('/digest-recipient/confirm?')) {
+      return Response.json({ status: 'verified' });
+    }
+    if (url.includes('/digest/unsubscribe?')) {
+      return Response.json({ status: 'unsubscribed' });
+    }
+    if (url.endsWith('/digest-recipient')) return Response.json(initialDigestRecipient);
 
     if (url.endsWith('/interests/settings') && method === 'PUT') {
       initialInterests = { ...initialInterests, personalizationEnabled: body.personalizationEnabled };
@@ -1276,6 +1306,9 @@ describe('discovery workspace', () => {
 
   it('updates daily email settings and renders a safe candidate preview', async () => {
     installFetchMock({
+      digestRecipient: {
+        email: 'user-a@example.local', status: 'verified', verifiedAt: now.toISOString(),
+      },
       digestStatus: {
         deliveryCapability: 'configured',
         nextLocalSend: {
@@ -1339,6 +1372,116 @@ describe('discovery workspace', () => {
     await waitFor(() => expect(
       requests.filter((entry) => entry.url === '/api/v1/digest-preview'),
     ).toHaveLength(previewRequests.length + 1));
+  });
+
+  it('requests verification for a user-entered digest recipient', async () => {
+    installFetchMock({
+      digestStatus: {
+        deliveryCapability: 'configured', nextLocalSend: null, recentRun: null,
+      },
+    });
+    renderApp('/digest');
+
+    const recipientInput = await screen.findByRole('textbox', { name: '收件邮箱' });
+    await waitFor(() => expect(recipientInput).toHaveValue('user-a@example.local'));
+    expect(screen.getByText('未验证')).toBeVisible();
+    fireEvent.change(recipientInput, { target: { value: 'Student@Example.com' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送验证邮件' }));
+
+    await waitFor(() => expect(requests).toContainEqual({
+      url: '/api/v1/digest-recipient/verification',
+      method: 'POST',
+      body: { email: 'Student@Example.com' },
+    }));
+    expect(await screen.findByText('等待验证')).toBeVisible();
+    expect(screen.getByText('验证邮件已发送，请检查收件箱')).toBeVisible();
+    expect(screen.getByRole('button', { name: '重新发送验证邮件' })).toBeVisible();
+  });
+
+  it('keeps daily email disabled until the recipient is verified', async () => {
+    installFetchMock({
+      digestStatus: {
+        deliveryCapability: 'configured', nextLocalSend: null, recentRun: null,
+      },
+    });
+    renderApp('/digest');
+
+    expect(await screen.findByText('验证收件邮箱后才能开启每日邮件')).toBeVisible();
+    expect(screen.getByRole('checkbox', { name: '每日邮件' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '发送测试邮件' })).toBeDisabled();
+  });
+
+  it('shows provider suppression and requires a different address before verification', async () => {
+    installFetchMock({
+      digestRecipient: {
+        email: 'blocked@example.com', status: 'suppressed', verifiedAt: null,
+      },
+      digestStatus: {
+        deliveryCapability: 'configured', nextLocalSend: null, recentRun: null,
+      },
+    });
+    renderApp('/digest');
+
+    const recipientInput = await screen.findByRole('textbox', { name: '收件邮箱' });
+    await waitFor(() => expect(recipientInput).toHaveValue('blocked@example.com'));
+    expect(await screen.findByText('已停用')).toBeVisible();
+    expect(screen.getByText('该地址已被邮件服务停用，请更换地址后重新验证')).toBeVisible();
+    expect(screen.getByRole('button', { name: '发送验证邮件' })).toBeDisabled();
+    expect(screen.getByRole('checkbox', { name: '每日邮件' })).toBeDisabled();
+
+    fireEvent.change(recipientInput, { target: { value: 'new@example.com' } });
+    expect(screen.getByRole('button', { name: '发送验证邮件' })).toBeEnabled();
+  });
+
+  it('sends a test email to the verified recipient and shows delivery success', async () => {
+    installFetchMock({
+      digestRecipient: {
+        email: 'verified@example.com', status: 'verified', verifiedAt: now.toISOString(),
+      },
+      digestStatus: {
+        deliveryCapability: 'configured', nextLocalSend: null, recentRun: null,
+      },
+    });
+    renderApp('/digest');
+
+    const button = await screen.findByRole('button', { name: '发送测试邮件' });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+
+    await waitFor(() => expect(requests).toContainEqual({
+      url: '/api/v1/digest-test-email', method: 'POST', body: undefined,
+    }));
+    expect(await screen.findByText('测试邮件已发送')).toBeVisible();
+  });
+
+  it('confirms a digest recipient from the public email link', async () => {
+    installFetchMock({
+      authSession: { authenticated: false, user: null, csrfToken: null },
+    });
+    renderApp('/digest/verify?token=verification-token-value-that-is-long-enough');
+
+    expect(await screen.findByRole('heading', { name: '邮箱已验证' })).toBeVisible();
+    expect(requests).toContainEqual({
+      url: '/api/v1/digest-recipient/confirm?token=verification-token-value-that-is-long-enough',
+      method: 'GET',
+      body: undefined,
+    });
+    expect(screen.getByRole('link', { name: '返回每日邮件' })).toHaveAttribute('href', '/digest');
+  });
+
+  it('unsubscribes daily email from the public email link without authentication', async () => {
+    installFetchMock({
+      authSession: { authenticated: false, user: null, csrfToken: null },
+    });
+    renderApp('/digest/unsubscribe?token=unsubscribe-token-value-that-is-long-enough');
+
+    expect(await screen.findByRole('heading', { name: '已停止每日邮件' })).toBeVisible();
+    expect(requests).toContainEqual({
+      url: '/api/v1/digest/unsubscribe?token=unsubscribe-token-value-that-is-long-enough',
+      method: 'GET',
+      body: undefined,
+    });
+    expect(screen.getByText(/历史邮件和内容不会删除/)).toBeVisible();
   });
 
   it('shows account authentication before loading the private workspace', async () => {

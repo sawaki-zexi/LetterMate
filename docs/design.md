@@ -133,11 +133,22 @@ Feed 先完成质量和筛选，再应用稳定兴趣排序。明确订阅不会
 
 数据模型：
 
-- `DigestPreference`：启用状态和本地发送时间；时区来自 User。
-- `DigestRun`：计划日期、选择窗口、状态、租约、安全错误和提供商消息 ID。
+- `DigestPreference`：启用状态、本地发送时间、规范化收件地址及其 `unverified | pending | verified | suppressed` 状态，以及当前唯一 `unsubscribeTokenId`；时区来自 User。
+- `DigestEmailVerification`：绑定用户和收件地址的一次性验证记录。原始 Token 只进入验证邮件，数据库仅保存 SHA-256 哈希、失效时间和使用时间。
+- `EmailDeliveryEvent`：只保存供应商、Svix 事件 ID、允许列表内的规范化事件类型、结果、供应商消息 ID 和发生时间；唯一约束保证长期幂等，不保存原始 payload、邮件正文或收件地址。
+- `DigestTestEmail`：独立测试投递记录，冻结当前已验证地址、幂等桶、状态、租约和安全错误码；不属于日报运行历史。
+- `DigestRun`：计划日期、选择窗口、冻结的已验证收件地址与退订令牌 ID、状态、租约、安全错误和提供商消息 ID。
 - `DigestItem`：冻结的内容键、顺序、中文结论、证据、不确定性、后续关注点、平台、发布时间和原始引用快照。
 
-调度器扫描已到本地发送时间且当天没有运行的用户。没有合格内容时创建 `skipped` 运行但不调用邮件服务。任务重试复用同一 `DigestRun` 和 `DigestItem` 快照；失败不推进成功窗口。
+调度器只扫描 `enabled=true`、`recipientStatus=verified` 且地址非空的偏好，并在事务内再次校验同一地址仍有资格。没有合格内容时创建 `skipped` 运行但不调用邮件服务。`DigestRun.recipientEmail` 与内容快照在创建时一起冻结；任务领取和重试只读取该字段，不重新读取登录邮箱或可变偏好。失败不推进成功窗口。
+
+退订令牌由随机 UUID 标识和 `EMAIL_UNSUBSCRIBE_SECRET` HMAC 签名组成，不携带用户 ID 或邮箱。调度事务要求偏好中的地址和令牌 ID 同时匹配，并把两者冻结到 `DigestRun`。Worker 由冻结 ID 生成浏览器 GET 链接与 RFC 8058 POST 地址；`EmailGateway` 只允许透传 `List-Unsubscribe` 和 `List-Unsubscribe-Post`。公开 API 先验证签名，再用当前唯一令牌 ID 条件更新 `enabled=false`，因此重复或并发请求幂等。地址验证重启与从关闭状态重新启用都会轮换 ID，旧签名即被撤销；历史运行和内容不修改。
+
+收件地址验证与登录身份分离：已登录用户通过 API 提交地址，服务端规范化后废弃该用户全部未使用 Token，把地址置为 `pending`、原子设置 `enabled=false`，并向独立 BullMQ 队列写入验证任务。Token 使用 32 字节随机值、24 小时有效期，验证请求按用户、地址和客户端 IP 的哈希键执行进程内限频。公开确认端点只接收 Token；事务以单次 claim 更新记录，并仅在当前偏好仍指向同一 `pending` 地址时切换为 `verified`。启用操作本身使用带 `recipientStatus=verified` 条件的数据库更新，避免与地址变更并发时重新打开调度。浏览器不会接触邮件供应商凭据，也不会获得代表用户邮箱发信的权限。
+
+Resend Webhook 使用 Nest 保留的原始请求字节、`svix-id`、`svix-timestamp` 和 `svix-signature` 验签。解析层只接受明确支持的投递事件，并把 bounce type 作为开放字符串处理：只有大小写归一后的 `Permanent` 被视为永久退信，`Temporary | Transient | Undetermined` 及未来未知值都按暂时事件处理。投诉和供应商抑制属于永久事件；延迟和一般失败只记录，不停发。关联层只查询 `DigestEmailVerification`、`DigestTestEmail` 和 `DigestRun` 已保存的 `providerMessageId`；未知 ID 记录为 `unmatched`，同一 ID 映射到冲突用户或地址时记录为 `conflict`，两者都不修改偏好。永久事件只在唯一归属成立时原子设置 `enabled=false`、`recipientStatus=suppressed` 和安全原因/时间。原地址随后不能重新验证，更换地址时清除抑制字段并回到正常验证流程。
+
+测试邮件使用独立 `digest-test-email` 队列。API 只为当前已验证地址创建记录，按用户每小时最多创建 3 个，并用“5 分钟时间桶 + 地址哈希”复用并发或重复请求；事务用用户级 advisory lock 串行化限频与幂等判断。Worker 领取时只读取记录中冻结的地址，使用 `digest-test:<id>` 供应商幂等键，并把状态更新为 `queued | running | retrying | succeeded | failed`。公开给浏览器的状态不包含地址、供应商消息 ID 或原始错误。测试成功不会修改 `DigestRun`、`DigestItem` 或上次成功发送窗口。
 
 邮件快照在 Topic、Trend 与 Creator 合并去重后加载当前兴趣画像、内容标签和版本化兴趣邻接关系。选择器使用与 Feed 相同的探索资格判定，先排除所有仅因相邻兴趣进入候选池的内容，再执行最多 10 条的个性化排序；明确 Topic 和 Creator 订阅不会被该过滤移除。API 预览、Worker 冻结快照和邮件渲染共享结构化简报契约，每项引用均绑定内容键、平台、发布时间和已验证 HTTP(S) URL。
 
@@ -145,9 +156,9 @@ Feed 先完成质量和筛选，再应用稳定兴趣排序。明确订阅不会
 
 候选读取、远程生成和最终冻结不处于同一个长事务中。最终短事务重新检查当天运行与已成功发送的引用，原子写入 `DigestRun`、`DigestItem` 和生成状态；只有完整快照提交后才入投递队列。`DigestRun.briefGenerationStatus/version/errorCode` 记录生成或安全回退，AI usage 账本以 `digest` 运行和 `digest_brief` 任务记录模型路由与预算。投递重试只读取冻结快照，不再次调用模型。
 
-`EmailGateway` 隔离投递提供商。默认测试使用 `FakeEmailGateway`；生产运行在完整 SMTP 配置存在时使用 `SmtpEmailGateway`。未配置 SMTP 时 API 返回 `not_configured`，Worker 不启动邮件队列、消费者或调度器，其他发现能力继续运行。
+`EmailGateway` 隔离投递提供商。默认测试使用 `FakeEmailGateway`；生产通过 `EMAIL_PROVIDER=none | resend | smtp` 显式选择能力。推荐的 `ResendEmailGateway` 使用 HTTPS API，发送现有文本/HTML 快照并把稳定 DigestRun 键传为供应商幂等键；`SmtpEmailGateway` 保留为兼容模式。未配置邮件提供商时 API 返回 `not_configured`，Worker 不启动邮件队列、消费者或调度器，其他发现能力继续运行。API Key、SMTP 凭据和授权头只存在于服务端。
 
-SMTP 使用确定性 `Message-ID`、TLS、连接超时、安全错误分类和脱敏日志。普通 SMTP 没有通用幂等键：如果服务器已接受邮件但连接在确认前中断，重试仍可能产生重复邮件。严格零重复需要改用支持幂等键的供应商 HTTP API。
+Resend Adapter 使用固定 HTTPS 基址、请求超时、稳定幂等键和安全状态码映射；不会持久化或返回供应商响应正文。SMTP 使用确定性 `Message-ID`、TLS、连接超时、安全错误分类和脱敏日志。普通 SMTP 没有通用幂等键：如果服务器已接受邮件但连接在确认前中断，重试仍可能产生重复邮件。
 
 ## 7. API
 
@@ -164,6 +175,13 @@ SMTP 使用确定性 `Message-ID`、TLS、连接超时、安全错误分类和�
 | `GET` | `/creators/:id/items` | 读取博主有效内容档案 |
 | `PUT` | `/feedback/:contentKey` | 设置、切换或清除反馈 |
 | `GET/PUT` | `/digest-preference` | 读取或修改每日邮件设置 |
+| `GET` | `/digest-recipient` | 读取当前用户的收件地址和验证状态 |
+| `POST` | `/digest-recipient/verification` | 保存地址并发送一次性验证邮件 |
+| `GET` | `/digest-recipient/confirm?token=...` | 公开消费一次性 Token 并确认收件地址 |
+| `GET/POST` | `/digest/unsubscribe?token=...` | 公开验证签名并幂等停止未来每日邮件；POST 支持 RFC 8058 一键退订 |
+| `POST` | `/email-webhooks/resend` | 使用原始请求体和 Svix 头验证 Resend 投递事件并幂等更新抑制状态 |
+| `POST` | `/digest-test-email` | 向当前已验证地址创建或复用测试发送 |
+| `GET` | `/digest-test-email/:id` | 读取当前用户测试发送的安全状态 |
 | `GET` | `/digest-preview` | 预览下一封邮件候选 |
 | `GET` | `/digest-status` | 读取投递能力、下一次本地发送时间和最近运行 |
 
@@ -192,7 +210,7 @@ SMTP 使用确定性 `Message-ID`、TLS、连接超时、安全错误分类和�
 
 ## 9. 验证
 
-默认测试不联网。真实 AI、X 和 SMTP 测试只在显式 live 开关及完整凭据同时存在时运行。
+默认测试不联网。真实 AI、X、Resend 和 SMTP 测试只在对应显式 live 开关及完整凭据同时存在时运行。
 
 ```powershell
 npm run db:generate

@@ -3,16 +3,30 @@ import type {
   DiscoverySourceStatus,
   CreatorJobData,
   TrendJobData,
+  DigestVerificationJobData,
+  DigestTestEmailJobData,
 } from '@lettermate/contracts';
 import type { INestApplication } from '@nestjs/common';
 import request from 'supertest';
+import { Webhook } from 'svix';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { configuredDiscoverySources, createApiApp } from './app.js';
 import { parseConfig } from '@lettermate/config';
+import { createEmailUnsubscribeToken, createEmailUnsubscribeTokenId } from '@lettermate/domain/email-unsubscribe';
 import { MemoryTopicStore } from './topic-store.js';
 import type { TopicQueue } from './topic-queue.js';
 import type { TrendQueue } from './trend-queue.js';
 import type { CreatorQueue } from './creator-queue.js';
+import type { DigestVerificationQueue } from './digest-verification-queue.js';
+import type { DigestTestEmailQueue } from './digest-test-email-queue.js';
+import {
+  DigestTestEmailService,
+  MemoryDigestTestEmailRepository,
+} from './digest-test-email-service.js';
+import {
+  DigestRecipientService,
+  MemoryDigestRecipientRepository,
+} from './digest-recipient-service.js';
 import {
   MemoryPersonalizationMemory,
   type MemoryPersonalizationFacts,
@@ -22,6 +36,15 @@ import {
   type CreatorIdentityResolver,
 } from './creator-resolver.js';
 import { AuthService, MemoryAuthRateLimiter, MemoryAuthStore } from './auth-service.js';
+import {
+  DigestUnsubscribeService,
+  MemoryDigestUnsubscribeRepository,
+} from './digest-unsubscribe-service.js';
+import {
+  EmailDeliveryWebhookService,
+  ResendWebhookVerifier,
+  type EmailDeliveryEvent,
+} from './email-delivery-webhook-service.js';
 
 class RecordingQueue implements TopicQueue {
   jobs: DiscoveryJobData[] = [];
@@ -77,6 +100,18 @@ class RecordingCreatorQueue implements CreatorQueue {
   async close() {}
 }
 
+class RecordingDigestVerificationQueue implements DigestVerificationQueue {
+  jobs: DigestVerificationJobData[] = [];
+  async enqueue(data: DigestVerificationJobData) { this.jobs.push(structuredClone(data)); }
+  async close() {}
+}
+
+class RecordingDigestTestEmailQueue implements DigestTestEmailQueue {
+  jobs: DigestTestEmailJobData[] = [];
+  async enqueue(data: DigestTestEmailJobData) { this.jobs.push(structuredClone(data)); }
+  async close() {}
+}
+
 class FailOnceCreatorQueue extends RecordingCreatorQueue {
   private failed = false;
 
@@ -95,8 +130,13 @@ describe('AI discovery API', () => {
   let queue: RecordingQueue;
   let trendQueue: RecordingTrendQueue;
   let creatorQueue: RecordingCreatorQueue;
+  let digestVerificationQueue: RecordingDigestVerificationQueue;
+  let digestTestEmailQueue: RecordingDigestTestEmailQueue;
   let creatorResolution: CreatorResolutionService;
   let personalizationFacts: MemoryPersonalizationFacts;
+  let unsubscribeToken: string;
+  let webhookEvents: EmailDeliveryEvent[];
+  const webhookSecret = `whsec_${Buffer.from('app-webhook-test-secret-32-bytes').toString('base64')}`;
   const discoverySources: DiscoverySourceStatus[] = [
     { id: 'openrouter-search', label: 'OpenRouter Web Search', category: 'web', status: 'enabled' },
     { id: 'twitterapi-io', label: 'X', category: 'social', status: 'not_configured' },
@@ -106,6 +146,8 @@ describe('AI discovery API', () => {
     queue = new RecordingQueue();
     trendQueue = new RecordingTrendQueue();
     creatorQueue = new RecordingCreatorQueue();
+    digestVerificationQueue = new RecordingDigestVerificationQueue();
+    digestTestEmailQueue = new RecordingDigestTestEmailQueue();
     personalizationFacts = {
       events: [{
         id: 'interest-event-1', userId: 'user-a', eventType: 'topic_state',
@@ -153,11 +195,28 @@ describe('AI discovery API', () => {
       'test-creator-resolution-secret',
       () => new Date('2026-07-27T12:00:00.000Z'),
     );
+    const digestRecipientRepository = new MemoryDigestRecipientRepository();
+    const digestUnsubscribeRepository = new MemoryDigestUnsubscribeRepository();
+    const unsubscribeSecret = 'unsubscribe-secret-with-at-least-thirty-two-characters';
+    const unsubscribeTokenId = createEmailUnsubscribeTokenId();
+    digestUnsubscribeRepository.register('user-a', unsubscribeTokenId);
+    unsubscribeToken = createEmailUnsubscribeToken(unsubscribeTokenId, unsubscribeSecret);
+    webhookEvents = [];
+    const digestRecipientService = new DigestRecipientService(
+      digestRecipientRepository,
+      digestVerificationQueue,
+      'https://app.example.com',
+      true,
+      undefined,
+      () => new Date('2026-07-27T12:00:00.000Z'),
+    );
     app = await createApiApp({
       store,
       queue,
       trendQueue,
       creatorQueue,
+      digestVerificationQueue,
+      digestTestEmailQueue,
       creatorResolution,
       aiConfigured: true,
       discoverySources,
@@ -165,6 +224,22 @@ describe('AI discovery API', () => {
       personalizationMemory: new MemoryPersonalizationMemory(
         () => personalizationFacts,
         () => new Date('2026-07-27T12:00:00.000Z'),
+      ),
+      digestRecipientService,
+      digestTestEmailService: new DigestTestEmailService(
+        new MemoryDigestTestEmailRepository(),
+        digestRecipientService,
+        digestTestEmailQueue,
+        true,
+        () => new Date('2026-07-27T12:00:00.000Z'),
+      ),
+      digestUnsubscribeService: new DigestUnsubscribeService(
+        digestUnsubscribeRepository,
+        unsubscribeSecret,
+      ),
+      emailDeliveryWebhookService: new EmailDeliveryWebhookService(
+        new ResendWebhookVerifier(webhookSecret),
+        { process: async (event) => { webhookEvents.push(event); } },
       ),
     });
   });
@@ -188,6 +263,160 @@ describe('AI discovery API', () => {
     expect(unsafe.headers['x-trace-id']).toEqual(expect.any(String));
     expect(unsafe.headers['x-trace-id']).not.toBe('student@example.com secret');
     expect(unsafe.body.traceId).toBe(unsafe.headers['x-trace-id']);
+  });
+
+  it('requests and confirms an owned digest recipient without exposing the token hash', async () => {
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-recipient')
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body).toEqual({
+        email: 'user-a@example.local', status: 'unverified', verifiedAt: null,
+      }));
+
+    await request(app.getHttpServer())
+      .post('/api/v1/digest-recipient/verification')
+      .set('x-user-id', 'user-a')
+      .send({ email: 'Student@Example.com' })
+      .expect(201)
+      .expect(({ body }) => expect(body).toEqual({
+        email: 'student@example.com', status: 'pending', verifiedAt: null,
+      }));
+    expect(digestVerificationQueue.jobs).toHaveLength(1);
+    expect(JSON.stringify(digestVerificationQueue.jobs[0])).not.toContain('user-a');
+    const token = new URL(digestVerificationQueue.jobs[0]!.verificationUrl)
+      .searchParams.get('token');
+
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-recipient/confirm')
+      .query({ token })
+      .expect(200)
+      .expect({ status: 'verified' });
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-recipient')
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body).toMatchObject({
+        email: 'student@example.com', status: 'verified',
+      }));
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-recipient/confirm')
+      .query({ token })
+      .expect(400)
+      .expect(({ body }) => expect(body.code).toBe('DIGEST_EMAIL_VERIFICATION_INVALID'));
+  });
+
+  it('protects digest recipient operations with authentication and input validation', async () => {
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-recipient')
+      .expect(401);
+    await request(app.getHttpServer())
+      .post('/api/v1/digest-recipient/verification')
+      .set('x-user-id', 'user-a')
+      .send({ email: 'not-an-email' })
+      .expect(400)
+      .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+    expect(digestVerificationQueue.jobs).toHaveLength(0);
+  });
+
+  it('supports public idempotent browser and one-click digest unsubscribe requests', async () => {
+    await request(app.getHttpServer())
+      .get('/api/v1/digest/unsubscribe')
+      .query({ token: unsubscribeToken })
+      .expect(200, { status: 'unsubscribed' });
+    await request(app.getHttpServer())
+      .post('/api/v1/digest/unsubscribe')
+      .query({ token: unsubscribeToken })
+      .type('form')
+      .send({ 'List-Unsubscribe': 'One-Click' })
+      .expect(200, { status: 'unsubscribed' });
+
+    const tampered = `${unsubscribeToken.slice(0, -1)}x`;
+    await request(app.getHttpServer())
+      .post('/api/v1/digest/unsubscribe')
+      .query({ token: tampered })
+      .expect(400)
+      .expect(({ body }) => {
+        expect(body.code).toBe('DIGEST_UNSUBSCRIBE_INVALID');
+        expect(JSON.stringify(body)).not.toContain('user-a');
+        expect(JSON.stringify(body)).not.toContain('@');
+      });
+  });
+
+  it('accepts an authenticated Resend webhook from the exact raw request body', async () => {
+    const body = JSON.stringify({
+      type: 'email.complained',
+      created_at: '2026-08-12T08:00:00.000Z',
+      data: { email_id: 'provider-email-1', to: ['private@example.com'] },
+    });
+    const id = 'msg_http_webhook_1';
+    const timestamp = new Date();
+    const signature = new Webhook(webhookSecret).sign(id, timestamp, body);
+
+    await request(app.getHttpServer())
+      .post('/api/v1/email-webhooks/resend')
+      .set('content-type', 'application/json')
+      .set('svix-id', id)
+      .set('svix-timestamp', Math.floor(timestamp.getTime() / 1_000).toString())
+      .set('svix-signature', signature)
+      .send(body)
+      .expect(200, { received: true });
+    expect(webhookEvents).toEqual([expect.objectContaining({
+      providerEventId: id,
+      providerMessageId: 'provider-email-1',
+      eventType: 'complained',
+    })]);
+    expect(JSON.stringify(webhookEvents)).not.toContain('private@example.com');
+
+    await request(app.getHttpServer())
+      .post('/api/v1/email-webhooks/resend')
+      .set('content-type', 'application/json')
+      .set('svix-id', `${id}-changed`)
+      .set('svix-timestamp', Math.floor(timestamp.getTime() / 1_000).toString())
+      .set('svix-signature', signature)
+      .send(`${body} `)
+      .expect(400)
+      .expect(({ body: error }) => expect(error.code).toBe('EMAIL_WEBHOOK_SIGNATURE_INVALID'));
+  });
+
+  it('queues and reads a test email only for the owning verified recipient', async () => {
+    await request(app.getHttpServer())
+      .post('/api/v1/digest-test-email')
+      .set('x-user-id', 'user-a')
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe('DIGEST_RECIPIENT_NOT_VERIFIED'));
+
+    await request(app.getHttpServer())
+      .post('/api/v1/digest-recipient/verification')
+      .set('x-user-id', 'user-a')
+      .send({ email: 'test@example.com' })
+      .expect(201);
+    const token = new URL(digestVerificationQueue.jobs[0]!.verificationUrl)
+      .searchParams.get('token');
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-recipient/confirm')
+      .query({ token })
+      .expect(200);
+
+    const created = await request(app.getHttpServer())
+      .post('/api/v1/digest-test-email')
+      .set('x-user-id', 'user-a')
+      .expect(201);
+    expect(created.body).toMatchObject({ status: 'queued', errorCode: null });
+    expect(created.body).not.toHaveProperty('recipientEmail');
+    expect(digestTestEmailQueue.jobs).toEqual([{
+      testEmailId: created.body.id, userId: 'user-a',
+    }]);
+
+    await request(app.getHttpServer())
+      .get(`/api/v1/digest-test-email/${created.body.id}`)
+      .set('x-user-id', 'user-a')
+      .expect(200)
+      .expect(({ body }) => expect(body.status).toBe('queued'));
+    await request(app.getHttpServer())
+      .get(`/api/v1/digest-test-email/${created.body.id}`)
+      .set('x-user-id', 'user-b')
+      .expect(404);
   });
 
   it('reads and controls only the authenticated user interest memory', async () => {
@@ -237,6 +466,25 @@ describe('AI discovery API', () => {
       .expect(200, {
         deliveryCapability: 'not_configured', nextLocalSend: null, recentRun: null,
       });
+
+    await request(app.getHttpServer())
+      .put('/api/v1/digest-preference')
+      .set('x-user-id', 'user-a')
+      .send({ enabled: true, localTime: '09:30', timezone: 'Asia/Tokyo' })
+      .expect(409)
+      .expect(({ body }) => expect(body.code).toBe('DIGEST_RECIPIENT_NOT_VERIFIED'));
+
+    await request(app.getHttpServer())
+      .post('/api/v1/digest-recipient/verification')
+      .set('x-user-id', 'user-a')
+      .send({ email: 'digest@example.com' })
+      .expect(201);
+    const token = new URL(digestVerificationQueue.jobs.at(-1)!.verificationUrl)
+      .searchParams.get('token');
+    await request(app.getHttpServer())
+      .get('/api/v1/digest-recipient/confirm')
+      .query({ token })
+      .expect(200, { status: 'verified' });
 
     const updated = await request(app.getHttpServer())
       .put('/api/v1/digest-preference')

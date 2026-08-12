@@ -233,6 +233,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .digest-settings__toggle p { margin: 0; color: var(--muted); font-size: 12px; }
 .digest-field { min-width: 0; display: grid; gap: 7px; color: #52606b; font-size: 12px; font-weight: 650; }
 .digest-field :is(input, select) { width: 100%; min-width: 0; height: 38px; border: 1px solid #cfd7da; border-radius: 4px; background: #fff; color: var(--ink); padding: 0 10px; }
+.digest-recipient { margin-bottom: 22px; }
+.digest-recipient > header { min-height: 42px; display: flex; align-items: center; border-bottom: 1px solid var(--border); }
+.digest-recipient h2 { margin: 0; font-size: 15px; }
+.digest-recipient form { display: grid; grid-template-columns: minmax(240px, 1fr) auto auto; gap: 16px; align-items: end; padding: 16px 0; }
+.digest-recipient__state { min-width: 78px; height: 38px; display: inline-flex; align-items: center; color: #a33d3d; font-size: 12px; font-weight: 700; }
+.digest-recipient__state--pending { color: #8a641d; }
+.digest-recipient__state--verified { color: #167149; }
+.inline-success { display: flex; align-items: center; gap: 7px; color: #167149; font-size: 12px; }
 .digest-delivery-status { margin-bottom: 22px; }
 .digest-delivery-status > header { min-height: 42px; display: flex; align-items: center; border-bottom: 1px solid var(--border); }
 .digest-delivery-status h2 { margin: 0; font-size: 15px; }
@@ -274,6 +282,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .auth-panel form label { display: grid; gap: 7px; color: #52606b; font-size: 12px; font-weight: 650; }
 .auth-panel form :is(input, select) { width: 100%; min-width: 0; height: 40px; border: 1px solid #cfd7da; border-radius: 4px; background: #fff; color: var(--ink); padding: 0 10px; }
 .auth-submit { width: 100%; justify-content: center; margin-top: 4px; }
+.digest-verification-result { display: grid; gap: 14px; text-align: center; justify-items: center; }
+.digest-verification-result .auth-brand { justify-self: stretch; }
+.digest-verification-result h2, .digest-verification-result p { margin: 0; }
 .sidebar-account { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px; border-top: 1px solid #ffffff1f; }
 .sidebar-account > div { min-width: 0; display: grid; gap: 3px; }
 .sidebar-account strong, .sidebar-account small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -318,6 +329,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     .creator-candidates > header { align-items: center; }
     .interest-groups { grid-template-columns: 1fr; gap: 24px; }
     .digest-preview-list { grid-template-columns: 1fr; }
+    .digest-recipient form { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 480px) {

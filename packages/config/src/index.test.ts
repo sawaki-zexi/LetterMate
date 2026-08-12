@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseConfig } from './index.js';
+import { isEmailDeliveryConfigured, parseConfig } from './index.js';
 
 describe('configuration', () => {
   it('requires secrets in production', () => {
@@ -14,11 +14,78 @@ describe('configuration', () => {
       METRICS_PORT: 9464,
       WEB_ORIGIN: 'http://localhost:5173',
       ALLOW_DEV_IDENTITY: true,
+      EMAIL_PROVIDER: 'none',
       SMTP_ENABLED: false,
       SMTP_PORT: 587,
       SMTP_SECURE: false,
       SMTP_REQUIRE_TLS: true,
     });
+  });
+
+  it('selects and validates the Resend email provider', () => {
+    const config = parseConfig({
+      EMAIL_PROVIDER: 'resend',
+      RESEND_API_KEY: 're_secret',
+      RESEND_FROM: 'LetterMate <digest@mail.example.com>',
+      RESEND_TIMEOUT_MS: '15000',
+    });
+
+    expect(config).toMatchObject({
+      EMAIL_PROVIDER: 'resend',
+      RESEND_API_KEY: 're_secret',
+      RESEND_FROM: 'LetterMate <digest@mail.example.com>',
+      RESEND_API_BASE_URL: 'https://api.resend.com',
+      RESEND_TIMEOUT_MS: 15_000,
+    });
+    expect(isEmailDeliveryConfigured(config)).toBe(true);
+    expect(() => parseConfig({ EMAIL_PROVIDER: 'resend' }))
+      .toThrow(/RESEND_API_KEY, RESEND_FROM/);
+    expect(() => parseConfig({
+      EMAIL_PROVIDER: 'resend',
+      RESEND_API_KEY: 're_secret',
+      RESEND_FROM: 'digest@example.com',
+      RESEND_API_BASE_URL: 'http://api.example.com',
+    })).toThrow(/HTTPS/);
+  });
+
+  it('requires a dedicated unsubscribe secret for configured production email', () => {
+    const production = {
+      NODE_ENV: 'production',
+      WEB_ORIGIN: 'https://discovery.example.com',
+      SESSION_SECRET: 's'.repeat(32),
+      CSRF_SECRET: 'c'.repeat(32),
+      ALLOW_DEV_IDENTITY: 'false',
+      EMAIL_PROVIDER: 'resend',
+      RESEND_API_KEY: 're_secret',
+      RESEND_FROM: 'digest@example.com',
+    };
+    expect(() => parseConfig(production)).toThrow(/EMAIL_UNSUBSCRIBE_SECRET/);
+    expect(parseConfig({
+      ...production,
+      EMAIL_UNSUBSCRIBE_SECRET: 'u'.repeat(32),
+      RESEND_WEBHOOK_SECRET: `whsec_${Buffer.from('webhook-secret-value').toString('base64')}`,
+    }).EMAIL_UNSUBSCRIBE_SECRET).toBe('u'.repeat(32));
+  });
+
+  it('requires and validates the Resend webhook secret in production', () => {
+    const production = {
+      NODE_ENV: 'production',
+      WEB_ORIGIN: 'https://discovery.example.com',
+      SESSION_SECRET: 's'.repeat(32),
+      CSRF_SECRET: 'c'.repeat(32),
+      ALLOW_DEV_IDENTITY: 'false',
+      EMAIL_PROVIDER: 'resend',
+      EMAIL_UNSUBSCRIBE_SECRET: 'u'.repeat(32),
+      RESEND_API_KEY: 're_secret',
+      RESEND_FROM: 'digest@example.com',
+    };
+    expect(() => parseConfig(production)).toThrow(/RESEND_WEBHOOK_SECRET/);
+    expect(() => parseConfig({ ...production, RESEND_WEBHOOK_SECRET: 'not-a-webhook-secret' }))
+      .toThrow();
+    expect(parseConfig({
+      ...production,
+      RESEND_WEBHOOK_SECRET: `whsec_${Buffer.from('webhook-secret-value').toString('base64')}`,
+    }).RESEND_WEBHOOK_SECRET).toMatch(/^whsec_/);
   });
 
   it('validates complete SMTP configuration without exposing credentials', () => {
@@ -32,6 +99,7 @@ describe('configuration', () => {
       SMTP_FROM: 'LetterMate <digest@example.com>',
       SMTP_MESSAGE_ID_DOMAIN: 'mail.example.com',
     })).toMatchObject({
+      EMAIL_PROVIDER: 'smtp',
       SMTP_ENABLED: true,
       SMTP_HOST: 'smtp.example.com',
       SMTP_PORT: 465,
@@ -47,6 +115,12 @@ describe('configuration', () => {
       SMTP_USER: 'mailer',
     })).toThrow(/configured together/);
     expect(() => parseConfig({ SMTP_MESSAGE_ID_DOMAIN: 'https://mail.example.com' })).toThrow();
+    expect(() => parseConfig({
+      EMAIL_PROVIDER: 'none',
+      SMTP_ENABLED: 'true',
+      SMTP_HOST: 'smtp.example.com',
+      SMTP_FROM: 'digest@example.com',
+    })).toThrow(/EMAIL_PROVIDER/);
   });
 
   it('provides bounded discovery execution defaults', () => {

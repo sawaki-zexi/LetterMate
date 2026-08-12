@@ -1,4 +1,4 @@
-import { parseConfig } from '@lettermate/config';
+import { isEmailDeliveryConfigured, parseConfig } from '@lettermate/config';
 import {
   creatorPlatformStatusSchema,
   creatorResolutionInputSchema,
@@ -8,7 +8,14 @@ import {
   digestPreferenceInputSchema,
   digestPreferenceSchema,
   digestPreviewSchema,
+  digestRecipientInputSchema,
+  digestRecipientSchema,
+  digestRecipientVerificationInputSchema,
+  digestRecipientVerificationResultSchema,
   digestStatusSchema,
+  digestTestEmailSchema,
+  digestUnsubscribeInputSchema,
+  digestUnsubscribeResultSchema,
   discoverySourceStatusSchema,
   feedImpressionInputSchema,
   feedImpressionReceiptSchema,
@@ -43,6 +50,7 @@ import {
   Post,
   Put,
   Query,
+  type RawBodyRequest,
   Req,
   Res,
   ServiceUnavailableException,
@@ -78,6 +86,11 @@ import {
   type CreatorQueue,
 } from './creator-queue.js';
 import {
+  createBullDigestVerificationQueue,
+  MemoryDigestVerificationQueue,
+  type DigestVerificationQueue,
+} from './digest-verification-queue.js';
+import {
   CreatorResolutionError,
   CreatorResolutionService,
   RssCreatorIdentityResolver,
@@ -96,12 +109,43 @@ import {
 } from './personalization-memory.js';
 import {
   DefaultDigestService,
+  DigestPreferenceError,
   MemoryDigestPreferenceStore,
   PrismaDigestPreferenceStore,
   type DigestPreferenceStore,
   type DigestService,
   type MemoryDigestFacts,
 } from './digest-service.js';
+import {
+  DigestRecipientError,
+  DigestRecipientService,
+  MemoryDigestRecipientRepository,
+  PrismaDigestRecipientRepository,
+} from './digest-recipient-service.js';
+import {
+  DigestTestEmailError,
+  DigestTestEmailService,
+  MemoryDigestTestEmailRepository,
+  PrismaDigestTestEmailRepository,
+} from './digest-test-email-service.js';
+import {
+  createBullDigestTestEmailQueue,
+  MemoryDigestTestEmailQueue,
+  type DigestTestEmailQueue,
+} from './digest-test-email-queue.js';
+import {
+  DigestUnsubscribeError,
+  DigestUnsubscribeService,
+  MemoryDigestUnsubscribeRepository,
+  PrismaDigestUnsubscribeRepository,
+} from './digest-unsubscribe-service.js';
+import {
+  EmailDeliveryWebhookError,
+  EmailDeliveryWebhookService,
+  MemoryEmailDeliveryEventRepository,
+  PrismaEmailDeliveryEventRepository,
+  ResendWebhookVerifier,
+} from './email-delivery-webhook-service.js';
 import {
   AuthError,
   AuthService,
@@ -124,6 +168,8 @@ const STORE = Symbol('TopicStore');
 const QUEUE = Symbol('TopicQueue');
 const TREND_QUEUE = Symbol('TrendQueue');
 const CREATOR_QUEUE = Symbol('CreatorQueue');
+const DIGEST_VERIFICATION_QUEUE = Symbol('DigestVerificationQueue');
+const DIGEST_TEST_EMAIL_QUEUE = Symbol('DigestTestEmailQueue');
 const CREATOR_RESOLUTION = Symbol('CreatorResolution');
 const AI_CONFIGURED = Symbol('AiConfigured');
 const DISCOVERY_SOURCES = Symbol('DiscoverySources');
@@ -132,6 +178,10 @@ const TREND_INTERVAL_HOURS = Symbol('TrendIntervalHours');
 const HEALTH_CHECKS = Symbol('HealthChecks');
 const PERSONALIZATION_MEMORY = Symbol('PersonalizationMemory');
 const DIGEST_SERVICE = Symbol('DigestService');
+const DIGEST_RECIPIENT_SERVICE = Symbol('DigestRecipientService');
+const DIGEST_TEST_EMAIL_SERVICE = Symbol('DigestTestEmailService');
+const DIGEST_UNSUBSCRIBE_SERVICE = Symbol('DigestUnsubscribeService');
+const EMAIL_DELIVERY_WEBHOOK_SERVICE = Symbol('EmailDeliveryWebhookService');
 const AUTH_SERVICE = Symbol('AuthService');
 const ALLOW_DEV_IDENTITY = Symbol('AllowDevIdentity');
 const SECURE_COOKIES = Symbol('SecureCookies');
@@ -182,6 +232,11 @@ class ApiController {
     @Inject(HEALTH_CHECKS) private readonly healthChecks: ApiHealthChecks,
     @Inject(PERSONALIZATION_MEMORY) private readonly personalization: PersonalizationMemory,
     @Inject(DIGEST_SERVICE) private readonly digest: DigestService,
+    @Inject(DIGEST_RECIPIENT_SERVICE) private readonly digestRecipient: DigestRecipientService,
+    @Inject(DIGEST_TEST_EMAIL_SERVICE) private readonly digestTestEmail: DigestTestEmailService,
+    @Inject(DIGEST_UNSUBSCRIBE_SERVICE) private readonly digestUnsubscribe: DigestUnsubscribeService,
+    @Inject(EMAIL_DELIVERY_WEBHOOK_SERVICE)
+    private readonly emailDeliveryWebhook: EmailDeliveryWebhookService,
     @Inject(AUTH_SERVICE) private readonly auth: AuthService,
     @Inject(ALLOW_DEV_IDENTITY) private readonly allowDevIdentity: boolean,
     @Inject(SECURE_COOKIES) private readonly secureCookies: boolean,
@@ -265,6 +320,28 @@ class ApiController {
     const cookies = parseCookies(cookieHeader);
     await this.auth.logout(cookies[authCookieNames.session]);
     clearAuthCookies(response, this.secureCookies);
+  }
+
+  @Post('email-webhooks/resend')
+  @HttpCode(200)
+  async receiveResendWebhook(
+    @Req() request: RawBodyRequest<Request>,
+    @Headers('svix-id') id?: string,
+    @Headers('svix-timestamp') timestamp?: string,
+    @Headers('svix-signature') signature?: string,
+  ) {
+    try {
+      return await this.emailDeliveryWebhook.receive(request.rawBody, {
+        ...(id ? { id } : {}),
+        ...(timestamp ? { timestamp } : {}),
+        ...(signature ? { signature } : {}),
+      });
+    } catch (error) {
+      if (error instanceof EmailDeliveryWebhookError) {
+        throw new HttpException(errorBody(error.code, error.message), error.status);
+      }
+      throw error;
+    }
   }
 
   @Post('topics')
@@ -643,6 +720,56 @@ class ApiController {
     );
   }
 
+  @Get('digest-recipient')
+  async getDigestRecipient(@Headers('x-user-id') header?: string) {
+    return digestRecipientSchema.parse(
+      await this.digestRecipient.get(authenticatedUser(header)),
+    );
+  }
+
+  @Post('digest-recipient/verification')
+  async requestDigestRecipientVerification(
+    @Headers('x-user-id') header: string | undefined,
+    @Body() body: unknown,
+    @Req() request: Request,
+  ) {
+    const input = parseOrThrow(digestRecipientInputSchema, body, '收件邮箱无效');
+    try {
+      return digestRecipientSchema.parse(await this.digestRecipient.request(
+        authenticatedUser(header), input.email, request.ip ?? 'unknown',
+      ));
+    } catch (error) {
+      this.throwDigestRecipientError(error);
+    }
+  }
+
+  @Get('digest-recipient/confirm')
+  async confirmDigestRecipient(@Query() query: unknown) {
+    const input = parseOrThrow(
+      digestRecipientVerificationInputSchema,
+      query,
+      '邮箱验证链接无效',
+    );
+    try {
+      return digestRecipientVerificationResultSchema.parse(
+        await this.digestRecipient.confirm(input.token),
+      );
+    } catch (error) {
+      this.throwDigestRecipientError(error);
+    }
+  }
+
+  @Get('digest/unsubscribe')
+  async unsubscribeDigest(@Query() query: unknown) {
+    return this.unsubscribeDigestWithToken(query);
+  }
+
+  @Post('digest/unsubscribe')
+  @HttpCode(200)
+  async oneClickUnsubscribeDigest(@Query() query: unknown) {
+    return this.unsubscribeDigestWithToken(query);
+  }
+
   @Put('digest-preference')
   async updateDigestPreference(
     @Headers('x-user-id') header: string | undefined,
@@ -653,9 +780,41 @@ class ApiController {
       body,
       '每日邮件设置无效',
     );
-    return digestPreferenceSchema.parse(
-      await this.digest.updatePreference(authenticatedUser(header), input),
-    );
+    try {
+      return digestPreferenceSchema.parse(
+        await this.digest.updatePreference(authenticatedUser(header), input),
+      );
+    } catch (error) {
+      if (error instanceof DigestPreferenceError) {
+        throw new HttpException(errorBody(error.code, error.message), error.status);
+      }
+      throw error;
+    }
+  }
+
+  @Post('digest-test-email')
+  async sendDigestTestEmail(@Headers('x-user-id') header?: string) {
+    try {
+      return digestTestEmailSchema.parse(
+        await this.digestTestEmail.request(authenticatedUser(header)),
+      );
+    } catch (error) {
+      this.throwDigestTestEmailError(error);
+    }
+  }
+
+  @Get('digest-test-email/:id')
+  async getDigestTestEmail(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('id') id: string,
+  ) {
+    try {
+      return digestTestEmailSchema.parse(
+        await this.digestTestEmail.get(authenticatedUser(header), id),
+      );
+    } catch (error) {
+      this.throwDigestTestEmailError(error);
+    }
   }
 
   @Get('digest-preview')
@@ -741,6 +900,38 @@ class ApiController {
     throw error;
   }
 
+  private throwDigestRecipientError(error: unknown): never {
+    if (error instanceof DigestRecipientError) {
+      throw new HttpException(errorBody(error.code, error.message), error.status);
+    }
+    throw error;
+  }
+
+  private async unsubscribeDigestWithToken(query: unknown) {
+    const input = parseOrThrow(
+      digestUnsubscribeInputSchema,
+      query,
+      '退订链接无效',
+    );
+    try {
+      return digestUnsubscribeResultSchema.parse(
+        await this.digestUnsubscribe.unsubscribe(input.token),
+      );
+    } catch (error) {
+      if (error instanceof DigestUnsubscribeError) {
+        throw new BadRequestException(errorBody(error.code, '退订链接无效'));
+      }
+      throw error;
+    }
+  }
+
+  private throwDigestTestEmailError(error: unknown): never {
+    if (error instanceof DigestTestEmailError) {
+      throw new HttpException(errorBody(error.code, error.message), error.status);
+    }
+    throw error;
+  }
+
   private async createAndEnqueueCreators(
     userId: string,
     inputs: CreatorCreateInput[],
@@ -799,12 +990,16 @@ class ResourceCloser implements OnModuleDestroy {
     @Inject(QUEUE) private readonly queue: TopicQueue,
     @Inject(TREND_QUEUE) private readonly trendQueue: TrendQueue,
     @Inject(CREATOR_QUEUE) private readonly creatorQueue: CreatorQueue,
+    @Inject(DIGEST_VERIFICATION_QUEUE) private readonly digestVerificationQueue: DigestVerificationQueue,
+    @Inject(DIGEST_TEST_EMAIL_QUEUE) private readonly digestTestEmailQueue: DigestTestEmailQueue,
   ) {}
 
   async onModuleDestroy() {
     await this.queue.close();
     await this.trendQueue.close();
     await this.creatorQueue.close();
+    await this.digestVerificationQueue.close();
+    await this.digestTestEmailQueue.close();
     await this.store.close();
   }
 }
@@ -818,6 +1013,8 @@ class AppModule implements NestModule {
     queue: TopicQueue,
     trendQueue: TrendQueue,
     creatorQueue: CreatorQueue,
+    digestVerificationQueue: DigestVerificationQueue,
+    digestTestEmailQueue: DigestTestEmailQueue,
     creatorResolution: CreatorResolutionGateway,
     aiConfigured: boolean,
     discoverySources: DiscoverySourceStatus[],
@@ -826,6 +1023,10 @@ class AppModule implements NestModule {
     healthChecks: ApiHealthChecks,
     personalization: PersonalizationMemory,
     digest: DigestService,
+    digestRecipient: DigestRecipientService,
+    digestTestEmail: DigestTestEmailService,
+    digestUnsubscribe: DigestUnsubscribeService,
+    emailDeliveryWebhook: EmailDeliveryWebhookService,
     auth: AuthService,
     allowDevIdentity: boolean,
     secureCookies: boolean,
@@ -839,6 +1040,8 @@ class AppModule implements NestModule {
         { provide: QUEUE, useValue: queue },
         { provide: TREND_QUEUE, useValue: trendQueue },
         { provide: CREATOR_QUEUE, useValue: creatorQueue },
+        { provide: DIGEST_VERIFICATION_QUEUE, useValue: digestVerificationQueue },
+        { provide: DIGEST_TEST_EMAIL_QUEUE, useValue: digestTestEmailQueue },
         { provide: CREATOR_RESOLUTION, useValue: creatorResolution },
         { provide: AI_CONFIGURED, useValue: aiConfigured },
         { provide: DISCOVERY_SOURCES, useValue: discoverySources },
@@ -847,6 +1050,10 @@ class AppModule implements NestModule {
         { provide: HEALTH_CHECKS, useValue: healthChecks },
         { provide: PERSONALIZATION_MEMORY, useValue: personalization },
         { provide: DIGEST_SERVICE, useValue: digest },
+        { provide: DIGEST_RECIPIENT_SERVICE, useValue: digestRecipient },
+        { provide: DIGEST_TEST_EMAIL_SERVICE, useValue: digestTestEmail },
+        { provide: DIGEST_UNSUBSCRIBE_SERVICE, useValue: digestUnsubscribe },
+        { provide: EMAIL_DELIVERY_WEBHOOK_SERVICE, useValue: emailDeliveryWebhook },
         { provide: AUTH_SERVICE, useValue: auth },
         { provide: ALLOW_DEV_IDENTITY, useValue: allowDevIdentity },
         { provide: SECURE_COOKIES, useValue: secureCookies },
@@ -862,6 +1069,8 @@ export interface CreateApiAppOptions {
   queue?: TopicQueue;
   trendQueue?: TrendQueue;
   creatorQueue?: CreatorQueue;
+  digestVerificationQueue?: DigestVerificationQueue;
+  digestTestEmailQueue?: DigestTestEmailQueue;
   creatorResolution?: CreatorResolutionGateway;
   aiConfigured?: boolean;
   discoverySources?: DiscoverySourceStatus[];
@@ -871,6 +1080,10 @@ export interface CreateApiAppOptions {
   healthChecks?: Partial<Omit<ApiHealthChecks, 'aiConfigured'>>;
   personalizationMemory?: PersonalizationMemory;
   digestService?: DigestService;
+  digestRecipientService?: DigestRecipientService;
+  digestTestEmailService?: DigestTestEmailService;
+  digestUnsubscribeService?: DigestUnsubscribeService;
+  emailDeliveryWebhookService?: EmailDeliveryWebhookService;
   emailDeliveryConfigured?: boolean;
   authService?: AuthService;
   allowDevIdentity?: boolean;
@@ -906,12 +1119,52 @@ export async function createApiApp(
     config.CSRF_SECRET ?? randomBytes(32).toString('base64url'),
     options.now,
   );
+  const digestVerificationQueue = options.digestVerificationQueue
+    ?? (prisma
+      ? createBullDigestVerificationQueue(config.REDIS_URL)
+      : new MemoryDigestVerificationQueue());
+  const digestRecipientRepository = prisma
+    ? new PrismaDigestRecipientRepository(prisma)
+    : new MemoryDigestRecipientRepository((userId) => {
+        const preference = memoryDigestFacts.preferences[userId];
+        if (preference) memoryDigestFacts.preferences[userId] = { ...preference, enabled: false };
+      });
+  const digestRecipient = options.digestRecipientService ?? new DigestRecipientService(
+    digestRecipientRepository,
+    digestVerificationQueue,
+    config.WEB_ORIGIN,
+    options.emailDeliveryConfigured ?? isEmailDeliveryConfigured(config),
+    undefined,
+    options.now,
+  );
   const digest = options.digestService ?? new DefaultDigestService(
     digestPreferences,
     store,
     personalization,
     options.now,
-    options.emailDeliveryConfigured ?? config.SMTP_ENABLED,
+    options.emailDeliveryConfigured ?? isEmailDeliveryConfigured(config),
+    digestRecipient,
+  );
+  const digestTestEmailQueue = options.digestTestEmailQueue
+    ?? (prisma ? createBullDigestTestEmailQueue(config.REDIS_URL) : new MemoryDigestTestEmailQueue());
+  const digestTestEmail = options.digestTestEmailService ?? new DigestTestEmailService(
+    prisma ? new PrismaDigestTestEmailRepository(prisma) : new MemoryDigestTestEmailRepository(),
+    digestRecipient,
+    digestTestEmailQueue,
+    options.emailDeliveryConfigured ?? isEmailDeliveryConfigured(config),
+    options.now,
+  );
+  const digestUnsubscribe = options.digestUnsubscribeService ?? new DigestUnsubscribeService(
+    prisma
+      ? new PrismaDigestUnsubscribeRepository(prisma)
+      : new MemoryDigestUnsubscribeRepository(),
+    config.EMAIL_UNSUBSCRIBE_SECRET,
+  );
+  const emailDeliveryWebhook = options.emailDeliveryWebhookService ?? new EmailDeliveryWebhookService(
+    config.RESEND_WEBHOOK_SECRET ? new ResendWebhookVerifier(config.RESEND_WEBHOOK_SECRET) : null,
+    prisma
+      ? new PrismaEmailDeliveryEventRepository(prisma)
+      : new MemoryEmailDeliveryEventRepository(),
   );
   const queue = options.queue ?? createBullTopicQueue(config.REDIS_URL);
   const trendQueue = options.trendQueue ?? createBullTrendQueue(config.REDIS_URL);
@@ -932,7 +1185,9 @@ export async function createApiApp(
   const redisProbe = options.healthChecks?.redis
     ?? healthProbe(queue)
     ?? healthProbe(trendQueue)
-    ?? healthProbe(creatorQueue);
+    ?? healthProbe(creatorQueue)
+    ?? healthProbe(digestVerificationQueue)
+    ?? healthProbe(digestTestEmailQueue);
   const healthChecks: ApiHealthChecks = {
     ...(databaseProbe ? { database: databaseProbe } : {}),
     ...(redisProbe ? { redis: redisProbe } : {}),
@@ -948,6 +1203,8 @@ export async function createApiApp(
       queue,
       trendQueue,
       creatorQueue,
+      digestVerificationQueue,
+      digestTestEmailQueue,
       creatorResolution,
       aiConfigured,
       discoverySources,
@@ -956,12 +1213,16 @@ export async function createApiApp(
       healthChecks,
       personalization,
       digest,
+      digestRecipient,
+      digestTestEmail,
+      digestUnsubscribe,
+      emailDeliveryWebhook,
       auth,
       allowDevIdentity,
       secureCookies,
       metrics,
     ),
-    { logger: false },
+    { logger: false, rawBody: true },
   );
   const trustProxy = options.trustProxy ?? (config.NODE_ENV === 'production' ? 1 : false);
   if (trustProxy !== false) {

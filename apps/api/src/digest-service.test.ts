@@ -106,6 +106,104 @@ describe('daily digest preview service', () => {
     expect(facts.preferences['user-b']).toBeUndefined();
   });
 
+  it('requires a verified recipient before enabling the digest', async () => {
+    const facts: MemoryDigestFacts = { preferences: {} };
+    const recipients = { get: vi.fn().mockResolvedValue({ email: null, status: 'unverified' }) };
+    const service = new DefaultDigestService(
+      new MemoryDigestPreferenceStore(() => facts),
+      { listFeed: vi.fn() } as unknown as TopicStore,
+      new MemoryPersonalizationMemory(() => ({
+        events: [], tags: [], creatorContent: [], settings: {}, forgottenTagIds: {},
+      })),
+      undefined,
+      true,
+      recipients,
+    );
+
+    await expect(service.updatePreference('user-a', {
+      enabled: true, localTime: '09:15', timezone: 'Asia/Shanghai',
+    })).rejects.toMatchObject({ code: 'DIGEST_RECIPIENT_NOT_VERIFIED', status: 409 });
+
+    recipients.get.mockResolvedValue({ email: 'student@example.com', status: 'verified' });
+    await expect(service.updatePreference('user-a', {
+      enabled: true, localTime: '09:15', timezone: 'Asia/Shanghai',
+    })).resolves.toMatchObject({ enabled: true });
+  });
+
+  it('uses a conditional Prisma update so recipient changes cannot race digest enabling', async () => {
+    const transaction = {
+      user: { upsert: vi.fn().mockResolvedValue({}) },
+      digestPreference: {
+        updateMany: vi.fn()
+          .mockResolvedValueOnce({ count: 0 })
+          .mockResolvedValueOnce({ count: 0 }),
+      },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback: (value: typeof transaction) => unknown) => callback(transaction)),
+    } as unknown as PrismaClient;
+
+    await expect(new PrismaDigestPreferenceStore(prisma).update('user-a', {
+      enabled: true, localTime: '09:15', timezone: 'Asia/Shanghai',
+    })).rejects.toMatchObject({ code: 'DIGEST_RECIPIENT_NOT_VERIFIED' });
+    expect(transaction.digestPreference.updateMany).toHaveBeenCalledWith({
+      where: {
+        userId: 'user-a', enabled: false,
+        recipientStatus: 'verified', recipientEmail: { not: null },
+      },
+      data: {
+        enabled: true,
+        localSendTime: '09:15',
+        unsubscribeTokenId: expect.any(String),
+      },
+    });
+    expect(transaction.digestPreference.updateMany).toHaveBeenLastCalledWith({
+      where: {
+        userId: 'user-a', enabled: true,
+        recipientStatus: 'verified', recipientEmail: { not: null },
+      },
+      data: { localSendTime: '09:15' },
+    });
+  });
+
+  it('rotates unsubscribe only when explicitly re-enabling, not while already enabled', async () => {
+    const reenableUpdates = vi.fn().mockResolvedValueOnce({ count: 1 });
+    const reenableTransaction = {
+      user: { upsert: vi.fn().mockResolvedValue({}) },
+      digestPreference: { updateMany: reenableUpdates },
+    };
+    const reenablePrisma = {
+      $transaction: vi.fn(async (callback: (value: typeof reenableTransaction) => unknown) => (
+        callback(reenableTransaction)
+      )),
+    } as unknown as PrismaClient;
+
+    await new PrismaDigestPreferenceStore(reenablePrisma).update('user-a', {
+      enabled: true, localTime: '09:15', timezone: 'Asia/Shanghai',
+    });
+    const rotated = reenableUpdates.mock.calls[0]?.[0].data.unsubscribeTokenId;
+    expect(rotated).toEqual(expect.any(String));
+    expect(reenableUpdates).toHaveBeenCalledTimes(1);
+
+    const alreadyEnabledUpdates = vi.fn()
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+    const alreadyEnabledTransaction = {
+      user: { upsert: vi.fn().mockResolvedValue({}) },
+      digestPreference: { updateMany: alreadyEnabledUpdates },
+    };
+    const alreadyEnabledPrisma = {
+      $transaction: vi.fn(async (callback: (value: typeof alreadyEnabledTransaction) => unknown) => (
+        callback(alreadyEnabledTransaction)
+      )),
+    } as unknown as PrismaClient;
+
+    await new PrismaDigestPreferenceStore(alreadyEnabledPrisma).update('user-a', {
+      enabled: true, localTime: '10:30', timezone: 'Asia/Shanghai',
+    });
+    expect(alreadyEnabledUpdates.mock.calls[1]?.[0].data).toEqual({ localSendTime: '10:30' });
+  });
+
   it('returns only the safe recent run summary for the owned user', async () => {
     const recentRun = {
       status: 'succeeded' as const,

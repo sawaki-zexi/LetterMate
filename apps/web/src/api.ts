@@ -14,7 +14,12 @@ import {
   digestPreferenceInputSchema,
   digestPreferenceSchema,
   digestPreviewSchema,
+  digestRecipientInputSchema,
+  digestRecipientSchema,
+  digestRecipientVerificationResultSchema,
   digestStatusSchema,
+  digestTestEmailSchema,
+  digestUnsubscribeResultSchema,
   discoverySourceStatusSchema,
   contentFeedbackSchema,
   feedImpressionInputSchema,
@@ -39,6 +44,7 @@ import {
   type TopicUpdateInput,
   type InterestMemorySettingsInput,
   type DigestPreferenceInput,
+  type DigestRecipientInput,
   type AuthLoginInput,
   type AuthRegisterInput,
 } from '@lettermate/contracts';
@@ -253,5 +259,29 @@ export const api = {
   ),
   digestPreview: () => apiRequest('/digest-preview', digestPreviewSchema),
   digestStatus: () => apiRequest('/digest-status', digestStatusSchema),
+  sendDigestTestEmail: () => apiRequest('/digest-test-email', digestTestEmailSchema, {
+    method: 'POST',
+  }),
+  digestTestEmail: (id: string) => apiRequest(
+    `/digest-test-email/${encodeURIComponent(id)}`,
+    digestTestEmailSchema,
+  ),
+  digestRecipient: () => apiRequest('/digest-recipient', digestRecipientSchema),
+  requestDigestRecipientVerification: (input: DigestRecipientInput) => apiRequest(
+    '/digest-recipient/verification',
+    digestRecipientSchema,
+    {
+      method: 'POST',
+      body: JSON.stringify(digestRecipientInputSchema.parse(input)),
+    },
+  ),
+  confirmDigestRecipient: (token: string) => apiRequest(
+    `/digest-recipient/confirm?${new URLSearchParams({ token })}`,
+    digestRecipientVerificationResultSchema,
+  ),
+  unsubscribeDigest: (token: string) => apiRequest(
+    `/digest/unsubscribe?${new URLSearchParams({ token })}`,
+    digestUnsubscribeResultSchema,
+  ),
   item: (id: string) => apiRequest(`/items/${encodeURIComponent(id)}`, feedItemSchema),
 };

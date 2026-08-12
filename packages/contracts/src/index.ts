@@ -4,6 +4,8 @@ export const discoveryQueueName = 'topic-discovery';
 export const trendQueueName = 'trend-discovery';
 export const creatorQueueName = 'creator-discovery';
 export const digestQueueName = 'daily-digest';
+export const digestVerificationQueueName = 'digest-email-verification';
+export const digestTestEmailQueueName = 'digest-test-email';
 export const maxTopicExpandedTerms = 32;
 
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
@@ -422,6 +424,60 @@ export const digestPreferenceInputSchema = z.strictObject({
 
 export const digestPreferenceSchema = digestPreferenceInputSchema;
 
+export const digestRecipientStatusSchema = z.enum([
+  'unverified', 'pending', 'verified', 'suppressed',
+]);
+
+export const digestRecipientSchema = z.strictObject({
+  email: z.email().nullable(),
+  status: digestRecipientStatusSchema,
+  verifiedAt: z.iso.datetime().nullable(),
+});
+
+export const digestRecipientInputSchema = z.strictObject({
+  email: z.email(),
+});
+
+export const digestRecipientVerificationInputSchema = z.strictObject({
+  token: z.string().min(32).max(500),
+});
+
+export const digestRecipientVerificationResultSchema = z.strictObject({
+  status: z.literal('verified'),
+});
+
+export const digestUnsubscribeInputSchema = z.strictObject({
+  token: z.string().min(32).max(500),
+});
+
+export const digestUnsubscribeResultSchema = z.strictObject({
+  status: z.literal('unsubscribed'),
+});
+
+export const digestVerificationJobDataSchema = z.strictObject({
+  verificationId: z.string().min(1),
+  recipient: z.email(),
+  verificationUrl: httpUrlSchema,
+  expiresAt: z.iso.datetime(),
+});
+
+export const digestTestEmailStatusSchema = z.enum([
+  'queued', 'running', 'retrying', 'succeeded', 'failed',
+]);
+
+export const digestTestEmailSchema = z.strictObject({
+  id: z.string().min(1),
+  status: digestTestEmailStatusSchema,
+  createdAt: z.iso.datetime(),
+  finishedAt: z.iso.datetime().nullable(),
+  errorCode: z.string().min(1).max(100).nullable(),
+});
+
+export const digestTestEmailJobDataSchema = z.strictObject({
+  testEmailId: z.string().min(1),
+  userId: z.string().min(1),
+});
+
 export const digestBriefSchema = z.strictObject({
   conclusion: z.string().trim().min(1),
   evidence: z.string().trim().min(1),
@@ -676,6 +732,17 @@ export type InterestMemoryTheme = z.infer<typeof interestMemoryThemeSchema>;
 export type InterestMemorySettingsInput = z.infer<typeof interestMemorySettingsInputSchema>;
 export type DigestPreference = z.infer<typeof digestPreferenceSchema>;
 export type DigestPreferenceInput = z.infer<typeof digestPreferenceInputSchema>;
+export type DigestRecipientStatus = z.infer<typeof digestRecipientStatusSchema>;
+export type DigestRecipient = z.infer<typeof digestRecipientSchema>;
+export type DigestRecipientInput = z.infer<typeof digestRecipientInputSchema>;
+export type DigestRecipientVerificationInput = z.infer<typeof digestRecipientVerificationInputSchema>;
+export type DigestRecipientVerificationResult = z.infer<typeof digestRecipientVerificationResultSchema>;
+export type DigestUnsubscribeInput = z.infer<typeof digestUnsubscribeInputSchema>;
+export type DigestUnsubscribeResult = z.infer<typeof digestUnsubscribeResultSchema>;
+export type DigestVerificationJobData = z.infer<typeof digestVerificationJobDataSchema>;
+export type DigestTestEmailStatus = z.infer<typeof digestTestEmailStatusSchema>;
+export type DigestTestEmail = z.infer<typeof digestTestEmailSchema>;
+export type DigestTestEmailJobData = z.infer<typeof digestTestEmailJobDataSchema>;
 export type DigestBrief = z.infer<typeof digestBriefSchema>;
 export type DigestCitation = z.infer<typeof digestCitationSchema>;
 export type DigestPreview = z.infer<typeof digestPreviewSchema>;

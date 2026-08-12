@@ -51,6 +51,8 @@ export class DigestScheduleService {
       try {
         const run = await this.repository.ensureRun({
           userId: preference.userId,
+          recipientEmail: preference.recipientEmail,
+          unsubscribeTokenId: preference.unsubscribeTokenId,
           scheduledLocalDate: clock.localDate,
           windowEnd: now,
           now,

@@ -28,13 +28,14 @@ docker compose -f infra/compose.production.example.yaml run --rm api node --impo
 
 ## 2. 部署检查
 
-1. 使用秘密存储提供 `SESSION_SECRET`、`CSRF_SECRET`、数据库、Redis、AI、连接器和 SMTP 凭据；不要写入镜像或仓库。
+1. 使用秘密存储提供 `SESSION_SECRET`、`CSRF_SECRET`、`EMAIL_UNSUBSCRIBE_SECRET`、数据库、Redis、AI、连接器和邮件提供商凭据；不要写入镜像或仓库。生产邮件推荐 `EMAIL_PROVIDER=resend`，并必须提供 `RESEND_WEBHOOK_SECRET`；SMTP 仅作为兼容路径。API 与 Worker 必须使用同一个退订密钥。
 2. 设置 `NODE_ENV=production`、`ALLOW_DEV_IDENTITY=false`，并使用 HTTPS `WEB_ORIGIN`。生产配置不满足这三项时必须启动失败。
 3. 运行 `docker compose -f infra/compose.production.example.yaml --profile monitoring config --quiet`，确认 Compose 有效且没有暴露 PostgreSQL/Redis 端口。
 4. 创建并校验数据库备份，再运行 `npm run db:deploy` 或一次性 `migrate` 服务。禁止自动执行迁移回滚。
+5. 部署收件验证和退订快照迁移时，历史未验证偏好会被保守暂停，历史排队/运行中且没有冻结地址或退订 ID 的任务会标记失败；用户验证地址后需显式重新启用。迁移不会改写已成功或已跳过的历史运行。
 5. 运行配置模式和 live 模式 `ops:doctor`；数据库与 Redis 必须为 `ok`。
 6. 启动 API/Worker/Web，确认 `/api/v1/health` 为 200，`/api/v1/health/ready` 为 200。
-7. 对已配置供应商运行对应的显式 live smoke；未配置供应商不阻塞其他能力。
+7. 对已配置供应商运行对应的显式 live smoke；Resend 还需把 Webhook 配置为公开 HTTPS `POST /api/v1/email-webhooks/resend`，确认 Svix 签名测试事件返回 200。未配置供应商不阻塞其他能力。
 8. 检查 `api.started`、`worker.started`、队列快照和首次调度日志，再开放流量。
 
 ### 每日备份与恢复演练
@@ -131,7 +132,7 @@ Prometheus 采集目标：
 
 ## 4. 密钥轮换
 
-### AI、连接器和 SMTP
+### AI、连接器和邮件提供商
 
 1. 在供应商创建新凭据，保留旧凭据。
 2. 更新秘密存储并重启使用该凭据的服务。X 同时被 API 身份解析和 Worker 使用，需要重启两者；其他发现和邮件凭据通常只需重启 Worker。
@@ -142,6 +143,10 @@ Prometheus 采集目标：
 ### Session 与 CSRF
 
 当前单实例基线没有多密钥验证窗口。轮换 `SESSION_SECRET` 会使现有登录会话失效，轮换 `CSRF_SECRET` 会使现有 CSRF Token 失效。应在维护窗口更新、重启 API，并明确要求用户重新登录。横向扩展前必须先设计 key ring，不能用不一致密钥滚动发布。
+
+### 邮件退订签名
+
+`EMAIL_UNSUBSCRIBE_SECRET` 必须在 API 与 Worker 中同步。当前没有多密钥验证窗口；轮换会使历史邮件中的退订链接失效。只在密钥泄露或计划维护时轮换，同时重启 API 与 Worker，并通知用户仍可登录 LetterMate 关闭每日邮件。不要把它与供应商 API Key 一起常规轮换。
 
 ### PostgreSQL 与 Redis
 
@@ -162,7 +167,12 @@ Prometheus 采集目标：
 | API 不就绪 | live doctor、PostgreSQL、Redis | 恢复依赖后确认 Readiness；不要仅重启循环 |
 | 队列积压 | Worker 日志、waiting/active/failed、外部限流 | 恢复 Worker 或限流来源；保留 BullMQ 任务状态 |
 | 单一来源失败 | component 与安全 code、供应商状态 | 禁用或修复该来源；其他来源继续运行 |
-| 邮件失败 | digest queue、SMTP live smoke | 修复后重试同一冻结快照；失败不能推进成功边界 |
+| 邮件失败 | digest queue、对应 Resend/SMTP live smoke | 修复后重试同一冻结快照；失败不能推进成功边界 |
+| 邮件未调度 | 收件状态、`enabled`、冻结地址迁移 | 确认地址为 `verified` 并让用户显式启用；不得手工把未验证地址写成已验证 |
+| 一键退订失败 | API/Worker 的 `EMAIL_UNSUBSCRIBE_SECRET`、邮件头与公开路由 | 确保两进程密钥一致并同时重启；不要通过手工恢复旧 Token 绕过轮换 |
+| Resend Webhook 失败 | `RESEND_WEBHOOK_SECRET`、公开 HTTPS 路由、Svix 三个头、API 时间同步 | 修复秘密或反向代理原始请求体传递后重放供应商事件；禁止关闭签名验证或记录原始 payload |
+| 地址被邮件服务停用 | `EmailDeliveryEvent` 的安全事件类型/结果、对应本地 provider message ID | 不手工恢复同一地址；让用户更换并验证地址。未知或冲突归属只调查消息 ID，不能按 payload 邮箱修改账户 |
+| 测试邮件失败 | `digest-test-email` queue、安全状态码、Provider smoke | 修复后在限频窗口允许时重试；测试邮件不得用于推进日报成功边界 |
 | 数据库损坏或误操作 | 备份清单、隔离恢复验证 | 停机、审批后恢复主库；禁止工具自动覆盖主库 |
 
 应用回滚只回滚镜像，不自动回滚 Prisma migration。若旧镜像不兼容新 schema，继续使用新镜像修复或执行经过评审的前向迁移。

@@ -6,6 +6,10 @@ export interface EmailMessage {
   subject: string;
   text: string;
   html: string;
+  headers?: {
+    'List-Unsubscribe': string;
+    'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click';
+  };
 }
 
 export interface EmailSendOptions {
@@ -26,6 +30,113 @@ export class EmailGatewayError extends Error {
 export interface EmailGateway {
   send(message: EmailMessage, options: EmailSendOptions): Promise<{ messageId: string }>;
 }
+
+export function renderDigestTestEmail(recipient: string): EmailMessage {
+  const safeRecipient = escapeHtml(recipient);
+  return {
+    to: recipient,
+    subject: '[测试] LetterMate 每日研究简报投递确认',
+    text: [
+      '这是一封 LetterMate 测试邮件。',
+      '',
+      '收到此邮件说明当前收件邮箱和系统邮件投递已经连通。',
+      '这不是正式的每日研究简报，不会改变日报发送记录。',
+    ].join('\n'),
+    html: [
+      '<main style="font-family:system-ui,sans-serif;line-height:1.6;color:#17202a">',
+      '<h1 style="font-size:22px">LetterMate 测试邮件</h1>',
+      '<p>收到此邮件说明当前收件邮箱和系统邮件投递已经连通。</p>',
+      `<p>已验证收件邮箱：${safeRecipient}</p>`,
+      '<p><strong>这不是正式的每日研究简报，不会改变日报发送记录。</strong></p>',
+      '</main>',
+    ].join(''),
+  };
+}
+
+export interface ResendEmailGatewayOptions {
+  apiKey: string;
+  baseUrl: string;
+  from: string;
+  timeoutMs: number;
+}
+
+export type EmailHttpClient = typeof fetch;
+
+const retryAfterMs = (value: string | null): number | undefined => {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+};
+
+const resendFailure = (status: number, retryAfter: string | null): EmailGatewayError => {
+  if (status === 401 || status === 403) {
+    return new EmailGatewayError('EMAIL_AUTHENTICATION_FAILED', false);
+  }
+  if (status === 409) {
+    return new EmailGatewayError('EMAIL_IDEMPOTENCY_CONFLICT', false);
+  }
+  if (status === 429) {
+    return new EmailGatewayError('EMAIL_RATE_LIMITED', true, retryAfterMs(retryAfter));
+  }
+  if (status >= 500) {
+    return new EmailGatewayError('EMAIL_PROVIDER_UNAVAILABLE', true);
+  }
+  return new EmailGatewayError('EMAIL_GATEWAY_UNAVAILABLE', false);
+};
+
+export class ResendEmailGateway implements EmailGateway {
+  constructor(
+    private readonly http: EmailHttpClient,
+    private readonly options: ResendEmailGatewayOptions,
+  ) {}
+
+  async send(message: EmailMessage, options: EmailSendOptions): Promise<{ messageId: string }> {
+    let response: Response;
+    try {
+      response = await this.http(`${this.options.baseUrl.replace(/\/$/, '')}/emails`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.options.apiKey}`,
+          'Content-Type': 'application/json',
+          'Idempotency-Key': options.idempotencyKey,
+        },
+        body: JSON.stringify({
+          from: this.options.from,
+          to: [message.to],
+          subject: message.subject,
+          text: message.text,
+          html: message.html,
+          ...(message.headers ? { headers: message.headers } : {}),
+        }),
+        signal: AbortSignal.timeout(this.options.timeoutMs),
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === 'TimeoutError') {
+        throw new EmailGatewayError('EMAIL_TIMEOUT', true);
+      }
+      throw new EmailGatewayError('EMAIL_CONFIRMATION_LOST', true);
+    }
+    if (!response.ok) {
+      throw resendFailure(response.status, response.headers.get('retry-after'));
+    }
+    try {
+      const result = await response.json() as { id?: unknown };
+      if (typeof result.id !== 'string' || result.id.length === 0) {
+        throw new Error('missing id');
+      }
+      return { messageId: result.id };
+    } catch {
+      throw new EmailGatewayError('EMAIL_CONFIRMATION_LOST', true);
+    }
+  }
+}
+
+export const createResendEmailGateway = (
+  options: ResendEmailGatewayOptions,
+  http: EmailHttpClient = fetch,
+): ResendEmailGateway => new ResendEmailGateway(http, options);
 
 interface SmtpTransport {
   sendMail(message: Record<string, unknown>): Promise<{
@@ -96,6 +207,7 @@ export class SmtpEmailGateway implements EmailGateway {
         text: message.text,
         html: message.html,
         messageId: deterministicMessageId,
+        ...(message.headers ? { headers: message.headers } : {}),
       });
       if ((result.rejected?.length ?? 0) > 0) {
         throw new EmailGatewayError('EMAIL_RECIPIENT_REJECTED', false);
@@ -191,6 +303,38 @@ export interface DigestEmailItem {
   followUp?: string;
 }
 
+export function renderDigestVerificationEmail(input: {
+  recipient: string;
+  verificationUrl: string;
+  expiresAt: string;
+}): EmailMessage {
+  const expiry = new Date(input.expiresAt).toISOString();
+  const url = escapeHtml(input.verificationUrl);
+  return {
+    to: input.recipient,
+    subject: '确认接收 LetterMate 每日研究简报',
+    text: [
+      '请确认这个邮箱用于接收 LetterMate 每日研究简报。',
+      '',
+      input.verificationUrl,
+      '',
+      `链接有效期至：${expiry}`,
+      '如果不是你发起的请求，可以忽略这封邮件。',
+    ].join('\n'),
+    html: [
+      '<!doctype html><html><head><meta charset="utf-8"></head>',
+      '<body style="font-family:Arial,sans-serif;color:#18201d">',
+      '<main style="max-width:560px;margin:0 auto;padding:24px">',
+      '<h1 style="font-size:22px">确认接收 LetterMate 每日研究简报</h1>',
+      '<p>请点击下面的按钮确认这个邮箱由你控制，并同意接收每日简报。</p>',
+      `<p><a href="${url}" style="display:inline-block;padding:10px 16px;background:#167149;color:#fff;text-decoration:none">确认收件邮箱</a></p>`,
+      `<p style="color:#52606b;font-size:12px">链接有效期至：${escapeHtml(expiry)}</p>`,
+      '<p style="color:#52606b;font-size:12px">如果不是你发起的请求，可以忽略这封邮件。</p>',
+      '</main></body></html>',
+    ].join(''),
+  };
+}
+
 const escapeHtml = (value: string): string => value
   .replaceAll('&', '&amp;')
   .replaceAll('<', '&lt;')
@@ -198,7 +342,7 @@ const escapeHtml = (value: string): string => value
   .replaceAll('"', '&quot;')
   .replaceAll("'", '&#39;');
 
-export function renderDigestEmail(input: {
+function renderDigestEmailBody(input: {
   recipient: string;
   scheduledLocalDate: string;
   items: readonly DigestEmailItem[];
@@ -248,5 +392,28 @@ export function renderDigestEmail(input: {
       `<h1 style="font-size:24px;margin:0 0 24px">LetterMate 每日研究简报</h1>${htmlItems}`,
       '</main></body></html>',
     ].join(''),
+  };
+}
+
+export function renderDigestEmail(input: {
+  recipient: string;
+  scheduledLocalDate: string;
+  items: readonly DigestEmailItem[];
+  unsubscribeUrl?: string;
+  oneClickUnsubscribeUrl?: string;
+}): EmailMessage {
+  const message = renderDigestEmailBody(input);
+  if (!input.unsubscribeUrl || !input.oneClickUnsubscribeUrl) return message;
+  return {
+    ...message,
+    text: `${message.text}\n\n退订每日邮件：${input.unsubscribeUrl}`,
+    html: message.html.replace(
+      '</main>',
+      `<footer style="margin-top:32px;padding-top:16px;border-top:1px solid #d8dee4;color:#52606b;font-size:12px"><a href="${escapeHtml(input.unsubscribeUrl)}">退订每日邮件</a></footer></main>`,
+    ),
+    headers: {
+      'List-Unsubscribe': `<${input.oneClickUnsubscribeUrl}>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    },
   };
 }

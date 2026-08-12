@@ -34,6 +34,19 @@ describe('operational doctor', () => {
     expect(serialized).not.toContain('redis.internal');
   });
 
+  it('reports the selected email provider without exposing its credential', async () => {
+    const report = await runOperationalDoctor(parseConfig({
+      EMAIL_PROVIDER: 'resend',
+      RESEND_API_KEY: 're_secret_value',
+      RESEND_FROM: 'LetterMate <digest@mail.example.com>',
+    }));
+
+    expect(report.checks).toContainEqual({
+      id: 'email', status: 'ok', details: { provider: 'resend' },
+    });
+    expect(JSON.stringify(report)).not.toContain('re_secret_value');
+  });
+
   it('runs and closes live dependency probes', async () => {
     const databaseProbe = { check: vi.fn(async () => {}), close: vi.fn(async () => {}) };
     const redisProbe = { check: vi.fn(async () => {}), close: vi.fn(async () => {}) };

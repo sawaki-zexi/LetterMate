@@ -475,13 +475,15 @@ describe('multi-source Prisma schema', () => {
 
   it('stores digest preferences, run boundaries, and frozen item snapshots', () => {
     expect(modelNames()).toEqual(expect.arrayContaining([
-      'DigestPreference', 'DigestRun', 'DigestItem',
+      'DigestPreference', 'DigestTestEmail', 'DigestRun', 'DigestItem',
     ]));
     expect(fieldNames('DigestPreference')).toEqual(expect.arrayContaining([
-      'userId', 'enabled', 'localSendTime', 'updatedAt',
+      'userId', 'enabled', 'localSendTime', 'unsubscribeTokenId',
+      'recipientSuppressionReason', 'recipientSuppressedAt', 'updatedAt',
     ]));
     expect(fieldNames('DigestRun')).toEqual(expect.arrayContaining([
-      'userId', 'scheduledLocalDate', 'windowStart', 'windowEnd', 'status',
+      'userId', 'recipientEmail', 'unsubscribeTokenId', 'scheduledLocalDate',
+      'windowStart', 'windowEnd', 'status',
       'sentAt', 'providerMessageId', 'runLeaseUntil', 'attemptCount',
       'briefGenerationStatus', 'briefGenerationVersion', 'briefGenerationErrorCode',
     ]));
@@ -490,6 +492,19 @@ describe('multi-source Prisma schema', () => {
       'runId', 'contentKey', 'position', 'title', 'summary', 'reason', 'sourceUrl',
       'citationUrls', 'platform', 'publishedAt', 'evidence', 'uncertainty', 'followUp',
     ]));
+    expect(fieldNames('DigestTestEmail')).toEqual(expect.arrayContaining([
+      'userId', 'recipientEmail', 'idempotencyBucket', 'status',
+      'providerMessageId', 'errorCode', 'attemptCount', 'runLeaseUntil',
+    ]));
+    expect(uniqueConstraints('DigestTestEmail')).toContainEqual(['userId', 'idempotencyBucket']);
+    expect(modelNames()).toContain('EmailDeliveryEvent');
+    expect(fieldNames('EmailDeliveryEvent')).toEqual(expect.arrayContaining([
+      'provider', 'providerEventId', 'eventType', 'outcome',
+      'providerMessageId', 'occurredAt', 'createdAt',
+    ]));
+    expect(uniqueConstraints('EmailDeliveryEvent')).toContainEqual([
+      'provider', 'providerEventId',
+    ]);
 
     const migrationPath = join(
       process.cwd(), 'prisma', 'migrations',
@@ -513,8 +528,41 @@ describe('multi-source Prisma schema', () => {
     const generationMigration = existsSync(generationMigrationPath)
       ? readFileSync(generationMigrationPath, 'utf8') : '';
     expect(generationMigration).toContain('ALTER TYPE "AiRunKind" ADD VALUE \'digest\'');
+    const unsubscribeMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260812_digest_unsubscribe', 'migration.sql',
+    );
+    const unsubscribeMigration = existsSync(unsubscribeMigrationPath)
+      ? readFileSync(unsubscribeMigrationPath, 'utf8') : '';
+    expect(unsubscribeMigration).toContain('ADD COLUMN "unsubscribeTokenId"');
+    expect(unsubscribeMigration).toContain('DigestPreference_unsubscribeTokenId_key');
     expect(generationMigration).toContain('ALTER TYPE "AiTask" ADD VALUE \'digest_brief\'');
     expect(generationMigration).toContain('ADD COLUMN "briefGenerationStatus"');
+    const recipientSnapshotMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260812_digest_run_recipient_snapshot', 'migration.sql',
+    );
+    const recipientSnapshotMigration = existsSync(recipientSnapshotMigrationPath)
+      ? readFileSync(recipientSnapshotMigrationPath, 'utf8') : '';
+    expect(recipientSnapshotMigration).toContain('ADD COLUMN "recipientEmail"');
+    expect(recipientSnapshotMigration).toContain('SET "enabled" = false');
+    const testEmailMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260812_digest_test_email', 'migration.sql',
+    );
+    const testEmailMigration = existsSync(testEmailMigrationPath)
+      ? readFileSync(testEmailMigrationPath, 'utf8') : '';
+    expect(testEmailMigration).toContain('CREATE TABLE "DigestTestEmail"');
+    expect(testEmailMigration).toContain('DigestTestEmail_userId_idempotencyBucket_key');
+    const suppressionMigrationPath = join(
+      process.cwd(), 'prisma', 'migrations',
+      '20260812_email_delivery_suppression', 'migration.sql',
+    );
+    const suppressionMigration = existsSync(suppressionMigrationPath)
+      ? readFileSync(suppressionMigrationPath, 'utf8') : '';
+    expect(suppressionMigration).toContain('ADD COLUMN "recipientSuppressionReason"');
+    expect(suppressionMigration).toContain('ADD COLUMN "providerMessageId"');
+    expect(suppressionMigration).toContain('CREATE TABLE "EmailDeliveryEvent"');
+    expect(suppressionMigration).toContain('EmailDeliveryEvent_provider_providerEventId_key');
   });
 
   it('stores rebuildable profiles and versioned shadow recommendation decisions', () => {

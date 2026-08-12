@@ -3,10 +3,14 @@ import {
   discoveryQueueName,
   creatorQueueName,
   digestQueueName,
+  digestVerificationQueueName,
+  digestTestEmailQueueName,
   trendQueueName,
   type DiscoveryJobData,
   type CreatorJobData,
   type DigestJobData,
+  type DigestVerificationJobData,
+  type DigestTestEmailJobData,
   type TrendJobData,
 } from '@lettermate/contracts';
 import { PrismaClient } from '@prisma/client';
@@ -58,7 +62,7 @@ import {
   ContentInterestTagger,
   PrismaContentInterestTagRepository,
 } from './content-interest-tagger.js';
-import { createSmtpEmailGateway } from './digest-email.js';
+import { createResendEmailGateway, createSmtpEmailGateway } from './digest-email.js';
 import { DigestBriefGenerator } from './digest-brief-generator.js';
 import {
   DigestDeliveryService,
@@ -67,6 +71,16 @@ import {
 } from './digest-service.js';
 import { DigestScheduleService, startDigestScheduler } from './digest-scheduler.js';
 import { createDigestWorker } from './digest-worker.js';
+import {
+  createDigestVerificationWorker,
+  DigestVerificationDeliveryService,
+  PrismaDigestVerificationDeliveryRepository,
+} from './digest-verification-worker.js';
+import {
+  createDigestTestEmailWorker,
+  DigestTestEmailDeliveryService,
+  PrismaDigestTestEmailDeliveryRepository,
+} from './digest-test-email-worker.js';
 import {
   attachWorkerLogging,
   startQueueMetricsReporter,
@@ -129,26 +143,78 @@ const aiRuntime = config.AI_API_KEY ? (() => {
   };
 })() : null;
 
-if (config.SMTP_ENABLED && config.SMTP_HOST && config.SMTP_FROM) {
+if (config.EMAIL_PROVIDER !== 'none') {
   const digestQueue = new Queue<DigestJobData>(digestQueueName, { connection: redis });
-  const digestGateway = createSmtpEmailGateway({
-    host: config.SMTP_HOST,
-    port: config.SMTP_PORT,
-    secure: config.SMTP_SECURE,
-    requireTls: config.SMTP_REQUIRE_TLS,
-    from: config.SMTP_FROM,
-    messageIdDomain: config.SMTP_MESSAGE_ID_DOMAIN,
-    connectionTimeoutMs: config.SMTP_CONNECTION_TIMEOUT_MS,
-    socketTimeoutMs: config.SMTP_SOCKET_TIMEOUT_MS,
-    ...(config.SMTP_USER && config.SMTP_PASSWORD
-      ? { user: config.SMTP_USER, password: config.SMTP_PASSWORD }
-      : {}),
-  });
+  const digestVerificationQueue = new Queue<DigestVerificationJobData>(
+    digestVerificationQueueName,
+    { connection: redis },
+  );
+  const digestTestEmailQueue = new Queue<DigestTestEmailJobData>(
+    digestTestEmailQueueName,
+    { connection: redis },
+  );
+  const digestGateway = config.EMAIL_PROVIDER === 'resend'
+    ? createResendEmailGateway({
+        apiKey: config.RESEND_API_KEY!,
+        baseUrl: config.RESEND_API_BASE_URL,
+        from: config.RESEND_FROM!,
+        timeoutMs: config.RESEND_TIMEOUT_MS,
+      })
+    : createSmtpEmailGateway({
+        host: config.SMTP_HOST!,
+        port: config.SMTP_PORT,
+        secure: config.SMTP_SECURE,
+        requireTls: config.SMTP_REQUIRE_TLS,
+        from: config.SMTP_FROM!,
+        messageIdDomain: config.SMTP_MESSAGE_ID_DOMAIN,
+        connectionTimeoutMs: config.SMTP_CONNECTION_TIMEOUT_MS,
+        socketTimeoutMs: config.SMTP_SOCKET_TIMEOUT_MS,
+        ...(config.SMTP_USER && config.SMTP_PASSWORD
+          ? { user: config.SMTP_USER, password: config.SMTP_PASSWORD }
+          : {}),
+      });
   const digestWorker = createDigestWorker(
     redis,
-    new DigestDeliveryService(new PrismaDigestDeliveryRepository(prisma), digestGateway),
+    new DigestDeliveryService(
+      new PrismaDigestDeliveryRepository(prisma),
+      digestGateway,
+      undefined,
+      undefined,
+      {
+        publicWebOrigin: config.WEB_ORIGIN,
+        secret: config.EMAIL_UNSUBSCRIBE_SECRET,
+      },
+    ),
+  );
+  const digestVerificationWorker = createDigestVerificationWorker(
+    redis,
+    new DigestVerificationDeliveryService(
+      digestGateway,
+      new PrismaDigestVerificationDeliveryRepository(prisma),
+    ),
+  );
+  const digestTestEmailWorker = createDigestTestEmailWorker(
+    redis,
+    new DigestTestEmailDeliveryService(
+      new PrismaDigestTestEmailDeliveryRepository(prisma),
+      digestGateway,
+    ),
   );
   attachWorkerLogging(digestWorker, digestQueueName, console, () => new Date(), metrics);
+  attachWorkerLogging(
+    digestVerificationWorker,
+    digestVerificationQueueName,
+    console,
+    () => new Date(),
+    metrics,
+  );
+  attachWorkerLogging(
+    digestTestEmailWorker,
+    digestTestEmailQueueName,
+    console,
+    () => new Date(),
+    metrics,
+  );
   const digestScheduler = startDigestScheduler(new DigestScheduleService(
     new PrismaDigestScheduleRepository(
       prisma,
@@ -158,8 +224,18 @@ if (config.SMTP_ENABLED && config.SMTP_HOST && config.SMTP_FROM) {
   ));
   schedulers.push(digestScheduler);
   schedulers.push(startQueueMetricsReporter(digestQueueName, digestQueue, { metrics }));
-  workers.push(digestWorker);
-  queues.push(digestQueue);
+  schedulers.push(startQueueMetricsReporter(
+    digestVerificationQueueName,
+    digestVerificationQueue,
+    { metrics },
+  ));
+  schedulers.push(startQueueMetricsReporter(
+    digestTestEmailQueueName,
+    digestTestEmailQueue,
+    { metrics },
+  ));
+  workers.push(digestWorker, digestVerificationWorker, digestTestEmailWorker);
+  queues.push(digestQueue, digestVerificationQueue, digestTestEmailQueue);
 } else {
   writeOperationalLog(console, {
     level: 'warn', event: 'digest.disabled',

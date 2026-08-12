@@ -7,10 +7,11 @@ const liveEnabled = process.env.RUN_LIVE_EMAIL_TESTS === '1';
 describe.skipIf(!liveEnabled)('live SMTP email gateway', () => {
   it('sends one explicitly enabled smoke message', async () => {
     const config = parseConfig(process.env);
-    if (!config.SMTP_ENABLED || !config.SMTP_HOST || !config.SMTP_FROM
+    if (config.EMAIL_PROVIDER !== 'smtp' || !config.SMTP_HOST || !config.SMTP_FROM
       || !config.SMTP_SMOKE_RECIPIENT) {
       throw new Error(
-        'RUN_LIVE_EMAIL_TESTS requires SMTP_ENABLED, SMTP_HOST, SMTP_FROM, and SMTP_SMOKE_RECIPIENT',
+        'RUN_LIVE_EMAIL_TESTS requires EMAIL_PROVIDER=smtp, SMTP_HOST, SMTP_FROM, '
+        + 'and SMTP_SMOKE_RECIPIENT',
       );
     }
     const gateway = createSmtpEmailGateway({

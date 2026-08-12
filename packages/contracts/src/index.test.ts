@@ -32,6 +32,8 @@ import {
   digestQueueName,
   digestRecentRunSchema,
   digestStatusSchema,
+  digestUnsubscribeInputSchema,
+  digestUnsubscribeResultSchema,
   feedItemSchema,
   feedOriginSchema,
   feedQuerySchema,
@@ -751,6 +753,17 @@ describe('AI discovery contracts', () => {
     expect(authSessionSchema.parse({
       authenticated: false, user: null, csrfToken: null,
     })).toEqual({ authenticated: false, user: null, csrfToken: null });
+  });
+
+  it('accepts only bounded opaque digest unsubscribe requests and safe results', () => {
+    const token = `v1.${'1'.repeat(36)}.${'a'.repeat(43)}`;
+    expect(digestUnsubscribeInputSchema.parse({ token })).toEqual({ token });
+    expect(digestUnsubscribeResultSchema.parse({ status: 'unsubscribed' }))
+      .toEqual({ status: 'unsubscribed' });
+    expect(() => digestUnsubscribeInputSchema.parse({ token: 'short' })).toThrow();
+    expect(() => digestUnsubscribeResultSchema.parse({
+      status: 'unsubscribed', userId: 'user-a',
+    })).toThrow();
   });
 
   it('accepts only safe readiness dependency states', () => {

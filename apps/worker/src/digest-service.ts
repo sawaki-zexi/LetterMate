@@ -11,6 +11,7 @@ import {
   type InterestProfileEntry,
   type InterestTagAdjacency,
 } from '@lettermate/domain';
+import { emailUnsubscribeUrl } from '@lettermate/domain/email-unsubscribe';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import type { EmailGateway } from './digest-email.js';
 import { EmailGatewayError, renderDigestEmail } from './digest-email.js';
@@ -275,6 +276,8 @@ export interface PreparedDigestRun {
 
 export interface DigestSchedulePreference {
   userId: string;
+  recipientEmail: string;
+  unsubscribeTokenId: string;
   localTime: string;
   timezone: string;
 }
@@ -283,6 +286,8 @@ export interface DigestScheduleRepository {
   listEnabledPreferences(): Promise<DigestSchedulePreference[]>;
   ensureRun(input: {
     userId: string;
+    recipientEmail: string;
+    unsubscribeTokenId: string;
     scheduledLocalDate: string;
     windowEnd: Date;
     now: Date;
@@ -339,15 +344,21 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
 
   async listEnabledPreferences(): Promise<DigestSchedulePreference[]> {
     const rows = await this.prisma.digestPreference.findMany({
-      where: { enabled: true },
+      where: {
+        enabled: true,
+        recipientStatus: 'verified',
+        recipientEmail: { not: null },
+      },
       select: {
-        userId: true, localSendTime: true,
+        userId: true, recipientEmail: true, unsubscribeTokenId: true, localSendTime: true,
         user: { select: { timezone: true } },
       },
       orderBy: { userId: 'asc' },
     });
     return rows.map((row) => ({
       userId: row.userId,
+      recipientEmail: row.recipientEmail!,
+      unsubscribeTokenId: row.unsubscribeTokenId,
       localTime: row.localSendTime,
       timezone: row.user.timezone,
     }));
@@ -355,6 +366,8 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
 
   async ensureRun(input: {
     userId: string;
+    recipientEmail: string;
+    unsubscribeTokenId: string;
     scheduledLocalDate: string;
     windowEnd: Date;
     now: Date;
@@ -374,6 +387,17 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
       if (existing) {
         return { kind: 'existing' as const, run: reusableDigestRun(existing, input.userId, input.now) };
       }
+      const preference = await transaction.digestPreference.findFirst({
+        where: {
+          userId: input.userId,
+          enabled: true,
+          recipientStatus: 'verified',
+          recipientEmail: input.recipientEmail,
+          unsubscribeTokenId: input.unsubscribeTokenId,
+        },
+        select: { userId: true, unsubscribeTokenId: true },
+      });
+      if (!preference) return { kind: 'ineligible' as const };
       const boundary = await transaction.digestRun.findFirst({
         where: { userId: input.userId, status: { in: ['succeeded', 'skipped'] } },
         select: { windowEnd: true },
@@ -389,6 +413,7 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
       return { kind: 'new' as const, snapshots };
     });
     if (preparation.kind === 'existing') return preparation.run;
+    if (preparation.kind === 'ineligible') return null;
 
     const runId = randomUUID();
     const generated = await this.briefGenerator.generate({
@@ -409,6 +434,17 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
         select: { id: true, status: true, runLeaseUntil: true },
       });
       if (existing) return reusableDigestRun(existing, input.userId, input.now);
+      const preference = await transaction.digestPreference.findFirst({
+        where: {
+          userId: input.userId,
+          enabled: true,
+          recipientStatus: 'verified',
+          recipientEmail: input.recipientEmail,
+          unsubscribeTokenId: input.unsubscribeTokenId,
+        },
+        select: { userId: true, unsubscribeTokenId: true },
+      });
+      if (!preference) return null;
       const [boundary, deliveredRows] = await Promise.all([
         transaction.digestRun.findFirst({
           where: { userId: input.userId, status: { in: ['succeeded', 'skipped'] } },
@@ -426,6 +462,8 @@ export class PrismaDigestScheduleRepository implements DigestScheduleRepository 
         data: {
           id: runId,
           userId: input.userId,
+          recipientEmail: input.recipientEmail,
+          unsubscribeTokenId: preference.unsubscribeTokenId,
           scheduledLocalDate: input.scheduledLocalDate,
           windowStart: boundary?.windowEnd ?? DEFAULT_WINDOW_START,
           windowEnd: input.windowEnd,
@@ -452,6 +490,7 @@ export interface ClaimedDigestRun {
   userId: string;
   scheduledLocalDate: string;
   recipient: string;
+  unsubscribeTokenId: string;
   leaseUntil: Date;
   items: DigestSnapshot[];
 }
@@ -505,6 +544,8 @@ export class PrismaDigestDeliveryRepository implements DigestDeliveryRepository 
       where: {
         id: data.runId,
         userId: data.userId,
+        recipientEmail: { not: null },
+        unsubscribeTokenId: { not: null },
         OR: [
           { status: 'queued' },
           { status: 'running', runLeaseUntil: { lte: now } },
@@ -522,17 +563,20 @@ export class PrismaDigestDeliveryRepository implements DigestDeliveryRepository 
     const run = await this.prisma.digestRun.findUnique({
       where: { id: data.runId },
       select: {
-        id: true, userId: true, scheduledLocalDate: true,
-        user: { select: { email: true } },
+        id: true, userId: true, recipientEmail: true, unsubscribeTokenId: true,
+        scheduledLocalDate: true,
         items: { orderBy: { position: 'asc' } },
       },
     });
-    if (!run || run.userId !== data.userId) return null;
+    if (!run || run.userId !== data.userId || !run.recipientEmail || !run.unsubscribeTokenId) {
+      return null;
+    }
     return {
       runId: run.id,
       userId: run.userId,
       scheduledLocalDate: run.scheduledLocalDate,
-      recipient: run.user.email,
+      recipient: run.recipientEmail,
+      unsubscribeTokenId: run.unsubscribeTokenId,
       leaseUntil,
       items: run.items,
     };
@@ -594,6 +638,13 @@ export class DigestDeliveryService {
     private readonly gateway: EmailGateway,
     private readonly now: () => Date = () => new Date(),
     private readonly leaseMs = 10 * 60_000,
+    private readonly unsubscribe: {
+      publicWebOrigin: string;
+      secret: string;
+    } = {
+      publicWebOrigin: 'http://localhost:5173',
+      secret: 'lettermate-local-email-unsubscribe-secret-v1',
+    },
   ) {}
 
   async run(
@@ -617,6 +668,18 @@ export class DigestDeliveryService {
         recipient: claimed.recipient,
         scheduledLocalDate: claimed.scheduledLocalDate,
         items: claimed.items,
+        unsubscribeUrl: emailUnsubscribeUrl(
+          this.unsubscribe.publicWebOrigin,
+          '/digest/unsubscribe',
+          claimed.unsubscribeTokenId,
+          this.unsubscribe.secret,
+        ),
+        oneClickUnsubscribeUrl: emailUnsubscribeUrl(
+          this.unsubscribe.publicWebOrigin,
+          '/api/v1/digest/unsubscribe',
+          claimed.unsubscribeTokenId,
+          this.unsubscribe.secret,
+        ),
       }), { idempotencyKey: `digest:${claimed.runId}` });
     } catch (error) {
       const failure = classifyEmailFailure(error);

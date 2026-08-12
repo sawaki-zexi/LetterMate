@@ -157,9 +157,20 @@ BING_SEARCH_ENABLED=true
 
 Brave 仍通过 `SEARCH_PROVIDER=brave` 和 `SEARCH_API_KEY` 配置。修改 `.env` 后需要重启 Worker。
 
-每日邮件默认未配置。启用生产 SMTP 时至少设置：
+每日邮件默认未配置。推荐使用支持幂等键的 Resend HTTP API：
 
 ```env
+EMAIL_PROVIDER=resend
+EMAIL_UNSUBSCRIBE_SECRET=replace-with-a-random-secret-at-least-32-characters
+RESEND_API_KEY=re_your_server_key
+RESEND_WEBHOOK_SECRET=whsec_your_resend_signing_secret
+RESEND_FROM=LetterMate <digest@mail.example.com>
+```
+
+Resend API Key 和 Webhook Secret 只保存在服务端秘密存储中。发件域名必须先在供应商处完成验证，并把 Resend Webhook 指向 `POST /api/v1/email-webhooks/resend`。生产使用 Resend 时缺少 Webhook Secret 会拒绝启动。SMTP 作为兼容路径，配置如下：
+
+```env
+EMAIL_PROVIDER=smtp
 SMTP_ENABLED=true
 SMTP_HOST=smtp.example.com
 SMTP_PORT=587
@@ -170,9 +181,17 @@ SMTP_USER=
 SMTP_PASSWORD=
 ```
 
-本地无认证 SMTP Relay 可以留空用户名和密码；需要认证时必须同时配置两者。未配置 SMTP 时 Feed 和发现功能正常运行，邮件调度不会启动。
+本地无认证 SMTP Relay 可以留空用户名和密码；需要认证时必须同时配置两者。旧部署只设置 `SMTP_ENABLED=true` 时继续自动选择 SMTP。`EMAIL_PROVIDER=none` 时 Feed 和发现功能正常运行，邮件调度不会启动。
 
-轮换凭据时更新部署环境中的服务端密钥并重启 Worker，确认新的 live smoke 后再撤销旧凭据；停用邮件只需设置 `SMTP_ENABLED=false` 并重启 Worker。
+用户不需要理解或填写 SMTP。登录后在“每日邮件”页填写收件邮箱，LetterMate 会从系统发件地址发送一封 24 小时内有效的一次性验证邮件；用户点击链接后，该地址才会变为已验证。只有已验证地址才能开启每日邮件。修改收件地址会使旧地址的验证状态和未使用链接失效，并立即暂停调度；验证新地址后需要显式重新开启。每次已创建运行都会冻结当时的收件地址，重试不会切换到后来修改的地址。邮箱密码、授权码和供应商 API Key 都不会进入浏览器。
+
+地址验证后可以点击“发送测试邮件”检查投递是否连通。测试邮件有明确标记，每小时最多创建 3 次，同一地址在 5 分钟内的重复点击会复用同一请求；它不会改变日报运行历史或上次成功发送边界。
+
+每封正式简报都包含可见退订链接和邮件客户端一键退订头。退订无需登录，会立即停止未来调度，但不会删除历史邮件、运行或 Feed 内容。用户只能在 LetterMate 内显式重新开启，并且当前收件地址仍须为已验证且未停用。退订令牌不包含用户 ID 或邮箱；地址变更和重新开启会撤销旧链接。
+
+Resend 报告明确永久退信、投诉或供应商抑制后，LetterMate 会立即停用该收件地址并停止未来调度。临时退信、投递延迟和一般失败不会自动停用。用户不能继续验证同一被停用地址，必须更换地址后重新验证；Webhook 只通过本地保存的供应商消息 ID 关联用户，不使用回调 payload 中的邮箱定位账户。
+
+轮换凭据时更新部署环境中的服务端密钥并重启 Worker，确认新的 live smoke 后再撤销旧凭据；停用邮件设置 `EMAIL_PROVIDER=none` 并重启 API 与 Worker。
 
 ### 3. 启动基础设施并迁移数据库
 
@@ -249,7 +268,9 @@ docker compose -f infra/compose.production.example.yaml --profile operations run
 | 发现调度 | `DISCOVERY_RUN_TIMEOUT_MS`, `DISCOVERY_CONNECTOR_CONCURRENCY`, `DISCOVERY_SCHEDULER_ENABLED` | 超时、并发和 Topic 调度 |
 | 趋势调度 | `TREND_MONITOR_ENABLED`, `TREND_INTERVAL_HOURS` | 趋势开关与缺失 Monitor 的初始周期 |
 | 趋势范围 | `TREND_X_WOEIDS`, `TREND_YOUTUBE_REGION`, `TREND_REDDIT_COMMUNITIES` | 地区与社区范围 |
-| 每日邮件 | `SMTP_ENABLED`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_REQUIRE_TLS`, `SMTP_FROM` | 生产 SMTP 投递与 TLS |
+| 每日邮件 | `EMAIL_PROVIDER`, `EMAIL_UNSUBSCRIBE_SECRET` | `none | resend | smtp` 投递选择，以及 API/Worker 共享的退订签名密钥；生产投递必须配置 |
+| Resend | `RESEND_API_KEY`, `RESEND_WEBHOOK_SECRET`, `RESEND_FROM`, `RESEND_API_BASE_URL`, `RESEND_TIMEOUT_MS` | 推荐生产 HTTP API、Svix Webhook 验签、发件身份和超时 |
+| SMTP 兼容 | `SMTP_ENABLED`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_REQUIRE_TLS`, `SMTP_FROM` | 兼容 SMTP 投递与 TLS |
 | 邮件认证 | `SMTP_USER`, `SMTP_PASSWORD` | 可选 SMTP 认证；必须同时配置 |
 | 邮件超时 | `SMTP_CONNECTION_TIMEOUT_MS`, `SMTP_SOCKET_TIMEOUT_MS` | 连接和 Socket 超时 |
 
@@ -279,6 +300,12 @@ docker compose -f infra/compose.production.example.yaml --profile operations run
 | `GET` | `/items/:id` | 获取 Topic 或趋势条目详情 |
 | `GET` | `/discovery-sources` | 获取脱敏后的连接器启用状态 |
 | `GET/PUT` | `/digest-preference` | 读取或修改每日邮件设置 |
+| `GET` | `/digest-recipient` | 获取收件邮箱及验证状态 |
+| `POST` | `/digest-recipient/verification` | 保存收件邮箱并发送验证邮件 |
+| `GET` | `/digest-recipient/confirm?token=...` | 从公开链接确认收件邮箱 |
+| `GET/POST` | `/digest/unsubscribe?token=...` | 公开停止未来每日邮件；POST 支持邮件客户端一键退订 |
+| `POST` | `/digest-test-email` | 向当前已验证邮箱发送测试邮件 |
+| `GET` | `/digest-test-email/:id` | 获取测试邮件安全状态 |
 | `GET` | `/digest-preview` | 预览下一封邮件候选 |
 | `GET` | `/digest-status` | 获取邮件能力、下一次本地发送时间和最近运行 |
 
@@ -335,9 +362,12 @@ npm test -- apps/worker/src/bluesky-creator.live.test.ts
 
 $env:RUN_LIVE_EMAIL_TESTS='1'
 npm test -- apps/worker/src/smtp-email.live.test.ts
+
+$env:RUN_LIVE_RESEND_TESTS='1'
+npm test -- apps/worker/src/resend-email.live.test.ts
 ```
 
-SMTP live smoke 还需要完整 SMTP 配置和 `SMTP_SMOKE_RECIPIENT`。普通 SMTP 通过确定性 `Message-ID` 尽力减少重试重复，但不能严格覆盖“服务器已接受、客户端未收到确认”的情况；严格零重复需要支持幂等键的供应商 API。
+Resend live smoke 需要 `EMAIL_PROVIDER=resend`、完整 Resend 配置和 `RESEND_SMOKE_RECIPIENT`；SMTP smoke 需要完整 SMTP 配置和 `SMTP_SMOKE_RECIPIENT`。Resend 使用 DigestRun 稳定键作为供应商幂等键。普通 SMTP 通过确定性 `Message-ID` 尽力减少重复，但不能严格覆盖“服务器已接受、客户端未收到确认”的情况。
 
 数据库备份默认写入 `.backups/postgres`，保留最近 14 天的全部备份、随后 8 周每周最新一份、再保留 12 个月每月最新一份。只有文件与清单均有效的完整备份会参与自动清理；恢复验证始终使用独立数据库，并拒绝 `lettermate`、`postgres`、`template0` 和 `template1`。生产主库恢复不提供自动覆盖命令，必须在停机、外部备份可用和人工审批后按运行手册执行。
 
@@ -357,7 +387,7 @@ Prometheus 默认只绑定 `127.0.0.1:9090`。通知渠道和 Alertmanager 由�
 - Topic 与趋势两条持久化发现管线。
 - RSS/Atom、X、Bilibili、YouTube 与 Bluesky 博主关注；YouTube 固定 `channelId` 并同步 uploads playlist，Bilibili 支持公开视频、公开动态、专栏和带原帖上下文的转发动态，Bluesky 固定 DID 并同步原创、引用、转发和带父帖上下文的回复。
 - 可审计兴趣事件、版本化内容标签、短期/长期/负向画像和个性化 Feed 排序。
-- 对现有候选的相邻兴趣识别、约 10% 探索编排，以及每日邮件预览、调度、重试和可选生产 SMTP 投递。
+- 对现有候选的相邻兴趣识别、约 10% 探索编排，以及每日邮件收件地址验证、测试邮件、仅验证地址调度、冻结快照重试、一键退订和可选 Resend/SMTP 生产投递。
 - 14 个主发现连接器和 6 个趋势输入。
 - 调度、租约恢复、幂等刷新和运行摘要。
 - API 统一 `x-trace-id`、脱敏结构化请求日志、Worker 队列快照与任务/连接器失败事件。

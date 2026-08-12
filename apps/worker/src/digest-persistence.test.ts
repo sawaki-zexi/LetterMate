@@ -11,6 +11,7 @@ const now = new Date('2026-08-08T00:30:00.000Z');
 const claimedRun: ClaimedDigestRun = {
   runId: 'run-1', userId: 'user-a', scheduledLocalDate: '2026-08-08',
   recipient: 'student@example.com',
+  unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
   leaseUntil: new Date('2026-08-08T00:40:00.000Z'),
   items: [{
     contentKey: 'https://example.com/1', position: 0, title: '标题',
@@ -21,6 +22,56 @@ const claimedRun: ClaimedDigestRun = {
 };
 
 describe('PrismaDigestScheduleRepository', () => {
+  it('lists only enabled preferences with a verified recipient', async () => {
+    const findMany = vi.fn().mockResolvedValue([{
+      userId: 'user-a', recipientEmail: 'student@example.com', localSendTime: '08:00',
+      unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
+      user: { timezone: 'Asia/Shanghai' },
+    }]);
+    const prisma = { digestPreference: { findMany } } as unknown as PrismaClient;
+
+    await expect(new PrismaDigestScheduleRepository(prisma).listEnabledPreferences())
+      .resolves.toEqual([{
+        userId: 'user-a', recipientEmail: 'student@example.com',
+        unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
+        localTime: '08:00', timezone: 'Asia/Shanghai',
+      }]);
+    expect(findMany).toHaveBeenCalledWith({
+      where: {
+        enabled: true, recipientStatus: 'verified', recipientEmail: { not: null },
+      },
+      select: {
+        userId: true, recipientEmail: true, unsubscribeTokenId: true, localSendTime: true,
+        user: { select: { timezone: true } },
+      },
+      orderBy: { userId: 'asc' },
+    });
+  });
+
+  it('does not create a run after the recipient loses scheduling eligibility', async () => {
+    const transaction = {
+      $executeRaw: vi.fn().mockResolvedValue(1),
+      digestRun: {
+        findUnique: vi.fn().mockResolvedValue(null), findFirst: vi.fn(), create: vi.fn(),
+      },
+      digestPreference: { findFirst: vi.fn().mockResolvedValue(null) },
+    };
+    const prisma = {
+      $transaction: vi.fn(async (callback: (value: typeof transaction) => unknown) => (
+        callback(transaction)
+      )),
+    } as unknown as PrismaClient;
+    const briefGenerator = { generate: vi.fn() };
+
+    await expect(new PrismaDigestScheduleRepository(prisma, briefGenerator).ensureRun({
+      userId: 'user-a', recipientEmail: 'old@example.com',
+      unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
+      scheduledLocalDate: '2026-08-08', windowEnd: now, now,
+    })).resolves.toBeNull();
+    expect(briefGenerator.generate).not.toHaveBeenCalled();
+    expect(transaction.digestRun.create).not.toHaveBeenCalled();
+  });
+
   it('reuses a queued run for safe re-entry without replacing its frozen snapshot', async () => {
     const transaction = {
       $executeRaw: vi.fn().mockResolvedValue(1),
@@ -39,7 +90,9 @@ describe('PrismaDigestScheduleRepository', () => {
     } as unknown as PrismaClient;
 
     await expect(new PrismaDigestScheduleRepository(prisma).ensureRun({
-      userId: 'user-a', scheduledLocalDate: '2026-08-08', windowEnd: now, now,
+      userId: 'user-a', recipientEmail: 'student@example.com',
+      unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
+      scheduledLocalDate: '2026-08-08', windowEnd: now, now,
     })).resolves.toEqual({
       runId: 'run-existing', userId: 'user-a', status: 'queued',
     });
@@ -67,7 +120,9 @@ describe('PrismaDigestScheduleRepository', () => {
     } as unknown as PrismaClient;
 
     await expect(new PrismaDigestScheduleRepository(prisma).ensureRun({
-      userId: 'user-a', scheduledLocalDate: '2026-08-08', windowEnd: now, now,
+      userId: 'user-a', recipientEmail: 'student@example.com',
+      unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
+      scheduledLocalDate: '2026-08-08', windowEnd: now, now,
     })).resolves.toEqual({
       runId: 'run-stale', userId: 'user-a', status: 'queued',
     });
@@ -83,6 +138,7 @@ describe('PrismaDigestScheduleRepository', () => {
         findFirst: vi.fn().mockResolvedValue({ windowEnd: boundary }),
         create: vi.fn().mockResolvedValue({ id: 'run-empty' }),
       },
+      digestPreference: { findFirst: vi.fn().mockResolvedValue({ userId: 'user-a' }) },
       discoveryItem: { findMany: vi.fn().mockResolvedValue([]) },
       radarItem: { findMany: vi.fn().mockResolvedValue([]) },
       creatorItem: { findMany: vi.fn().mockResolvedValue([]) },
@@ -99,7 +155,9 @@ describe('PrismaDigestScheduleRepository', () => {
     } as unknown as PrismaClient;
 
     const result = await new PrismaDigestScheduleRepository(prisma).ensureRun({
-      userId: 'user-a', scheduledLocalDate: '2026-08-08', windowEnd: now, now,
+      userId: 'user-a', recipientEmail: 'student@example.com',
+      unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
+      scheduledLocalDate: '2026-08-08', windowEnd: now, now,
     });
 
     expect(result).toEqual({ runId: 'run-empty', userId: 'user-a', status: 'skipped' });
@@ -125,6 +183,7 @@ describe('PrismaDigestScheduleRepository', () => {
       data: {
         id: expect.any(String),
         userId: 'user-a',
+        recipientEmail: 'student@example.com',
         scheduledLocalDate: '2026-08-08',
         windowStart: boundary,
         windowEnd: now,
@@ -162,6 +221,7 @@ describe('PrismaDigestScheduleRepository', () => {
       digestRun: {
         findUnique: vi.fn().mockResolvedValue(null), findFirst: vi.fn().mockResolvedValue(null), create,
       },
+      digestPreference: { findFirst: vi.fn().mockResolvedValue({ userId: 'user-a' }) },
       discoveryItem: { findMany: vi.fn().mockResolvedValue([followed]) },
       radarItem: { findMany: vi.fn().mockResolvedValue([
         { ...source('trend-duplicate', followed.canonicalPrimaryUrl), canonicalPrimaryUrl: followed.canonicalPrimaryUrl },
@@ -202,7 +262,9 @@ describe('PrismaDigestScheduleRepository', () => {
     };
 
     await expect(new PrismaDigestScheduleRepository(prisma, briefGenerator).ensureRun({
-      userId: 'user-a', scheduledLocalDate: '2026-08-08', windowEnd: now, now,
+      userId: 'user-a', recipientEmail: 'student@example.com',
+      unsubscribeTokenId: '11111111-1111-4111-8111-111111111111',
+      scheduledLocalDate: '2026-08-08', windowEnd: now, now,
     })).resolves.toEqual({ runId: 'run-ranked', userId: 'user-a', status: 'queued' });
 
     const frozen = create.mock.calls[0]?.[0].data.items.create;
@@ -213,6 +275,7 @@ describe('PrismaDigestScheduleRepository', () => {
     ]));
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
+        recipientEmail: 'student@example.com',
         briefGenerationStatus: 'generated',
         briefGenerationVersion: 'digest-brief-grounded-v1',
         briefGenerationErrorCode: null,
@@ -236,7 +299,8 @@ describe('PrismaDigestDeliveryRepository', () => {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
         findUnique: vi.fn().mockResolvedValue({
           id: 'run-1', userId: 'user-a', scheduledLocalDate: '2026-08-08',
-          user: { email: 'student@example.com' }, items: [],
+          recipientEmail: 'student@example.com',
+          unsubscribeTokenId: '11111111-1111-4111-8111-111111111111', items: [],
         }),
       },
     } as unknown as PrismaClient;
@@ -250,7 +314,8 @@ describe('PrismaDigestDeliveryRepository', () => {
     });
     expect(prisma.digestRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: {
-        id: 'run-1', userId: 'user-a',
+        id: 'run-1', userId: 'user-a', recipientEmail: { not: null },
+        unsubscribeTokenId: { not: null },
         OR: [
           { status: 'queued' },
           { status: 'running', runLeaseUntil: { lte: now } },

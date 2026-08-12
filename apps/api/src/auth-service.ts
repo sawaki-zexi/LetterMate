@@ -457,7 +457,9 @@ export function createAuthMiddleware(
         request.headers['x-user-timezone'] = session.session.user?.timezone;
         request.headers['x-auth-csrf'] = session.session.csrfToken ?? undefined;
         const method = request.method.toUpperCase();
-        const authPublic = /^\/api\/v1\/auth\/(login|register|session)$/.test(request.path);
+        const authPublic = /^\/api\/v1\/auth\/(login|register|session)$/.test(request.path)
+          || request.path === '/api/v1/digest/unsubscribe'
+          || request.path === '/api/v1/email-webhooks/resend';
         if (!authPublic && !['GET', 'HEAD', 'OPTIONS'].includes(method)) {
           const csrfHeader = request.headers['x-csrf-token'] as string | undefined;
           if (!auth.verifyCsrfToken(session.sessionId, csrfHeader)) {

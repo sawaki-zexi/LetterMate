@@ -124,6 +124,16 @@ const baseConfigSchema = z.object({
   TREND_YOUTUBE_REGION: z.string().regex(/^[A-Z]{2}$/).default('US'),
   TREND_REDDIT_COMMUNITIES: trendRedditCommunities,
   TREND_GOOGLE_RSS_URLS: trendGoogleRssUrls,
+  EMAIL_PROVIDER: z.enum(['none', 'smtp', 'resend']).optional(),
+  EMAIL_UNSUBSCRIBE_SECRET: z.string().min(32).optional(),
+  RESEND_API_KEY: optionalNonEmptyString,
+  RESEND_WEBHOOK_SECRET: z.string().trim().regex(/^whsec_[A-Za-z0-9_\-+/=]+$/).optional(),
+  RESEND_API_BASE_URL: z.url().refine(
+    (url) => new URL(url).protocol === 'https:',
+    'RESEND_API_BASE_URL must use HTTPS',
+  ).default('https://api.resend.com'),
+  RESEND_FROM: optionalNonEmptyString,
+  RESEND_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(120_000).default(10_000),
   SMTP_ENABLED: z
     .enum(['true', 'false'])
     .default('false')
@@ -158,14 +168,31 @@ const baseConfigSchema = z.object({
     (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
     z.email().optional(),
   ),
+  RUN_LIVE_RESEND_TESTS: z
+    .enum(['0', '1'])
+    .default('0')
+    .transform((value) => value === '1'),
+  RESEND_SMOKE_RECIPIENT: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.email().optional(),
+  ),
 });
 
-export type AppConfig = z.infer<typeof baseConfigSchema>;
+type ParsedAppConfig = z.infer<typeof baseConfigSchema>;
+export type AppConfig = Omit<ParsedAppConfig, 'EMAIL_PROVIDER' | 'EMAIL_UNSUBSCRIBE_SECRET'> & {
+  EMAIL_PROVIDER: 'none' | 'smtp' | 'resend';
+  EMAIL_UNSUBSCRIBE_SECRET: string;
+};
 
 export function parseConfig(environment: Record<string, string | undefined>): AppConfig {
   const parsed = baseConfigSchema.parse(environment);
+  const emailProvider = parsed.EMAIL_PROVIDER ?? (parsed.SMTP_ENABLED ? 'smtp' : 'none');
 
-  if (parsed.SMTP_ENABLED) {
+  if (parsed.EMAIL_PROVIDER === 'none' && parsed.SMTP_ENABLED) {
+    throw new Error('SMTP_ENABLED cannot be true when EMAIL_PROVIDER is none');
+  }
+
+  if (emailProvider === 'smtp') {
     const missing = [
       ['SMTP_HOST', parsed.SMTP_HOST],
       ['SMTP_FROM', parsed.SMTP_FROM],
@@ -176,6 +203,28 @@ export function parseConfig(environment: Record<string, string | undefined>): Ap
     if (Boolean(parsed.SMTP_USER) !== Boolean(parsed.SMTP_PASSWORD)) {
       throw new Error('SMTP_USER and SMTP_PASSWORD must be configured together');
     }
+  }
+
+  if (emailProvider === 'resend') {
+    const missing = [
+      ['RESEND_API_KEY', parsed.RESEND_API_KEY],
+      ['RESEND_FROM', parsed.RESEND_FROM],
+    ].filter(([, value]) => !value).map(([name]) => name);
+    if (missing.length > 0) {
+      throw new Error(`Missing required Resend configuration: ${missing.join(', ')}`);
+    }
+  }
+
+  if (parsed.NODE_ENV === 'production'
+    && emailProvider !== 'none'
+    && !parsed.EMAIL_UNSUBSCRIBE_SECRET) {
+    throw new Error('Missing required production configuration: EMAIL_UNSUBSCRIBE_SECRET');
+  }
+
+  if (parsed.NODE_ENV === 'production'
+    && emailProvider === 'resend'
+    && !parsed.RESEND_WEBHOOK_SECRET) {
+    throw new Error('Missing required production configuration: RESEND_WEBHOOK_SECRET');
   }
 
   if (parsed.NODE_ENV === 'production') {
@@ -193,5 +242,15 @@ export function parseConfig(environment: Record<string, string | undefined>): Ap
     }
   }
 
-  return parsed;
+  return {
+    ...parsed,
+    EMAIL_PROVIDER: emailProvider,
+    EMAIL_UNSUBSCRIBE_SECRET: parsed.EMAIL_UNSUBSCRIBE_SECRET
+      ?? parsed.SESSION_SECRET
+      ?? 'lettermate-local-email-unsubscribe-secret-v1',
+  };
 }
+
+export const isEmailDeliveryConfigured = (config: AppConfig): boolean => (
+  config.EMAIL_PROVIDER !== 'none'
+);

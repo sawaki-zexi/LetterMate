@@ -11,8 +11,20 @@ import {
   type FeedItem,
 } from '@lettermate/contracts';
 import type { PrismaClient } from '@prisma/client';
+import { randomUUID } from 'node:crypto';
 import type { PersonalizationMemory } from './personalization-memory.js';
 import type { TopicStore } from './topic-store.js';
+
+export class DigestPreferenceError extends Error {
+  constructor(public readonly code: string, public readonly status: number) {
+    super('请先验证收件邮箱');
+    this.name = 'DigestPreferenceError';
+  }
+}
+
+export interface DigestRecipientEligibilityStore {
+  get(userId: string): Promise<{ email: string | null; status: string }>;
+}
 
 export interface DigestPreferenceStore {
   get(userId: string): Promise<DigestPreference>;
@@ -110,18 +122,40 @@ export class PrismaDigestPreferenceStore implements DigestPreferenceStore {
           timezone: parsed.timezone,
         },
       });
-      await transaction.digestPreference.upsert({
-        where: { userId },
-        create: {
-          userId,
-          enabled: parsed.enabled,
-          localSendTime: parsed.localTime,
-        },
-        update: {
-          enabled: parsed.enabled,
-          localSendTime: parsed.localTime,
-        },
-      });
+      if (parsed.enabled) {
+        const reenabled = await transaction.digestPreference.updateMany({
+          where: {
+            userId,
+            enabled: false,
+            recipientStatus: 'verified',
+            recipientEmail: { not: null },
+          },
+          data: {
+            enabled: true,
+            localSendTime: parsed.localTime,
+            unsubscribeTokenId: randomUUID(),
+          },
+        });
+        if (reenabled.count === 0) {
+          const updated = await transaction.digestPreference.updateMany({
+            where: {
+              userId,
+              enabled: true,
+              recipientStatus: 'verified',
+              recipientEmail: { not: null },
+            },
+            data: { localSendTime: parsed.localTime },
+          });
+          if (updated.count === 1) return;
+          throw new DigestPreferenceError('DIGEST_RECIPIENT_NOT_VERIFIED', 409);
+        }
+      } else {
+        await transaction.digestPreference.upsert({
+          where: { userId },
+          create: { userId, enabled: false, localSendTime: parsed.localTime },
+          update: { enabled: false, localSendTime: parsed.localTime },
+        });
+      }
     });
     return parsed;
   }
@@ -184,13 +218,20 @@ export class DefaultDigestService implements DigestService {
     private readonly personalization: PersonalizationMemory,
     private readonly now: () => Date = () => new Date(),
     private readonly deliveryConfigured = false,
+    private readonly recipients?: DigestRecipientEligibilityStore,
   ) {}
 
   getPreference(userId: string): Promise<DigestPreference> {
     return this.preferences.get(userId);
   }
 
-  updatePreference(userId: string, input: DigestPreferenceInput): Promise<DigestPreference> {
+  async updatePreference(userId: string, input: DigestPreferenceInput): Promise<DigestPreference> {
+    if (input.enabled) {
+      const recipient = await this.recipients?.get(userId);
+      if (!recipient?.email || recipient.status !== 'verified') {
+        throw new DigestPreferenceError('DIGEST_RECIPIENT_NOT_VERIFIED', 409);
+      }
+    }
     return this.preferences.update(userId, input);
   }
 

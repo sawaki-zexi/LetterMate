@@ -59,8 +59,8 @@ describe('daily digest scheduling', () => {
   it('prepares only due users and enqueues only nonempty queued runs', async () => {
     const repository = {
       listEnabledPreferences: vi.fn().mockResolvedValue([
-        { userId: 'user-a', localTime: '08:00', timezone: 'Asia/Shanghai' },
-        { userId: 'user-b', localTime: '09:00', timezone: 'Asia/Shanghai' },
+        { userId: 'user-a', recipientEmail: 'a@example.com', unsubscribeTokenId: 'token-a', localTime: '08:00', timezone: 'Asia/Shanghai' },
+        { userId: 'user-b', recipientEmail: 'b@example.com', unsubscribeTokenId: 'token-b', localTime: '09:00', timezone: 'Asia/Shanghai' },
       ]),
       ensureRun: vi.fn().mockResolvedValue({
         runId: 'run-a', userId: 'user-a', status: 'queued',
@@ -73,7 +73,9 @@ describe('daily digest scheduling', () => {
 
     expect(repository.ensureRun).toHaveBeenCalledTimes(1);
     expect(repository.ensureRun).toHaveBeenCalledWith({
-      userId: 'user-a', scheduledLocalDate: '2026-08-08', windowEnd: now, now,
+      userId: 'user-a', recipientEmail: 'a@example.com',
+      unsubscribeTokenId: 'token-a',
+      scheduledLocalDate: '2026-08-08', windowEnd: now, now,
     });
     expect(queue.add).toHaveBeenCalledWith(
       'deliver-digest',
@@ -87,7 +89,7 @@ describe('daily digest scheduling', () => {
   it('does not call the queue for an empty skipped run', async () => {
     const repository = {
       listEnabledPreferences: vi.fn().mockResolvedValue([
-        { userId: 'user-a', localTime: '08:00', timezone: 'Asia/Shanghai' },
+        { userId: 'user-a', recipientEmail: 'a@example.com', unsubscribeTokenId: 'token-a', localTime: '08:00', timezone: 'Asia/Shanghai' },
       ]),
       ensureRun: vi.fn().mockResolvedValue({
         runId: 'run-a', userId: 'user-a', status: 'skipped',

@@ -57,7 +57,7 @@ import {
   type CSSProperties,
   type FormEvent,
 } from 'react';
-import { Link, NavLink, Route, Routes, useParams } from 'react-router-dom';
+import { Link, NavLink, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { api } from './api.js';
 import { DiscoveryCard } from './components/DiscoveryCard.js';
 import { discoveryKindLabels } from './discovery-display.js';
@@ -1239,6 +1239,24 @@ function DigestPage() {
   });
   const preview = useQuery({ queryKey: ['digest-preview'], queryFn: api.digestPreview });
   const status = useQuery({ queryKey: ['digest-status'], queryFn: api.digestStatus });
+  const recipient = useQuery({ queryKey: ['digest-recipient'], queryFn: api.digestRecipient });
+  const [recipientEmail, setRecipientEmail] = useState('');
+  useEffect(() => {
+    if (recipient.data?.email) setRecipientEmail(recipient.data.email);
+  }, [recipient.data]);
+  const verifyRecipient = useMutation({
+    mutationFn: () => api.requestDigestRecipientVerification({ email: recipientEmail }),
+    onSuccess: (data) => {
+      client.setQueryData(['digest-recipient'], data);
+      setRecipientEmail(data.email ?? '');
+      setDraft((current) => current ? { ...current, enabled: false } : current);
+      client.setQueryData<DigestPreference>(['digest-preference'], (current) => (
+        current ? { ...current, enabled: false } : current
+      ));
+      void client.invalidateQueries({ queryKey: ['digest-preference'] });
+      void client.invalidateQueries({ queryKey: ['digest-status'] });
+    },
+  });
   const [draft, setDraft] = useState<DigestPreference | null>(null);
   useEffect(() => {
     if (preference.data) setDraft(preference.data);
@@ -1251,10 +1269,28 @@ function DigestPage() {
       void client.invalidateQueries({ queryKey: ['digest-status'] });
     },
   });
+  const [testEmailId, setTestEmailId] = useState<string | null>(null);
+  const testEmail = useQuery({
+    queryKey: ['digest-test-email', testEmailId],
+    queryFn: () => api.digestTestEmail(testEmailId!),
+    enabled: testEmailId !== null,
+    refetchInterval: (query) => (
+      ['queued', 'running', 'retrying'].includes(query.state.data?.status ?? '') ? 1_000 : false
+    ),
+  });
+  const sendTestEmail = useMutation({
+    mutationFn: api.sendDigestTestEmail,
+    onSuccess: (data) => {
+      setTestEmailId(data.id);
+      client.setQueryData(['digest-test-email', data.id], data);
+    },
+  });
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (draft) save.mutate(draft);
   };
+  const sameSuppressedRecipient = recipient.data?.status === 'suppressed'
+    && recipientEmail.trim().toLowerCase() === recipient.data.email?.trim().toLowerCase();
 
   return (
     <Page title="每日邮件" description="设置本地发送时间并预览下一封引用型研究简报">
@@ -1264,6 +1300,49 @@ function DigestPage() {
         error={status.error}
         retry={() => void status.refetch()}
       />
+      <section className="digest-recipient" aria-labelledby="digest-recipient-title">
+        <header><h2 id="digest-recipient-title">收件邮箱</h2></header>
+        <form onSubmit={(event) => {
+          event.preventDefault();
+          verifyRecipient.mutate();
+        }}>
+          <label className="digest-field">
+            <span>接收每日简报的邮箱</span>
+            <input
+              type="email"
+              aria-label="收件邮箱"
+              required
+              value={recipientEmail}
+              disabled={verifyRecipient.isPending}
+              onChange={(event) => setRecipientEmail(event.target.value)}
+            />
+          </label>
+          <div className={`digest-recipient__state digest-recipient__state--${recipient.data?.status ?? 'unverified'}`}>
+            {recipient.isLoading
+              ? '读取中'
+              : recipient.data?.status === 'verified'
+                ? '已验证'
+                : recipient.data?.status === 'pending'
+                  ? '等待验证'
+                  : recipient.data?.status === 'suppressed'
+                    ? '已停用'
+                    : '未验证'}
+          </div>
+          <button
+            className="button"
+            type="submit"
+            disabled={verifyRecipient.isPending || sameSuppressedRecipient}
+          >
+            {verifyRecipient.isPending ? <RefreshCw className="spin" size={16} /> : <Mail size={16} />}
+            {recipient.data?.status === 'pending' ? '重新发送验证邮件' : '发送验证邮件'}
+          </button>
+        </form>
+        {verifyRecipient.isSuccess && <p className="inline-success"><CheckCircle2 size={15} />验证邮件已发送，请检查收件箱</p>}
+        {sameSuppressedRecipient && (
+          <p className="inline-error"><AlertCircle size={15} />该地址已被邮件服务停用，请更换地址后重新验证</p>
+        )}
+        {verifyRecipient.error && <p className="inline-error"><AlertCircle size={15} />{verifyRecipient.error.message}</p>}
+      </section>
       {!draft && (
         <QueryState
           isLoading={preference.isLoading}
@@ -1280,12 +1359,15 @@ function DigestPage() {
               type="checkbox"
               aria-label="每日邮件"
               checked={draft.enabled}
-              disabled={save.isPending}
+              disabled={save.isPending || recipient.data?.status !== 'verified'}
               onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
             />
             <span aria-hidden="true" />
           </label>
         </div>
+        {recipient.data?.status !== 'verified' && (
+          <p className="inline-note">验证收件邮箱后才能开启每日邮件</p>
+        )}
         <label className="digest-field">
           <span>发送时间</span>
           <input
@@ -1314,6 +1396,31 @@ function DigestPage() {
           {save.isPending ? <RefreshCw className="spin" size={16} /> : <Check size={16} />}
           保存设置
         </button>
+        <button
+          className="button button--secondary"
+          type="button"
+          disabled={
+            recipient.data?.status !== 'verified'
+            || status.data?.deliveryCapability !== 'configured'
+            || sendTestEmail.isPending
+          }
+          onClick={() => sendTestEmail.mutate()}
+        >
+          {sendTestEmail.isPending ? <RefreshCw className="spin" size={16} /> : <Mail size={16} />}
+          发送测试邮件
+        </button>
+        {sendTestEmail.error && (
+          <p className="inline-error"><AlertCircle size={15} />{sendTestEmail.error.message}</p>
+        )}
+        {testEmail.data?.status === 'succeeded' && (
+          <p className="inline-success"><CheckCircle2 size={15} />测试邮件已发送</p>
+        )}
+        {['queued', 'running', 'retrying'].includes(testEmail.data?.status ?? '') && (
+          <p className="inline-note">测试邮件发送中</p>
+        )}
+        {testEmail.data?.status === 'failed' && (
+          <p className="inline-error"><AlertCircle size={15} />测试邮件发送失败，请稍后重试</p>
+        )}
       </form>}
 
       <DigestRunStatusView
@@ -1369,6 +1476,64 @@ function DigestPage() {
       </section>
     </Page>
   );
+}
+
+function DigestVerificationPage() {
+  const location = useLocation();
+  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const verification = useQuery({
+    queryKey: ['digest-recipient-confirm', token],
+    queryFn: () => api.confirmDigestRecipient(token),
+    enabled: token.length > 0,
+    retry: false,
+  });
+  return <main className="auth-page">
+    <section className="auth-panel digest-verification-result">
+      <div className="auth-brand"><span>LM</span><h1>收件邮箱验证</h1></div>
+      {!token && <p className="inline-error"><AlertCircle size={15} />验证链接无效</p>}
+      {token && verification.isLoading && <p><RefreshCw className="spin" size={18} />正在验证邮箱</p>}
+      {verification.isSuccess && <>
+        <CheckCircle2 size={32} />
+        <h2>邮箱已验证</h2>
+        <p>现在可以返回 LetterMate 设置每日简报。</p>
+      </>}
+      {verification.error && <>
+        <AlertCircle size={32} />
+        <h2>验证链接不可用</h2>
+        <p>链接可能已过期或已经使用，请返回 LetterMate 重新发送。</p>
+      </>}
+      <Link className="button" to="/digest">返回每日邮件</Link>
+    </section>
+  </main>;
+}
+
+function DigestUnsubscribePage() {
+  const location = useLocation();
+  const token = new URLSearchParams(location.search).get('token') ?? '';
+  const unsubscribe = useQuery({
+    queryKey: ['digest-unsubscribe', token],
+    queryFn: () => api.unsubscribeDigest(token),
+    enabled: token.length > 0,
+    retry: false,
+  });
+  return <main className="auth-page">
+    <section className="auth-panel digest-verification-result">
+      <div className="auth-brand"><span>LM</span><h1>停止每日邮件</h1></div>
+      {!token && <p className="inline-error"><AlertCircle size={15} />退订链接无效</p>}
+      {token && unsubscribe.isLoading && <p><RefreshCw className="spin" size={18} />正在停止每日邮件</p>}
+      {unsubscribe.isSuccess && <>
+        <CheckCircle2 size={32} />
+        <h2>已停止每日邮件</h2>
+        <p>之后不会再安排新的每日邮件。历史邮件和内容不会删除。</p>
+      </>}
+      {unsubscribe.error && <>
+        <AlertCircle size={32} />
+        <h2>退订链接不可用</h2>
+        <p>链接可能已被新设置替换。登录 LetterMate 后可查看当前邮件状态。</p>
+      </>}
+      <Link className="button" to="/digest">返回每日邮件</Link>
+    </section>
+  </main>;
 }
 
 function DigestDeliveryStatusView({
@@ -1528,6 +1693,7 @@ function Workspace({ session, onLogout }: { session: AuthSession; onLogout: () =
 
 export default function App() {
   const client = useQueryClient();
+  const location = useLocation();
   const session = useQuery({
     queryKey: ['auth-session'],
     queryFn: api.session,
@@ -1548,6 +1714,8 @@ export default function App() {
       authenticated: false, user: null, csrfToken: null,
     }),
   });
+  if (location.pathname === '/digest/verify') return <DigestVerificationPage />;
+  if (location.pathname === '/digest/unsubscribe') return <DigestUnsubscribePage />;
   if (!session.data) {
     return <main className="auth-page"><QueryState isLoading={session.isLoading} error={session.error} retry={() => void session.refetch()} /></main>;
   }
