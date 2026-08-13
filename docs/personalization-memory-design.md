@@ -158,9 +158,9 @@ negativeScore(t)= sum(negativeStrength * negativeDecay(age))
 信号优先级：
 
 1. 活动 Topic 是强结构信号，活动期间不衰减，但不允许扩展精确匹配边界。
-2. 活动 Creator 是来源信号；其 `feedEligible=true` 内容只贡献较弱主题信号。
+2. 活动 Creator 是来源信号；其 `feedEligible=true` 内容只有在同一高置信 `topic | entity` 标签至少跨两篇内容、两个自然日重复出现时才贡献较弱主题信号。单篇标签和 `content_type` 不进入画像。
 3. `interested` 是最强内容级正向信号，只传播到该内容的高置信主题。
-4. `less` 单独累计负向信号，对当前内容影响强，对相邻主题传播受限。
+4. `less` 对当前 `contentKey` 直接施加强惩罚，不依赖兴趣标签是否存在；有高置信标签时再单独累计负向信号，对相邻主题传播受限。
 5. 取消反馈终止对应信号并重新投影，不写一个方向相反的伪事件。
 6. 曝光、未点击和未反馈不改变画像。
 
@@ -180,7 +180,7 @@ negativeScore(t)= sum(negativeStrength * negativeDecay(age))
 ### 6.2 硬约束
 
 - 质量门控、来源证明和用户所有权先于个性化。
-- Topic/Creator 保护内容不能被 `less`、多样性或探索移除，只能调整顺序。
+- Topic/Creator 保护内容不能被 `less`、多样性或探索移除，只能调整顺序；客户端在反馈成功后立即重新获取 Feed 和兴趣记忆，并显示已生效状态。
 - Feed 搜索以文本相关性为第一排序键，个性化只处理相同相关度；搜索不插入探索。
 - 来源或 Topic 过滤后的 Feed 不插入其他通道内容。
 - 每日邮件最多 10 条，可以因容量延后保护内容，但必须报告覆盖情况；探索永不进入邮件。

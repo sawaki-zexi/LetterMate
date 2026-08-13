@@ -157,6 +157,11 @@ export function DiscoveryCard({
           </div>
         )}
       </div>
+      {item.feedback === 'less' && (
+        <p className="feedback-confirmation" role="status">
+          已减少此条及相似内容的推荐；已关注的关键词和博主内容仍会保留
+        </p>
+      )}
     </article>
   );
 }

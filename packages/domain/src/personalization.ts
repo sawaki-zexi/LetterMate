@@ -2,13 +2,14 @@ import type { FeedItem } from '@lettermate/contracts';
 
 export const INTEREST_TAXONOMY_VERSION = '2026-08-08-v1';
 export const INTEREST_EXTRACTOR_VERSION = 'openrouter-theme-v1';
-export const INTEREST_PROFILE_POLICY_VERSION = 'interest-profile-v1';
+export const INTEREST_PROFILE_POLICY_VERSION = 'interest-profile-v2';
 export const INTEREST_SHADOW_RANKING_VERSION = 'interest-shadow-v1';
-export const INTEREST_RULES_RANKING_VERSION = 'interest-rules-v2';
+export const INTEREST_RULES_RANKING_VERSION = 'interest-rules-v3';
 export const INTEREST_DISABLED_RANKING_VERSION = 'personalization-off-v1';
 export const INTEREST_ADJACENCY_VERSION = 'qualified-content-cooccurrence-v1';
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const DIRECT_LESS_FEEDBACK_PENALTY = 12;
 
 export type InterestSignalKind = 'topic' | 'creator' | 'interested' | 'less';
 
@@ -203,12 +204,15 @@ function candidateScore(
   const freshness = 2 * decay(ageDays, 3);
   const hot = candidate.item.kind === 'hot' ? 1 : 0;
   const multiOrigin = Math.min(2, Math.max(0, candidate.item.origins.length - 1)) * 0.5;
-  const score = subscription + positive - negative + freshness + hot + multiOrigin;
+  const directNegative = candidate.item.feedback === 'less'
+    ? DIRECT_LESS_FEEDBACK_PENALTY
+    : 0;
+  const score = subscription + positive - negative - directNegative + freshness + hot + multiOrigin;
   const reasons: RecommendationReasonCode[] = [];
   if (followedTopic) reasons.push('FOLLOWED_TOPIC');
   if (followedCreator) reasons.push('FOLLOWED_CREATOR');
   if (positive > 0) reasons.push('RELATED_INTEREST');
-  if (negative > 0) reasons.push('REDUCED_INTEREST');
+  if (negative > 0 || directNegative > 0) reasons.push('REDUCED_INTEREST');
   if (trend && candidate.item.kind === 'hot') reasons.push('RECENT_HOT_TOPIC');
   const lane: RecommendationLane = followedTopic || followedCreator
     ? 'subscription'

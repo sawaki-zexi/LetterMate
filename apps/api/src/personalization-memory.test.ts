@@ -40,6 +40,23 @@ const topicEvent = (userId: string, id: string): InterestEvent => ({
   occurredAt: '2026-08-08T08:00:00.000Z',
 });
 
+const creatorEvent = (userId: string, id: string): InterestEvent => ({
+  ...eventBase,
+  id,
+  userId,
+  eventType: 'creator_state',
+  sourceRef: 'creator-1',
+  payload: {
+    schemaVersion: 1,
+    state: 'active',
+    creatorId: 'creator-1',
+    platform: 'x',
+    accountKey: 'creator-1',
+    displayName: 'Creator One',
+  },
+  occurredAt: '2026-08-08T08:00:00.000Z',
+});
+
 const candidate = (contentKey: string): FeedItem => ({
   id: contentKey,
   topicId: null,
@@ -104,6 +121,49 @@ describe('personalization memory adapters', () => {
     facts.events = [feedbackEvent('user-2', 'event-2')];
     const withoutOwnedSignal = await memory.select(input);
     expect(withoutOwnedSignal.profileVersion).not.toBe(first.profileVersion);
+  });
+
+  it('requires repeated cross-day creator evidence and excludes content-type noise', async () => {
+    const facts: MemoryPersonalizationFacts = {
+      events: [creatorEvent('user-1', 'creator-event-1')],
+      tags: [
+        {
+          tagId: 'tag-single', slug: 'single', displayName: 'Single mention', kind: 'topic',
+          confidence: 0.95, contentKey: 'https://example.com/one',
+          createdAt: '2026-08-07T08:00:00.000Z',
+        },
+        ...['one', 'two'].map((key) => ({
+          tagId: 'tag-repeated', slug: 'repeated', displayName: 'Repeated theme', kind: 'topic' as const,
+          confidence: 0.9, contentKey: `https://example.com/${key}`,
+          createdAt: `2026-08-0${key === 'one' ? '7' : '8'}T08:00:00.000Z`,
+        })),
+        ...['one', 'two'].map((key) => ({
+          tagId: 'tag-format', slug: 'tutorial', displayName: 'Tutorial', kind: 'content_type' as const,
+          confidence: 1, contentKey: `https://example.com/${key}`,
+          createdAt: `2026-08-0${key === 'one' ? '7' : '8'}T08:00:00.000Z`,
+        })),
+      ],
+      creatorContent: [
+        {
+          userId: 'user-1', creatorId: 'creator-1', contentKey: 'https://example.com/one',
+          discoveredAt: '2026-08-07T08:00:00.000Z',
+        },
+        {
+          userId: 'user-1', creatorId: 'creator-1', contentKey: 'https://example.com/two',
+          discoveredAt: '2026-08-08T08:00:00.000Z',
+        },
+      ],
+      settings: {},
+      forgottenTagIds: {},
+    };
+    const memory = new MemoryPersonalizationMemory(
+      () => facts,
+      () => new Date('2026-08-09T08:00:00.000Z'),
+    );
+
+    const view = await memory.inspect('user-1');
+    const allThemes = [...view.recent, ...view.longTerm, ...view.reduced];
+    expect(allThemes.map((theme) => theme.id)).toEqual(['tag-repeated']);
   });
 
   it('pauses ranking, resets behavioral history, and keeps forgotten themes suppressed', async () => {

@@ -125,7 +125,7 @@ describe('DiscoveryCard', () => {
 
   it('renders persisted feedback state and emits switch or clear actions', () => {
     const onFeedback = vi.fn();
-    render(<DiscoveryCard
+    const { rerender } = render(<DiscoveryCard
       item={{ ...topicItem, feedback: 'interested' }}
       onFeedback={onFeedback}
     />);
@@ -138,5 +138,11 @@ describe('DiscoveryCard', () => {
     fireEvent.click(less);
     expect(onFeedback).toHaveBeenNthCalledWith(1, null);
     expect(onFeedback).toHaveBeenNthCalledWith(2, 'less');
+
+    rerender(<DiscoveryCard
+      item={{ ...topicItem, feedback: 'less' }}
+      onFeedback={onFeedback}
+    />);
+    expect(screen.getByRole('status')).toHaveTextContent('已减少此条及相似内容的推荐');
   });
 });

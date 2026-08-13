@@ -318,6 +318,8 @@ function FeedPage() {
       client.setQueriesData<FeedItem>({ queryKey: ['item'] }, (item) => (
         item?.contentKey === result.contentKey ? { ...item, feedback: result.value } : item
       ));
+      void client.invalidateQueries({ queryKey: ['feed'] });
+      void client.invalidateQueries({ queryKey: ['interests'] });
     },
   });
   const impressionQueue = useRef(new Map<string, Set<string>>());

@@ -374,10 +374,11 @@ function installFetchMock({
           code: 'FEEDBACK_UNAVAILABLE', message: '反馈暂时无法保存', traceId: 'test',
         }, { status: 503 });
       }
-      return Response.json({
-        contentKey: decodeURIComponent(feedbackMatch[1] ?? ''),
-        value: body.value,
-      });
+      const contentKey = decodeURIComponent(feedbackMatch[1] ?? '');
+      feed = feed.map((feedItem) => (
+        feedItem.contentKey === contentKey ? { ...feedItem, feedback: body.value } : feedItem
+      ));
+      return Response.json({ contentKey, value: body.value });
     }
     if (/\/items\/[^/?]+$/.test(url)) return Response.json(item!);
     if (url.includes('/feed')) {
@@ -965,6 +966,8 @@ describe('discovery workspace', () => {
     await waitFor(() => expect(interested).toHaveAttribute('aria-pressed', 'false'));
     fireEvent.click(less);
     await waitFor(() => expect(less).toHaveAttribute('aria-pressed', 'true'));
+    await waitFor(() => expect(requests.filter(({ url }) => url.includes('/feed')).length)
+      .toBeGreaterThan(1));
 
     expect(requests.filter(({ url }) => url.includes('/feedback/')).map(({ body }) => body))
       .toEqual([{ value: 'interested' }, { value: null }, { value: 'less' }]);

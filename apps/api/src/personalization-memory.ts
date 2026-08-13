@@ -141,10 +141,28 @@ function buildShadow(input: {
       }
     }
   }
-  for (const content of input.creatorContent) {
-    if (!activeCreatorIds.has(content.creatorId)) continue;
-    if (resetAt && new Date(content.discoveredAt) < resetAt) continue;
+  const eligibleCreatorContent = input.creatorContent.filter((content) => (
+    activeCreatorIds.has(content.creatorId)
+    && (!resetAt || new Date(content.discoveredAt) >= resetAt)
+  ));
+  const creatorEvidence = new Map<string, { contentKeys: Set<string>; dates: Set<string> }>();
+  for (const content of eligibleCreatorContent) {
     for (const tag of tagsByContent.get(content.contentKey) ?? []) {
+      if (tag.kind === 'content_type' || tag.confidence < 0.75) continue;
+      const evidence = creatorEvidence.get(tag.tagId) ?? {
+        contentKeys: new Set<string>(), dates: new Set<string>(),
+      };
+      evidence.contentKeys.add(content.contentKey);
+      evidence.dates.add(content.discoveredAt.slice(0, 10));
+      creatorEvidence.set(tag.tagId, evidence);
+    }
+  }
+  const eligibleCreatorTagIds = new Set([...creatorEvidence.entries()].flatMap(([tagId, evidence]) => (
+    evidence.contentKeys.size >= 2 && evidence.dates.size >= 2 ? [tagId] : []
+  )));
+  for (const content of eligibleCreatorContent) {
+    for (const tag of tagsByContent.get(content.contentKey) ?? []) {
+      if (!eligibleCreatorTagIds.has(tag.tagId)) continue;
       signals.push({
         tagId: tag.tagId,
         kind: 'creator',

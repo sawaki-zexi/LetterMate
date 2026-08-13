@@ -119,6 +119,10 @@ Creator 同步状态使用 `queued | running | succeeded | degraded | failed`。
 
 ## 5. Feed、兴趣与探索
 
+兴趣投影只把活动 Topic、显式反馈和满足重复证据门槛的 Creator 标签作为画像信号。Creator 自动信号要求同一高置信 `topic | entity` 标签至少出现在两篇不同内容、两个不同自然日中；`content_type` 和单篇标签仅保留为内容元数据，不进入用户画像。该门槛在投影时计算，因此旧画像会在下一次选择或兴趣查看时自动重建，无需数据迁移。
+
+`less` 同时包含内容级和主题级作用：评分器始终对当前 `contentKey` 应用直接惩罚，不依赖标签提取是否成功；存在高置信标签时再通过负向画像降低相似内容。Topic 与 Creator 内容仍属于保护集合，不被删除，但可以降序。客户端保存反馈后使 Feed 和兴趣记忆查询失效，立即获取新的排序与画像。
+
 统一 Feed 按平台内容 ID、规范化 URL 和内容指纹合并 Topic、Trend 与 Creator，并返回全部 `origins[]`。
 
 兴趣信号来自：

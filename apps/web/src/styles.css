@@ -97,6 +97,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .feedback-button[aria-pressed="true"]:first-child { border-color: #9fcac4; background: #e8f4f1; color: #176b65; }
 .feedback-button[aria-pressed="true"]:last-child { border-color: #d9b0b3; background: #f8e9ea; color: #8a3940; }
 .feedback-button:disabled { cursor: wait; opacity: .58; }
+.discovery-card .feedback-confirmation { margin-top: 9px; color: #7a5558; font-size: 12px; }
 .classification, .meta { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 12px; }
 .classification { font-weight: 700; }
 .classification--hot { color: #a84b22; }

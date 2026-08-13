@@ -96,6 +96,26 @@ describe('personalization domain module', () => {
     expect(rankShadowSlate(input)).toEqual(first);
   });
 
+  it('directly demotes less feedback even when the content has no interest tags', () => {
+    const ranked = rankShadowSlate({
+      candidates: [
+        {
+          item: feedItem('https://example.com/a', { feedback: 'less' }),
+          tags: [],
+        },
+        { item: feedItem('https://example.com/b'), tags: [] },
+      ],
+      profile: [],
+      asOf: new Date('2026-08-08T08:00:00.000Z'),
+    });
+
+    expect(ranked.map((item) => item.contentKey)).toEqual([
+      'https://example.com/b',
+      'https://example.com/a',
+    ]);
+    expect(ranked[1]?.reasonCodes).toContain('REDUCED_INTEREST');
+  });
+
   it('marks at most ten percent of an ordinary Feed as adjacent exploration', () => {
     const profile = [{
       tagId: 'core', shortScore: 5, longScore: 3, negativeScore: 0,
