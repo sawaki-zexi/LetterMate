@@ -7,6 +7,8 @@ export const digestQueueName = 'daily-digest';
 export const digestVerificationQueueName = 'digest-email-verification';
 export const digestTestEmailQueueName = 'digest-test-email';
 export const maxTopicExpandedTerms = 32;
+export const defaultFeedPageLimit = 30;
+export const maxFeedPageLimit = 50;
 
 export const discoveryKindSchema = z.enum(['hot', 'quality']);
 export const runStatusSchema = z.enum(['queued', 'running', 'succeeded', 'degraded', 'failed']);
@@ -22,6 +24,7 @@ export const sourceTypeSchema = z.enum([
 export const discoveryTriggerSchema = z.enum(['initial', 'manual', 'scheduled']);
 export const feedRangeSchema = z.enum(['1d', '3d', '7d', '30d', '90d', 'all']);
 export const feedOriginSchema = z.enum(['all', 'topic', 'trend', 'creator']);
+export const readingStateSchema = z.enum(['saved', 'archived']);
 export const feedbackValueSchema = z.enum(['interested', 'less']);
 export const interestEventTypeSchema = z.enum([
   'topic_state',
@@ -99,6 +102,9 @@ export const feedQuerySchema = z.strictObject({
   range: feedRangeSchema.default('30d'),
   origin: feedOriginSchema.default('all'),
   q: feedSearchTextSchema,
+  reading: readingStateSchema.optional(),
+  limit: z.coerce.number().int().min(1).max(maxFeedPageLimit).default(defaultFeedPageLimit),
+  cursor: z.string().trim().min(1).max(1024).regex(/^[A-Za-z0-9_-]+$/u).optional(),
 }).superRefine((filter, context) => {
   if (filter.topicId && (filter.origin === 'trend' || filter.origin === 'creator')) {
     context.addIssue({
@@ -290,6 +296,7 @@ const feedMergeFields = {
   contentKey: httpUrlSchema,
   origins: z.array(feedOriginDetailSchema).min(1).max(50),
   feedback: feedbackValueSchema.nullable(),
+  readingState: readingStateSchema.nullable().optional(),
   recommendation: feedRecommendationSchema.optional(),
 };
 
@@ -300,6 +307,33 @@ export const feedbackInputSchema = z.strictObject({
 export const contentFeedbackSchema = z.strictObject({
   contentKey: httpUrlSchema,
   value: feedbackValueSchema.nullable(),
+});
+
+export const savedContentInputSchema = z.strictObject({
+  state: readingStateSchema.nullable(),
+});
+
+export const savedContentBatchInputSchema = z.strictObject({
+  contentKeys: z.array(httpUrlSchema).min(1).max(maxFeedPageLimit),
+  state: z.literal('archived'),
+}).superRefine((input, context) => {
+  const keys = input.contentKeys.map((key) => key.toLowerCase());
+  if (new Set(keys).size !== keys.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['contentKeys'],
+      message: 'contentKeys must not contain duplicates',
+    });
+  }
+});
+
+export const savedContentSchema = z.strictObject({
+  contentKey: httpUrlSchema,
+  state: readingStateSchema.nullable(),
+});
+
+export const savedContentBatchSchema = z.strictObject({
+  items: z.array(savedContentSchema).max(maxFeedPageLimit),
 });
 
 export const feedImpressionInputSchema = z.strictObject({
@@ -591,6 +625,12 @@ export const feedItemSchema = z.discriminatedUnion('origin', [
   creatorFeedItemSchema,
 ]);
 
+export const feedPageSchema = z.strictObject({
+  items: z.array(feedItemSchema).max(maxFeedPageLimit),
+  nextCursor: z.string().min(1).max(1024).nullable(),
+  truncated: z.boolean(),
+});
+
 export const discoveryJobDataSchema = z.object({
   topicId: z.string().min(1),
   userId: z.string().min(1),
@@ -716,11 +756,17 @@ export type DiscoveryJobData = z.infer<typeof discoveryJobDataSchema>;
 export type DiscoverySourceStatus = z.infer<typeof discoverySourceStatusSchema>;
 export type DiscoveryTrigger = z.infer<typeof discoveryTriggerSchema>;
 export type FeedItem = z.infer<typeof feedItemSchema>;
+export type FeedPage = z.infer<typeof feedPageSchema>;
 export type FeedbackInput = z.infer<typeof feedbackInputSchema>;
 export type FeedImpressionInput = z.infer<typeof feedImpressionInputSchema>;
 export type FeedImpressionReceipt = z.infer<typeof feedImpressionReceiptSchema>;
 export type FeedbackValue = z.infer<typeof feedbackValueSchema>;
 export type ContentFeedback = z.infer<typeof contentFeedbackSchema>;
+export type SavedContentInput = z.infer<typeof savedContentInputSchema>;
+export type SavedContentBatchInput = z.infer<typeof savedContentBatchInputSchema>;
+export type SavedContent = z.infer<typeof savedContentSchema>;
+export type SavedContentBatch = z.infer<typeof savedContentBatchSchema>;
+export type ReadingState = z.infer<typeof readingStateSchema>;
 export type InterestEvent = z.infer<typeof interestEventSchema>;
 export type InterestEventType = z.infer<typeof interestEventTypeSchema>;
 export type InterestTagExtraction = z.infer<typeof interestTagExtractionSchema>;

@@ -98,6 +98,8 @@ Topic 和 Trend 共用主发现流程：
 
 Topic 使用 6/12/24 小时自适应周期。TrendMonitor 使用持久化周期。调度、手动刷新和故障恢复都复用运行租约和幂等任务边界。
 
+Topic API 不直接把 Redis 入队作为数据库事务的一部分。Topic 创建、编辑触发的刷新、恢复和手动刷新会在同一 PostgreSQL 事务中写入 `TopicDispatchOutbox`；`TopicDispatchRelay` 通过数据库 lease 领取待投递记录，再以 outbox ID 作为 BullMQ 稳定 `jobId`。入队失败只记录安全错误码并按指数退避，成功后确认 outbox；relay 的并发 `kick()` 合并为单次 flush。Topic 删除会在同一事务取消尚未投递的记录，领取查询同时排除已删除或暂停 Topic；暂停不会丢弃意图，恢复后仍可领取有效记录。该边界提供至少一次投递，不把 Redis 短时故障转换成已提交 Topic 的伪失败。
+
 Topic 与 Trend 编排通过可选遥测接口输出 `plan | collect | classify | retrieve | quality_gate | persist` 阶段事件。事件只包含运行 ID、耗时和聚合输入/输出/失败数量；不包含用户、关键词、URL、正文或供应商响应。遥测 Adapter 的失败不会改变发现运行结果。
 
 离线 Agent 评估使用版本化的 expected/forbidden URL golden fixtures，对最终结果计算预期召回、禁止命中率、HTTP(S) 来源覆盖、中文内容覆盖和重复率。评估接口位于 Domain，CLI 是独立 Adapter；默认不联网，未达到门槛时返回非零状态，可直接接入 CI。仓库内 fixtures 用于验证质量边界和评估机制，不代表真实线上效果基准。
@@ -124,6 +126,14 @@ Creator 同步状态使用 `queued | running | succeeded | degraded | failed`。
 `less` 同时包含内容级和主题级作用：评分器始终对当前 `contentKey` 应用直接惩罚，不依赖标签提取是否成功；存在高置信标签时再通过负向画像降低相似内容。Topic 与 Creator 内容仍属于保护集合，不被删除，但可以降序。客户端保存反馈后使 Feed 和兴趣记忆查询失效，立即获取新的排序与画像。
 
 统一 Feed 按平台内容 ID、规范化 URL 和内容指纹合并 Topic、Trend 与 Creator，并返回全部 `origins[]`。
+
+`SavedContent` 是按用户和规范化内容键保存的版本化阅读列表记录。每次状态变化结束当前记录的有效区间并在需要时创建新的 `saved | archived` 记录；`removedAt` 表示该版本失效。该时间区间模型允许 Feed 在 `snapshotAt` 回放稍后读或归档成员，即使用户随后反复取消、恢复或归档，后续页也不会漂移。阅读状态不复制来源内容，不生成兴趣事件，不参与个性化或邮件选择；打开外部链接不会隐式写状态。
+
+批量阅读操作只接受 `archived` 目标状态和最多 50 个规范化内容键。Web 仅在稍后读视图中选择当前已加载页面，API 在规范化后拒绝重复内容键，并在同一数据库事务中重新检查每一项的用户所有权和 Feed 资格；任一目标无效时用事务回滚整批写入。成功批次共享同一个状态变化时间，以保持版本有效区间一致。批量操作不写兴趣事件，也不改变推荐决策或邮件候选。
+
+`TopicStore.listFeed` 是 Feed 读取的统一接口，Prisma 和 Memory adapter 均返回 `FeedPage { items, nextCursor, truncated }`。首页在 API 时钟上固定 `snapshotAt`，不透明 base64url 游标保存版本、快照时间、原始 `since`、偏移和筛选指纹，并使用服务端会话密钥的 HMAC-SHA-256 验证完整性。指纹覆盖用户、来源、Topic、分类、搜索词、阅读列表筛选、窗口键和页大小；解码失败、HMAC 不匹配或指纹不匹配由 API 统一返回 `400 INVALID_CURSOR`。
+
+每个来源在快照内最多读取 300 个候选，然后才进行跨来源合并、去重和个性化；任一来源达到上限时 `truncated=true`。Prisma 查询同时施加 `discoveredAt <= snapshotAt`、时间窗口、所有权与来源条件，搜索 SQL 按相关性、有效时间和 ID 稳定排序并使用 `LIMIT`。个性化选择器使用同一 `snapshotAt` 作为 `asOf`，使后续页重算时不读取快照之后的兴趣事件。
 
 兴趣信号来自：
 
@@ -177,7 +187,10 @@ Resend Adapter 使用固定 HTTPS 基址、请求超时、稳定幂等键和安�
 | `POST` | `/creators/resolve` | 解析博主身份候选 |
 | `POST` | `/creators` | 确认并创建关注 |
 | `GET` | `/creators/:id/items` | 读取博主有效内容档案 |
+| `GET` | `/feed` | 读取绑定用户和筛选的稳定快照分页 |
 | `PUT` | `/feedback/:contentKey` | 设置、切换或清除反馈 |
+| `PUT` | `/saved-items` | 原子批量归档当前用户最多 50 条稍后读内容 |
+| `PUT` | `/saved-items/:contentKey` | 设置 `saved | archived | null` 阅读列表状态 |
 | `GET/PUT` | `/digest-preference` | 读取或修改每日邮件设置 |
 | `GET` | `/digest-recipient` | 读取当前用户的收件地址和验证状态 |
 | `POST` | `/digest-recipient/verification` | 保存地址并发送一次性验证邮件 |
@@ -190,6 +203,8 @@ Resend Adapter 使用固定 HTTPS 基址、请求超时、稳定幂等键和安�
 | `GET` | `/digest-status` | 读取投递能力、下一次本地发送时间和最近运行 |
 
 共享 schema 拒绝未声明字段。跨用户资源统一返回 `404`，避免泄露资源是否存在。
+
+PostgreSQL 专有路径不依赖 Memory adapter 代替验证。CI 使用空 PostgreSQL service 和独立 shadow database 检查迁移目录与 Prisma schema 无差异，执行已提交迁移后开启 `RUN_DATABASE_TESTS=1` 运行 Feed 搜索、所有权和快照游标集成测试。该门禁覆盖 `pg_trgm`、Prisma 查询与用户隔离，不在默认本地离线测试中启动。
 
 ## 8. 安全与运行
 

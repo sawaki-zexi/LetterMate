@@ -55,6 +55,7 @@ LetterMate 将完整关键词追踪与自动技术趋势发现合并到一个 Fe
 - 核心事实支持门控、历史增量判断和多层去重。
 - `hot | quality` 分类、中文摘要、推荐理由和可回溯原始链接。
 - Topic 的 6/12/24 小时自适应调度与趋势监控持久化周期。
+- Topic 创建、修改、恢复和手动刷新使用事务型 dispatch outbox；Redis 短时不可用时自动退避重试，删除不会投递失效任务，暂停期间不领取任务。
 - Topic 主关键词及扩展词可编辑、删除；AI 只在首次运行生成扩展词，之后完全由用户管理。
 - 修改或删除 Topic 不删除历史 Feed；历史卡片保留发现时关键词并显示“关键词已失效”。
 - 统一 Feed、已入库文章搜索、来源/分类/时间筛选和自然日期分组。
@@ -296,8 +297,10 @@ docker compose -f infra/compose.production.example.yaml --profile operations run
 | `POST` | `/topics/:id/refresh` | 登记 Topic 手动刷新 |
 | `GET` | `/trends/status` | 获取趋势 Monitor 和最新运行摘要 |
 | `POST` | `/trends/refresh` | 登记趋势手动刷新 |
-| `GET` | `/feed` | 查询统一 Feed |
+| `GET` | `/feed` | 查询统一 Feed 的稳定快照分页 |
 | `GET` | `/items/:id` | 获取 Topic 或趋势条目详情 |
+| `PUT` | `/saved-items/:contentKey` | 设置单条内容 `saved | archived | null` 阅读状态 |
+| `PUT` | `/saved-items` | 原子批量归档当前用户最多 50 条稍后读内容 |
 | `GET` | `/discovery-sources` | 获取脱敏后的连接器启用状态 |
 | `GET/PUT` | `/digest-preference` | 读取或修改每日邮件设置 |
 | `GET` | `/digest-recipient` | 获取收件邮箱及验证状态 |
@@ -309,7 +312,11 @@ docker compose -f infra/compose.production.example.yaml --profile operations run
 | `GET` | `/digest-preview` | 预览下一封邮件候选 |
 | `GET` | `/digest-status` | 获取邮件能力、下一次本地发送时间和最近运行 |
 
-Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend|creator`、`kind=hot|quality`、可选 `topicId` 和最长 100 字符的 `q`。`q` 只搜索当前用户已入库文章的标题、摘要和推荐理由，不触发外部发现；有关键词时按标题、摘要、推荐理由的加权相关性排序，再按文章时间和 ID 稳定排序。`topicId` 不能与 `origin=trend|creator` 同时使用。
+Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend|creator`、`kind=hot|quality`、`reading=saved|archived`、可选 `topicId`、最长 100 字符的 `q`、`limit=1..50`（默认 30）和不透明 `cursor`。`q` 只搜索当前用户已入库文章的标题、摘要和推荐理由，不触发外部发现；有关键词时按标题、摘要、推荐理由的加权相关性排序，再按文章时间和 ID 稳定排序。`topicId` 不能与 `origin=trend|creator` 同时使用。稍后读视图可通过 `PUT /saved-items` 一次归档当前已加载页面中最多 50 条内容；批量请求任一内容越权或不存在时整批回滚。
+
+`GET /feed` 返回 `{ items, nextCursor, truncated }`。首页固定一个快照时间，后续页不会被新入库内容插队；`nextCursor=null` 表示当前快照已读完。`truncated=true` 表示至少一个来源命中了有界候选池上限，客户端应如实显示结果范围提示。游标绑定用户、筛选、时间窗口和页大小，错用或篡改返回 `400 INVALID_CURSOR`。
+
+Topic API 返回成功只代表 Topic 状态与 dispatch 意图已持久化，不代表 Redis 已即时接受任务。后台 relay 会自动完成投递；删除会取消尚未投递的意图，暂停期间不领取，恢复后可继续处理。
 
 ## 开发与验证
 
@@ -320,6 +327,8 @@ Feed 支持 `range=1d|3d|7d|30d|90d|all`、`origin=all|topic|trend|creator`、`k
 | `npm run lint` | ESLint，禁止 warning |
 | `npm run typecheck` | TypeScript project references 检查 |
 | `npm test` | Vitest 单元与集成测试 |
+| `RUN_DATABASE_TESTS=1 npm test -- apps/api/src/feed-search.integration.test.ts` | 在已连接 PostgreSQL 且已部署迁移的情况下验证 Feed SQL、所有权与游标快照 |
+| `RUN_DATABASE_TESTS=1 npm test -- apps/api/src/topic-dispatch-outbox.integration.test.ts` | 在已连接 PostgreSQL 且已部署迁移的情况下验证 Topic outbox 事务、lease、重试和状态过滤 |
 | `npm run evaluate:quality` | 运行离线 Agent golden fixtures 质量门槛 |
 | `npm run evaluate:source-quality -- http://127.0.0.1:9090 24` | 从 Prometheus 评估最近 24 小时来源漏斗和窗口完整性 |
 | `npm run evaluate:interest-effects -- YYYY-MM-DD` | 汇总指定 UTC 日的曝光、显式反馈与订阅保护效果 |

@@ -113,6 +113,7 @@ interface FetchMockOptions {
   topics?: Topic[];
   topicsResponse?: Promise<Topic[]>;
   feed?: FeedItem[];
+  nextFeed?: FeedItem[];
   feedByQuery?: Record<string, FeedItem[]>;
   feedSearchFailures?: number;
   item?: FeedItem;
@@ -144,6 +145,7 @@ function installFetchMock({
   topics: initialTopics = [],
   topicsResponse,
   feed = [],
+  nextFeed,
   feedByQuery = {},
   feedSearchFailures: initialFeedSearchFailures = 0,
   item,
@@ -380,10 +382,29 @@ function installFetchMock({
       ));
       return Response.json({ contentKey, value: body.value });
     }
+    const savedContentMatch = url.match(/\/saved-items\/(.+)$/);
+    if (url.endsWith('/saved-items') && method === 'PUT') {
+      const contentKeys = (body.contentKeys as string[]) ?? [];
+      feed = feed.map((feedItem) => contentKeys.includes(feedItem.contentKey)
+        ? { ...feedItem, readingState: body.state }
+        : feedItem);
+      return Response.json({
+        items: contentKeys.map((contentKey) => ({ contentKey, state: body.state })),
+      });
+    }
+    if (savedContentMatch && method === 'PUT') {
+      const contentKey = decodeURIComponent(savedContentMatch[1] ?? '');
+      feed = feed.map((feedItem) => (
+        feedItem.contentKey === contentKey ? { ...feedItem, readingState: body.state } : feedItem
+      ));
+      return Response.json({ contentKey, state: body.state });
+    }
     if (/\/items\/[^/?]+$/.test(url)) return Response.json(item!);
     if (url.includes('/feed')) {
       feedRequestCount += 1;
-      const query = new URL(url, 'http://test').searchParams.get('q');
+      const searchParams = new URL(url, 'http://test').searchParams;
+      const query = searchParams.get('q');
+      const cursor = searchParams.get('cursor');
       if (query && feedSearchFailures > 0) {
         feedSearchFailures -= 1;
         return Response.json({
@@ -394,7 +415,13 @@ function installFetchMock({
         feedRefetchFailures -= 1;
         return Response.json({ code: 'FEED_UNAVAILABLE', message: '发现内容暂时不可用', traceId: 'test' }, { status: 503 });
       }
-      return Response.json(query ? feedByQuery[query] ?? [] : feed);
+      const reading = searchParams.get('reading');
+      const responseItems = cursor && nextFeed ? nextFeed : query ? feedByQuery[query] ?? [] : feed;
+      return Response.json({
+        items: reading ? responseItems.filter((feedItem) => feedItem.readingState === reading) : responseItems,
+        nextCursor: !cursor && nextFeed ? 'next-page' : null,
+        truncated: false,
+      });
     }
     return Response.json({ code: 'NOT_FOUND', message: 'not found', traceId: 'test' }, { status: 404 });
   }));
@@ -440,6 +467,74 @@ describe('discovery workspace', () => {
 
     fireEvent.change(range, { target: { value: '3d' } });
     await waitFor(() => expect(requests.some(({ url }) => url.includes('range=3d'))).toBe(true));
+  });
+
+  it('saves, archives, filters, and restores an item from the Feed', async () => {
+    installFetchMock({ feed: [feedItem('reading-flow', 'trend')] });
+    renderApp('/');
+    await screen.findByRole('heading', { name: '发现 reading-flow' });
+
+    fireEvent.click(screen.getByRole('button', { name: '保存到稍后读' }));
+    expect(await screen.findByRole('button', { name: '归档' })).toBeVisible();
+    expect(requests.some(({ url, body }) => (
+      url.includes('/saved-items/') && (body as { state?: string } | undefined)?.state === 'saved'
+    ))).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: '归档' }));
+    expect(await screen.findByRole('button', { name: '恢复到稍后读' })).toBeVisible();
+    const readingGroup = screen.getByRole('group', { name: '阅读状态' });
+    fireEvent.click(within(readingGroup).getByRole('button', { name: '已归档' }));
+    await waitFor(() => expect(requests.some(({ url }) => url.includes('reading=archived'))).toBe(true));
+    expect(await screen.findByRole('heading', { name: '发现 reading-flow' })).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '恢复到稍后读' }));
+    expect(await screen.findByText('暂无归档内容')).toBeVisible();
+  });
+
+  it('selects the current reading page and archives it in one request', async () => {
+    installFetchMock({
+      feed: [feedItem('bulk-one', 'trend'), feedItem('bulk-two', 'topic')],
+    });
+    renderApp('/');
+    await screen.findByRole('heading', { name: '发现 bulk-one' });
+    const readingGroup = screen.getByRole('group', { name: '阅读状态' });
+    fireEvent.click(within(readingGroup).getByRole('button', { name: '稍后读' }));
+    await screen.findByText('暂无稍后读内容');
+
+    fireEvent.click(within(readingGroup).getByRole('button', { name: '全部' }));
+    await screen.findByRole('heading', { name: '发现 bulk-one' });
+    for (const item of ['bulk-one', 'bulk-two']) {
+      const card = screen.getByRole('heading', { name: `发现 ${item}` }).closest('article');
+      if (!card) throw new Error(`Missing card for ${item}`);
+      fireEvent.click(within(card).getByRole('button', { name: '保存到稍后读' }));
+      await waitFor(() => expect(within(card).getByRole('button', { name: '归档' })).toBeVisible());
+    }
+    fireEvent.click(within(readingGroup).getByRole('button', { name: '稍后读' }));
+    await screen.findByRole('checkbox', { name: '选择当前页全部稍后读' });
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择当前页全部稍后读' }));
+    expect(screen.getByRole('button', { name: /归档选中/ })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: /归档选中/ }));
+    await screen.findByText('暂无稍后读内容');
+    expect(requests.some(({ url, method, body }) => (
+      url.endsWith('/saved-items')
+      && method === 'PUT'
+      && (body as { contentKeys?: string[] } | undefined)?.contentKeys?.length === 2
+    ))).toBe(true);
+  });
+
+  it('appends the next Feed page from the opaque cursor', async () => {
+    installFetchMock({
+      feed: [feedItem('page-one', 'topic')],
+      nextFeed: [feedItem('page-two', 'trend')],
+    });
+    renderApp('/');
+
+    expect(await screen.findByRole('heading', { name: '发现 page-one' })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '加载更多' }));
+
+    expect(await screen.findByRole('heading', { name: '发现 page-two' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: '发现 page-one' })).toBeVisible();
+    expect(requests.some(({ url }) => url.includes('cursor=next-page'))).toBe(true);
   });
 
   it('submits search only from the form and keeps it active across Feed filters', async () => {

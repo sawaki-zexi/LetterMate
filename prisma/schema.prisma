@@ -110,6 +110,11 @@ enum FeedbackValue {
   less
 }
 
+enum SavedContentState {
+  saved
+  archived
+}
+
 enum InterestEventType {
   topic_state
   creator_state
@@ -163,6 +168,7 @@ model User {
   creatorRuns  CreatorRun[]
   creatorItems CreatorItem[]
   feedback     ContentFeedback[]
+  savedContent SavedContent[]
   interestEvents InterestEvent[]
   interestProfiles UserInterestProfile[]
   interestProfileVersions InterestProfileVersion[]
@@ -198,7 +204,7 @@ model RunStage {
   user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   artifact      RunArtifact?
 
-  @@unique([userId, runKind, runId, stage, inputDigest, policyVersion, routeVersion])
+  @@unique([userId, runKind, runId, stage, inputDigest, policyVersion, routeVersion], map: "RunStage_userId_runKind_runId_stage_inputDigest_policyVersion_r")
   @@index([userId, createdAt])
   @@index([runKind, runId, stage, status])
 }
@@ -302,12 +308,30 @@ model Topic {
   user                  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   items                 DiscoveryItem[]
   runs                  DiscoveryRun[]
+  topicDispatches       TopicDispatchOutbox[]
 
   @@index([userId, deletedAt, createdAt])
   @@index([userId, createdAt])
   @@index([nextRunAt, runStatus])
   @@index([pausedAt, nextRunAt])
   @@index([runStatus, runLeaseUntil])
+}
+
+model TopicDispatchOutbox {
+  id            String            @id @default(uuid())
+  topicId       String
+  userId        String
+  trigger       DiscoveryTrigger
+  createdAt     DateTime          @default(now())
+  availableAt   DateTime          @default(now())
+  claimUntil    DateTime?
+  attemptCount  Int               @default(0)
+  dispatchedAt  DateTime?
+  lastErrorCode String?
+  topic         Topic             @relation(fields: [topicId], references: [id], onDelete: Cascade)
+
+  @@index([dispatchedAt, availableAt, claimUntil, createdAt])
+  @@index([topicId, dispatchedAt])
 }
 
 model DiscoveryItem {
@@ -333,6 +357,9 @@ model DiscoveryItem {
 
   @@unique([topicId, canonicalPrimaryUrl])
   @@index([topicId, publishedAt, discoveredAt])
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "DiscoveryItem_title_trgm_idx")
+  @@index([summary(ops: raw("gin_trgm_ops"))], type: Gin, map: "DiscoveryItem_summary_trgm_idx")
+  @@index([reason(ops: raw("gin_trgm_ops"))], type: Gin, map: "DiscoveryItem_reason_trgm_idx")
 }
 
 model DiscoveryRun {
@@ -442,6 +469,9 @@ model RadarItem {
   @@unique([userId, canonicalPrimaryUrl])
   @@index([userId, publishedAt, discoveredAt])
   @@index([runId, discoveredAt])
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "RadarItem_title_trgm_idx")
+  @@index([summary(ops: raw("gin_trgm_ops"))], type: Gin, map: "RadarItem_summary_trgm_idx")
+  @@index([reason(ops: raw("gin_trgm_ops"))], type: Gin, map: "RadarItem_reason_trgm_idx")
 }
 
 model CreatorSubscription {
@@ -540,6 +570,20 @@ model ContentFeedback {
 
   @@unique([userId, contentKey])
   @@index([userId, updatedAt])
+}
+
+model SavedContent {
+  id          String            @id @default(uuid())
+  userId     String
+  contentKey String
+  state       SavedContentState @default(saved)
+  savedAt     DateTime          @default(now())
+  removedAt   DateTime?
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, savedAt])
+  @@index([userId, state, removedAt, savedAt])
+  @@index([userId, contentKey, removedAt])
 }
 
 model InterestTag {

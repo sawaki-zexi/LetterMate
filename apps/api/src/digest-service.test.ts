@@ -72,7 +72,9 @@ describe('daily digest preview service', () => {
     const digestFacts: MemoryDigestFacts = {
       preferences: {}, completedBoundaries: { 'user-a': boundary },
     };
-    const listFeed = vi.fn().mockResolvedValue(candidates);
+    const listFeed = vi.fn().mockResolvedValue({
+      items: candidates, nextCursor: null, truncated: false,
+    });
     const service = new DefaultDigestService(
       new MemoryDigestPreferenceStore(() => digestFacts),
       { listFeed } as unknown as TopicStore,
@@ -83,7 +85,11 @@ describe('daily digest preview service', () => {
     const preview = await service.preview('user-a');
 
     expect(listFeed).toHaveBeenCalledWith('user-a', {
-      origin: 'all', since: new Date(boundary),
+      origin: 'all',
+      since: new Date(boundary),
+      limit: 50,
+      snapshotAt: new Date('2026-08-08T12:00:00.000Z'),
+      windowKey: boundary,
     });
     expect(preview.items).toHaveLength(10);
     expect(preview.items.some((item) => item.contentKey === candidates[0]!.contentKey)).toBe(false);

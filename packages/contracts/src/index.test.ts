@@ -17,6 +17,10 @@ import {
   discoveryResultSchema,
   discoverySourceStatusSchema,
   contentFeedbackSchema,
+  savedContentBatchInputSchema,
+  savedContentBatchSchema,
+  savedContentInputSchema,
+  savedContentSchema,
   feedbackInputSchema,
   feedImpressionInputSchema,
   feedImpressionReceiptSchema,
@@ -35,6 +39,7 @@ import {
   digestUnsubscribeInputSchema,
   digestUnsubscribeResultSchema,
   feedItemSchema,
+  feedPageSchema,
   feedOriginSchema,
   feedQuerySchema,
   feedRangeSchema,
@@ -80,6 +85,21 @@ const topicOriginFixture = {
 const trendOriginFixture = { origin: 'trend' as const };
 
 describe('AI discovery contracts', () => {
+  it('parses bounded Feed pagination and page responses', () => {
+    expect(feedQuerySchema.parse({ limit: '20' })).toMatchObject({
+      range: '30d', origin: 'all', limit: 20,
+    });
+    expect(feedQuerySchema.parse({ cursor: 'abc_123-XYZ' })).toMatchObject({
+      cursor: 'abc_123-XYZ', limit: 30,
+    });
+    expect(() => feedQuerySchema.parse({ limit: '0' })).toThrow();
+    expect(() => feedQuerySchema.parse({ limit: '51' })).toThrow();
+    expect(() => feedQuerySchema.parse({ cursor: 'not a cursor' })).toThrow();
+    expect(feedPageSchema.parse({
+      items: [], nextCursor: null, truncated: false,
+    })).toEqual({ items: [], nextCursor: null, truncated: false });
+  });
+
   it('accepts only versioned, exact interest events', () => {
     const event = {
       id: 'event-1',
@@ -286,10 +306,10 @@ describe('AI discovery contracts', () => {
     expect(feedQuerySchema.parse({
       q: '  智能体工程  ', range: '30d', origin: 'topic', kind: 'quality',
     })).toEqual({
-      q: '智能体工程', range: '30d', origin: 'topic', kind: 'quality',
+      q: '智能体工程', range: '30d', origin: 'topic', kind: 'quality', limit: 30,
     });
     expect(feedQuerySchema.parse({ q: '   ' })).toEqual({
-      q: undefined, range: '30d', origin: 'all',
+      q: undefined, range: '30d', origin: 'all', limit: 30,
     });
     expect(() => feedQuerySchema.parse({ q: 'x'.repeat(101) })).toThrow();
     expect(() => feedQuerySchema.parse({
@@ -620,6 +640,26 @@ describe('AI discovery contracts', () => {
     expect(contentFeedbackSchema.parse({
       contentKey: 'https://example.com/article', value: 'interested',
     })).toEqual({ contentKey: 'https://example.com/article', value: 'interested' });
+    expect(savedContentInputSchema.parse({ state: 'saved' })).toEqual({ state: 'saved' });
+    expect(savedContentSchema.parse({
+      contentKey: 'https://example.com/article', state: 'archived',
+    })).toEqual({ contentKey: 'https://example.com/article', state: 'archived' });
+    expect(savedContentInputSchema.parse({ state: null })).toEqual({ state: null });
+    expect(() => savedContentInputSchema.parse({ state: 'unknown' })).toThrow();
+    expect(savedContentBatchInputSchema.parse({
+      contentKeys: ['https://example.com/a', 'https://example.com/b'], state: 'archived',
+    })).toEqual({
+      contentKeys: ['https://example.com/a', 'https://example.com/b'], state: 'archived',
+    });
+    expect(savedContentBatchSchema.parse({ items: [
+      { contentKey: 'https://example.com/a', state: 'archived' },
+    ] })).toEqual({ items: [{ contentKey: 'https://example.com/a', state: 'archived' }] });
+    expect(() => savedContentBatchInputSchema.parse({
+      contentKeys: ['https://example.com/a', 'https://example.com/a'], state: 'archived',
+    })).toThrow();
+    expect(() => savedContentBatchInputSchema.parse({
+      contentKeys: ['https://example.com/a'], state: 'saved',
+    })).toThrow();
   });
 
   it('exposes recommendation context and interest memory without internal scores', () => {

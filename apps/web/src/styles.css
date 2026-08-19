@@ -49,12 +49,16 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .feed-search input { min-width: 0; height: 38px; border: 1px solid #cfd6da; border-radius: 5px; padding: 0 11px; color: #24343d; background: white; }
 .feed-search .icon-button { border: 1px solid #cfd6da; background: white; }
 .feed-tools { min-height: 42px; display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
-.feed-segments { display: flex; }
+.feed-segments { display: flex; flex-wrap: wrap; gap: 10px; }
 .segmented { display: inline-grid; grid-template-columns: repeat(3, 76px); border: 1px solid #cfd6da; border-radius: 6px; overflow: hidden; background: white; }
 .segmented button { border: 0; border-right: 1px solid var(--border); height: 36px; background: transparent; color: #5d6972; cursor: pointer; font-size: 13px; }
 .segmented button:last-child { border-right: 0; }
 .segmented button[aria-pressed="true"] { background: #263b43; color: white; }
 .feed-selects { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px 14px; }
+.feed-bulk-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -4px 0 16px; padding: 9px 11px; border: 1px solid #dfe5e8; background: #f8fafb; }
+.bulk-select-all, .discovery-select { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+.bulk-select-all input, .discovery-select input { width: 16px; height: 16px; accent-color: var(--accent); }
+.discovery-select { flex: 0 0 auto; margin-right: 2px; }
 .filter-control { display: grid; grid-template-columns: auto minmax(130px, 190px); gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
 .filter-control select { width: 100%; height: 36px; border: 1px solid #cfd6da; border-radius: 5px; background: white; padding: 0 28px 0 9px; color: #33434d; }
 .source-filter { grid-template-columns: auto minmax(150px, 210px); }
@@ -74,6 +78,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .topic-refresh-result--warning { border-left-color: #a46b1d; background: #f8f1e4; color: #76501d; }
 .topic-refresh-result--error { border-left-color: #b74a50; background: #f8e9ea; color: #7f3439; }
 .feed-groups { display: grid; gap: 28px; }
+.feed-pagination { display: flex; justify-content: center; padding-top: 20px; }
+.feed-pagination .button { display: inline-flex; align-items: center; gap: 7px; }
+.feed-limit-note { margin: 20px 0 0; color: var(--muted); font-size: 12px; text-align: center; }
 .feed-time-group { min-width: 0; }
 .feed-time-group > h2 { margin: 0 0 9px; color: #53626b; font-size: 13px; line-height: 1.4; font-weight: 700; }
 .discovery-list { display: grid; gap: 10px; }
@@ -320,6 +327,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .feed-tools { align-items: stretch; flex-direction: column; }
   .feed-segments { display: grid; }
   .segmented { width: 100%; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .feed-bulk-actions { align-items: stretch; flex-direction: column; }
+  .feed-bulk-actions .button { width: 100%; }
   .feed-selects { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .filter-control, .source-filter { min-width: 0; grid-template-columns: 1fr; gap: 5px; }
   .discovery-card { padding: 15px; }

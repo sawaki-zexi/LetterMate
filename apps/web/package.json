@@ -7,7 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "preview:e2e": "vite preview --host 127.0.0.1 --port 5410"
+    "preview:e2e": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {
     "@lettermate/contracts": "*"

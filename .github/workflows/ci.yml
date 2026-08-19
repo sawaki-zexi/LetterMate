@@ -31,8 +31,42 @@ jobs:
       - run: npm run evaluate:quality
       - run: npm run build
 
+  database-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lettermate
+          POSTGRES_PASSWORD: lettermate
+          POSTGRES_DB: lettermate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lettermate -d lettermate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://lettermate:lettermate@localhost:5432/lettermate?schema=public
+      SHADOW_DATABASE_URL: postgresql://lettermate:lettermate@localhost:5432/lettermate_shadow?schema=public
+      RUN_DATABASE_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run db:generate
+      - run: docker exec ${{ job.services.postgres.id }} createdb -U lettermate lettermate_shadow
+      - run: npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url "$SHADOW_DATABASE_URL" --exit-code
+      - run: npm run db:deploy
+      - run: npm test -- apps/api/src/feed-search.integration.test.ts apps/api/src/topic-dispatch-outbox.integration.test.ts
+
   e2e:
-    needs: verify
+    needs: [verify, database-integration]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

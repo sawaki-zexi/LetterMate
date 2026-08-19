@@ -33,7 +33,7 @@ const relation = (modelName: string, fieldName: string) => {
 
 const uniqueConstraints = (modelName: string) => {
   return [
-    ...[...modelSource(modelName).matchAll(/@@unique\(\[([^\]]+)\]\)/g)]
+    ...[...modelSource(modelName).matchAll(/@@unique\(\[([^\]]+)\](?:, [^)]*)?\)/g)]
       .map((match) => match[1]!.split(', ').map((field) => field.trim())),
     ...fieldNames(modelName).filter((fieldName) => fieldLine(modelName, fieldName).includes('@unique'))
       .map((fieldName) => [fieldName]),
@@ -379,6 +379,25 @@ describe('multi-source Prisma schema', () => {
     );
   });
 
+  it('stores versioned user-owned reading-list states', () => {
+    expect(schema).toContain('enum SavedContentState {\n  saved\n  archived\n}');
+    expect(fieldNames('SavedContent')).toEqual(expect.arrayContaining([
+      'id', 'userId', 'contentKey', 'state', 'savedAt', 'removedAt', 'user',
+    ]));
+    expect(relation('SavedContent', 'user')).toMatchObject({
+      relationFromFields: ['userId'],
+      relationOnDelete: 'Cascade',
+    });
+    expect(modelSource('SavedContent')).toContain('@@index([userId, state, removedAt, savedAt])');
+    const migrationPath = join(
+      process.cwd(), 'prisma', 'migrations', '20260818_saved_content_archive', 'migration.sql',
+    );
+    const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
+    expect(migration).toContain('CREATE TYPE "SavedContentState" AS ENUM');
+    expect(migration).toContain('CREATE UNIQUE INDEX "SavedContent_one_active_state_per_content_idx"');
+    expect(migration).toContain('WHERE "removedAt" IS NULL');
+  });
+
   it('persists the inferred keyword profile and snapshots it for each run', () => {
     expect(fieldLine('Topic', 'keywordProfile')).toContain('KeywordProfileKind');
     expect(fieldLine('Topic', 'keywordProfile')).toContain('@default(unknown)');
@@ -464,13 +483,15 @@ describe('multi-source Prisma schema', () => {
     });
 
     const migrationPath = join(
-      process.cwd(), 'prisma', 'migrations', '20260808_interest_adjacency', 'migration.sql',
+      process.cwd(), 'prisma', 'migrations', '20260816_interest_adjacency_repair', 'migration.sql',
     );
     const migration = existsSync(migrationPath) ? readFileSync(migrationPath, 'utf8') : '';
-    expect(migration).toContain('CREATE TABLE "InterestTagAdjacency"');
+    expect(migration).toContain('CREATE TABLE IF NOT EXISTS "InterestTagAdjacency"');
     expect(migration).toContain("'qualified-content-cooccurrence-v1'");
     expect(migration).toContain('left_content."confidence" >= 0.75');
     expect(migration).toContain('right_tag."kind" <> \'content_type\'');
+    expect(migration).toContain('FOREIGN KEY ("leftTagId") REFERENCES "InterestTag"("id")');
+    expect(migration).toContain('FOREIGN KEY ("rightTagId") REFERENCES "InterestTag"("id")');
   });
 
   it('stores digest preferences, run boundaries, and frozen item snapshots', () => {

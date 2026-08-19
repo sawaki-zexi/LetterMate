@@ -31,12 +31,28 @@ docker compose -f infra/compose.production.example.yaml run --rm api node --impo
 1. 使用秘密存储提供 `SESSION_SECRET`、`CSRF_SECRET`、`EMAIL_UNSUBSCRIBE_SECRET`、数据库、Redis、AI、连接器和邮件提供商凭据；不要写入镜像或仓库。生产邮件推荐 `EMAIL_PROVIDER=resend`，并必须提供 `RESEND_WEBHOOK_SECRET`；SMTP 仅作为兼容路径。API 与 Worker 必须使用同一个退订密钥。
 2. 设置 `NODE_ENV=production`、`ALLOW_DEV_IDENTITY=false`，并使用 HTTPS `WEB_ORIGIN`。生产配置不满足这三项时必须启动失败。
 3. 运行 `docker compose -f infra/compose.production.example.yaml --profile monitoring config --quiet`，确认 Compose 有效且没有暴露 PostgreSQL/Redis 端口。
-4. 创建并校验数据库备份，再运行 `npm run db:deploy` 或一次性 `migrate` 服务。禁止自动执行迁移回滚。
+4. 创建并校验数据库备份，再运行 `npx prisma migrate status`。状态正常后运行 `npm run db:deploy` 或一次性 `migrate` 服务。禁止自动执行迁移回滚。
 5. 部署收件验证和退订快照迁移时，历史未验证偏好会被保守暂停，历史排队/运行中且没有冻结地址或退订 ID 的任务会标记失败；用户验证地址后需显式重新启用。迁移不会改写已成功或已跳过的历史运行。
-5. 运行配置模式和 live 模式 `ops:doctor`；数据库与 Redis 必须为 `ok`。
-6. 启动 API/Worker/Web，确认 `/api/v1/health` 为 200，`/api/v1/health/ready` 为 200。
-7. 对已配置供应商运行对应的显式 live smoke；Resend 还需把 Webhook 配置为公开 HTTPS `POST /api/v1/email-webhooks/resend`，确认 Svix 签名测试事件返回 200。未配置供应商不阻塞其他能力。
-8. 检查 `api.started`、`worker.started`、队列快照和首次调度日志，再开放流量。
+6. 运行配置模式和 live 模式 `ops:doctor`；数据库与 Redis 必须为 `ok`。
+7. 启动 API/Worker/Web，确认 `/api/v1/health` 为 200，`/api/v1/health/ready` 为 200。
+8. 对已配置供应商运行对应的显式 live smoke；Resend 还需把 Webhook 配置为公开 HTTPS `POST /api/v1/email-webhooks/resend`，确认 Svix 签名测试事件返回 200。未配置供应商不阻塞其他能力。
+9. 检查 `api.started`、`worker.started`、队列快照和首次调度日志，再开放流量。
+
+### Topic dispatch outbox
+
+API 启动时会启动 Topic dispatch relay。它每秒扫描未确认的 `TopicDispatchOutbox`，使用数据库 lease 领取记录，并将记录 ID 作为 BullMQ 稳定 job ID。Redis 不可用时，Topic 仍保持 `queued`，记录按有限指数退避重试；确认后才标记 `dispatchedAt`。删除 Topic 会取消仍未投递的记录，暂停 Topic 在领取查询中被排除，恢复后可继续领取有效记录。
+
+排障时先检查 API 结构化日志中的安全错误码 `TOPIC_QUEUE_UNAVAILABLE`、队列快照和数据库中的未确认记录数量；不要手工把 Topic 改成 `failed` 来绕过 relay。确认 Redis 恢复后可等待下一轮轮询，或重启 API 触发一次启动扫描。若需要清理已删除 Topic 的历史记录，应使用受控 SQL/迁移并保留审计，不直接删除仍在 lease 中的记录。
+
+### 迁移历史完整性
+
+`20260808_interest_adjacency` 已被更正为 no-op，关系表和回填移至
+`20260816_interest_adjacency_repair`，以保证空数据库能按提交顺序部署。每个
+目标环境在部署前必须运行 `npx prisma migrate status`。若报告该历史迁移的
+checksum 不匹配，立即停止部署：确认该环境的 `_prisma_migrations` 记录、备份
+和实际 `InterestTagAdjacency` 结构，再由数据库负责人评审并执行一次受控的
+migration-resolve/前向修复。不得删除 `_prisma_migrations` 记录、修改 checksum，
+或把修复迁移标记为已执行来绕过检查。
 
 ### 每日备份与恢复演练
 

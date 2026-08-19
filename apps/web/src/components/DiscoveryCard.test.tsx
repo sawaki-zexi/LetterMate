@@ -145,4 +145,28 @@ describe('DiscoveryCard', () => {
     />);
     expect(screen.getByRole('status')).toHaveTextContent('已减少此条及相似内容的推荐');
   });
+
+  it('supports save, archive, restore, and remove reading-list actions', () => {
+    const onReadingState = vi.fn();
+    const { rerender } = render(<DiscoveryCard item={topicItem} onReadingState={onReadingState} />);
+
+    const save = screen.getByRole('button', { name: '保存到稍后读' });
+    expect(save).toHaveAttribute('aria-pressed', 'false');
+    fireEvent.click(save);
+    expect(onReadingState).toHaveBeenCalledWith('saved');
+
+    rerender(<DiscoveryCard item={{ ...topicItem, readingState: 'saved' }} onReadingState={onReadingState} />);
+    const remove = screen.getByRole('button', { name: '取消稍后读' });
+    expect(remove).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(remove);
+    expect(onReadingState).toHaveBeenLastCalledWith(null);
+    fireEvent.click(screen.getByRole('button', { name: '归档' }));
+    expect(onReadingState).toHaveBeenLastCalledWith('archived');
+
+    rerender(<DiscoveryCard item={{ ...topicItem, readingState: 'archived' }} onReadingState={onReadingState} />);
+    fireEvent.click(screen.getByRole('button', { name: '恢复到稍后读' }));
+    expect(onReadingState).toHaveBeenLastCalledWith('saved');
+    fireEvent.click(screen.getByRole('button', { name: '从阅读列表移除' }));
+    expect(onReadingState).toHaveBeenLastCalledWith(null);
+  });
 });

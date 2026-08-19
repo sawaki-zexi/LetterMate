@@ -78,14 +78,15 @@ describe('web API client', () => {
     expect(new Headers(clearedInit?.headers).get('x-csrf-token')).toBeNull();
   });
 
-  it('validates and sends all Feed filters with a 30d default, then parses FeedItem', async () => {
-    const fetchMock = vi.fn(async () => Response.json([feedItem]));
+  it('validates and sends all Feed filters with defaults, then parses FeedPage', async () => {
+    const page = { items: [feedItem], nextCursor: null, truncated: false };
+    const fetchMock = vi.fn(async () => Response.json(page));
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(api.feed({ origin: 'topic', kind: 'hot', topicId: 'topic/a' }))
-      .resolves.toEqual([feedItem]);
+      .resolves.toEqual(page);
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/feed?topicId=topic%2Fa&kind=hot&range=30d&origin=topic',
+      '/api/v1/feed?topicId=topic%2Fa&kind=hot&range=30d&origin=topic&limit=30',
       expect.any(Object),
     );
     expect(() => api.feed({ range: 'recent' as FeedRange })).toThrow();
@@ -103,7 +104,9 @@ describe('web API client', () => {
   });
 
   it('trims and serializes a submitted persisted Feed search query', async () => {
-    const fetchMock = vi.fn(async () => Response.json([feedItem]));
+    const fetchMock = vi.fn(async () => Response.json({
+      items: [feedItem], nextCursor: null, truncated: false,
+    }));
     vi.stubGlobal('fetch', fetchMock);
 
     await api.feed({
@@ -115,14 +118,16 @@ describe('web API client', () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/feed?topicId=topic%2Fa&kind=quality&range=all&origin=topic&q=%E6%99%BA%E8%83%BD%E4%BD%93%E5%B7%A5%E7%A8%8B',
+      '/api/v1/feed?topicId=topic%2Fa&kind=quality&range=all&origin=topic&q=%E6%99%BA%E8%83%BD%E4%BD%93%E5%B7%A5%E7%A8%8B&limit=30',
       expect.any(Object),
     );
   });
 
   it('rejects legacy item shapes without an origin', async () => {
     const { origin: _origin, ...legacyItem } = feedItem;
-    vi.stubGlobal('fetch', vi.fn(async () => Response.json([legacyItem])));
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      items: [legacyItem], nextCursor: null, truncated: false,
+    })));
 
     await expect(api.feed()).rejects.toThrow();
   });
@@ -144,6 +149,25 @@ describe('web API client', () => {
     );
   });
 
+  it('sends the saved Feed filter and persists reading-list state', async () => {
+    const responses = [
+      Response.json({ items: [feedItem], nextCursor: null, truncated: false }),
+      Response.json({ contentKey: feedItem.contentKey, state: 'saved' }),
+    ];
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => responses.shift()!);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.feed({ reading: 'saved' })).resolves.toEqual({
+      items: [feedItem], nextCursor: null, truncated: false,
+    });
+    await expect(api.setSavedContent(feedItem.contentKey, { state: 'saved' })).resolves.toEqual({
+      contentKey: feedItem.contentKey,
+      state: 'saved',
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/feed?range=30d&origin=all&reading=saved&limit=30');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(`/api/v1/saved-items/${encodeURIComponent(feedItem.contentKey)}`);
+  });
+
   it('writes validated feedback against the encoded stable content key', async () => {
     const fetchMock = vi.fn(async () => Response.json({
       contentKey: feedItem.contentKey,
@@ -160,6 +184,33 @@ describe('web API client', () => {
       expect.objectContaining({ method: 'PUT', body: JSON.stringify({ value: 'interested' }) }),
     );
     expect(() => api.setFeedback(feedItem.contentKey, { value: 'like' as never })).toThrow();
+  });
+
+  it('archives a validated batch of reading-list items', async () => {
+    const fetchMock = vi.fn(async () => Response.json({ items: [
+      { contentKey: 'https://example.com/a', state: 'archived' },
+      { contentKey: 'https://example.com/b', state: 'archived' },
+    ] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.archiveSavedContentBatch([
+      'https://example.com/a', 'https://example.com/b',
+    ])).resolves.toEqual({ items: [
+      { contentKey: 'https://example.com/a', state: 'archived' },
+      { contentKey: 'https://example.com/b', state: 'archived' },
+    ] });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/saved-items',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({
+          contentKeys: ['https://example.com/a', 'https://example.com/b'], state: 'archived',
+        }),
+      }),
+    );
+    expect(() => api.archiveSavedContentBatch([
+      'https://example.com/a', 'https://example.com/a',
+    ])).toThrow();
   });
 
   it('reads and controls interest memory with validated payloads', async () => {

@@ -923,7 +923,7 @@ describe('AI discovery API', () => {
       .get('/api/v1/feed?range=all')
       .set('x-user-id', 'user-a')
       .expect(200)
-      .expect(({ body }) => expect(body[0]).toMatchObject({ topicKeywordActive: true }));
+      .expect(({ body }) => expect(body.items[0]).toMatchObject({ topicKeywordActive: true }));
 
     await request(app.getHttpServer())
       .post(`/api/v1/topics/${own.id}/resume`)
@@ -954,7 +954,7 @@ describe('AI discovery API', () => {
     expect(queue.jobs).toContainEqual({ topicId: topic.id, userId: 'user-a', trigger: 'manual' });
   });
 
-  it('compensates a failed update enqueue so the topic can be refreshed again', async () => {
+  it('keeps a durable Topic dispatch pending when Redis is temporarily unavailable', async () => {
     const failingQueue = new FailOnceTopicQueue();
     const localApp = await createApiApp({
       store, queue: failingQueue, trendQueue, creatorQueue, aiConfigured: true, discoverySources,
@@ -964,20 +964,15 @@ describe('AI discovery API', () => {
     await request(localApp.getHttpServer()).patch(`/api/v1/topics/${topic.id}`)
       .set('x-user-id', 'user-a')
       .send({ keyword: 'gpt-5.8', expandedTerms: [] })
-      .expect(500);
+      .expect(200);
     await request(localApp.getHttpServer()).get('/api/v1/topics')
       .set('x-user-id', 'user-a')
       .expect(200)
       .expect(({ body }) => expect(body[0]).toMatchObject({
-        runStatus: 'failed',
-        lastError: {
-          code: 'TOPIC_QUEUE_UNAVAILABLE',
-          message: '发现任务暂时无法入队，请稍后重试',
-        },
+        runStatus: 'queued',
+        lastError: null,
       }));
-    await request(localApp.getHttpServer()).post(`/api/v1/topics/${topic.id}/refresh`)
-      .set('x-user-id', 'user-a')
-      .expect(202);
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
     expect(failingQueue.jobs).toContainEqual({
       topicId: topic.id, userId: 'user-a', trigger: 'manual',
     });
@@ -1007,7 +1002,7 @@ describe('AI discovery API', () => {
       .get('/api/v1/feed?range=all')
       .set('x-user-id', 'user-a')
       .expect(200);
-    expect(active.body[0]).toMatchObject({
+    expect(active.body.items[0]).toMatchObject({
       origin: 'topic',
       topicKeyword: 'AI Agent',
       topicKeywordActive: true,
@@ -1022,7 +1017,7 @@ describe('AI discovery API', () => {
       .get('/api/v1/feed?range=all')
       .set('x-user-id', 'user-a')
       .expect(200);
-    expect(renamed.body[0]).toMatchObject({
+    expect(renamed.body.items[0]).toMatchObject({
       topicKeyword: 'AI Agent',
       topicKeywordActive: false,
     });
@@ -1035,7 +1030,7 @@ describe('AI discovery API', () => {
       .get('/api/v1/feed?range=all')
       .set('x-user-id', 'user-a')
       .expect(200);
-    expect(deleted.body[0]).toMatchObject({
+    expect(deleted.body.items[0]).toMatchObject({
       topicKeyword: 'AI Agent',
       topicKeywordActive: false,
     });
@@ -1089,8 +1084,49 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(200);
 
-    expect(response.body).toHaveLength(1);
-    expect(response.body[0].kind).toBe('hot');
+    expect(response.body.items).toHaveLength(1);
+    expect(response.body.items[0].kind).toBe('hot');
+  });
+
+  it('returns stable Feed pages and rejects malformed or cross-filter cursors', async () => {
+    const topic = store.seedTopic('user-a', 'Pagination');
+    const newer = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-07-27T11:00:00.000Z',
+    });
+    const older = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-07-27T10:00:00.000Z',
+    });
+
+    const first = await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all&limit=1')
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(first.body).toMatchObject({
+      items: [expect.objectContaining({ id: newer.id })],
+      truncated: false,
+    });
+    expect(first.body.nextCursor).toEqual(expect.any(String));
+
+    const second = await request(app.getHttpServer())
+      .get(`/api/v1/feed?range=all&limit=1&cursor=${first.body.nextCursor}`)
+      .set('x-user-id', 'user-a')
+      .expect(200);
+    expect(second.body).toMatchObject({
+      items: [expect.objectContaining({ id: older.id })],
+      nextCursor: null,
+      truncated: false,
+    });
+
+    await request(app.getHttpServer())
+      .get('/api/v1/feed?range=all&cursor=not-a-valid-cursor')
+      .set('x-user-id', 'user-a')
+      .expect(400)
+      .expect(({ body }) => expect(body.code).toBe('INVALID_CURSOR'));
+    await request(app.getHttpServer())
+      .get(`/api/v1/feed?range=all&limit=1&kind=hot&cursor=${first.body.nextCursor}`)
+      .set('x-user-id', 'user-a')
+      .expect(400)
+      .expect(({ body }) => expect(body.code).toBe('INVALID_CURSOR'));
   });
 
   it('searches persisted owner articles with existing Feed filters', async () => {
@@ -1130,7 +1166,7 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(200);
 
-    expect(response.body.map((item: { title: string }) => item.title))
+    expect(response.body.items.map((item: { title: string }) => item.title))
       .toEqual(['智能体工程实践']);
   });
 
@@ -1167,9 +1203,9 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(200);
 
-    expect(recent.body).toHaveLength(1);
-    expect(recent.body[0].kind).toBe('hot');
-    expect(all.body).toHaveLength(3);
+    expect(recent.body.items).toHaveLength(1);
+    expect(recent.body.items[0].kind).toBe('hot');
+    expect(all.body.items).toHaveLength(3);
   });
 
   it('applies a 72-hour Feed window from the injected clock', async () => {
@@ -1186,7 +1222,7 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(200);
 
-    expect(response.body.map((item: { id: string }) => item.id)).toEqual([boundary.id]);
+    expect(response.body.items.map((item: { id: string }) => item.id)).toEqual([boundary.id]);
   });
 
   it('filters the unified Feed by Topic or trend origin', async () => {
@@ -1207,8 +1243,8 @@ describe('AI discovery API', () => {
       .set('x-user-id', 'user-a')
       .expect(200);
 
-    expect(trend.body.map((item: { id: string }) => item.id)).toEqual([radarItem.id]);
-    expect(topicOnly.body.map((item: { id: string }) => item.id)).toEqual([topicItem.id]);
+    expect(trend.body.items.map((item: { id: string }) => item.id)).toEqual([radarItem.id]);
+    expect(topicOnly.body.items.map((item: { id: string }) => item.id)).toEqual([topicItem.id]);
   });
 
   it('sets, switches, clears, and safely scopes persisted Feed feedback', async () => {
@@ -1227,7 +1263,7 @@ describe('AI discovery API', () => {
       .send({ value: 'interested' }).expect(200);
     await request(app.getHttpServer()).get('/api/v1/feed?range=all')
       .set('x-user-id', 'user-a').expect(200)
-      .expect(({ body }) => expect(body[0].feedback).toBe('interested'));
+      .expect(({ body }) => expect(body.items[0].feedback).toBe('interested'));
 
     await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
       .send({ value: 'less' }).expect(200)
@@ -1250,6 +1286,93 @@ describe('AI discovery API', () => {
       .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
   });
 
+  it('saves only owned Feed items and filters the current user reading list', async () => {
+    const own = store.seedRadarItem('user-a', 'quality');
+    const other = store.seedRadarItem('user-b', 'quality');
+    const path = `/api/v1/saved-items/${encodeURIComponent(own.contentKey)}`;
+
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ state: 'saved' }).expect(200)
+      .expect({ contentKey: own.contentKey, state: 'saved' });
+    await request(app.getHttpServer()).get('/api/v1/feed?range=all&reading=saved')
+      .set('x-user-id', 'user-a').expect(200)
+      .expect(({ body }) => expect(body.items).toEqual([
+        expect.objectContaining({ contentKey: own.contentKey, readingState: 'saved' }),
+      ]));
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ state: 'archived' }).expect(200)
+      .expect({ contentKey: own.contentKey, state: 'archived' });
+    await request(app.getHttpServer()).get('/api/v1/feed?range=all&reading=archived')
+      .set('x-user-id', 'user-a').expect(200)
+      .expect(({ body }) => expect(body.items).toEqual([
+        expect.objectContaining({ contentKey: own.contentKey, readingState: 'archived' }),
+      ]));
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ state: 'saved' }).expect(200)
+      .expect({ contentKey: own.contentKey, state: 'saved' });
+    await request(app.getHttpServer())
+      .put(`/api/v1/saved-items/${encodeURIComponent(other.contentKey)}`)
+      .set('x-user-id', 'user-a').send({ state: 'saved' }).expect(404);
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ state: null }).expect(200)
+      .expect({ contentKey: own.contentKey, state: null });
+    await request(app.getHttpServer()).get('/api/v1/feed?range=all&reading=saved')
+      .set('x-user-id', 'user-a').expect(200)
+      .expect(({ body }) => expect(body.items).toEqual([]));
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ state: 'unknown' }).expect(400)
+      .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+    await request(app.getHttpServer()).get('/api/v1/feed?range=all&reading=unknown')
+      .set('x-user-id', 'user-a').expect(400)
+      .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+  });
+
+  it('archives selected owned reading items in one transaction', async () => {
+    const first = store.seedRadarItem('user-a', 'quality');
+    const second = store.seedRadarItem('user-a', 'quality');
+    const foreign = store.seedRadarItem('user-b', 'quality');
+    const path = '/api/v1/saved-items';
+    for (const contentKey of [first.contentKey, second.contentKey]) {
+      await request(app.getHttpServer()).put(`/api/v1/saved-items/${encodeURIComponent(contentKey)}`)
+        .set('x-user-id', 'user-a').send({ state: 'saved' }).expect(200);
+    }
+
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ contentKeys: [first.contentKey, second.contentKey], state: 'archived' })
+      .expect(200)
+      .expect({ items: [
+        { contentKey: first.contentKey, state: 'archived' },
+        { contentKey: second.contentKey, state: 'archived' },
+      ] });
+    await request(app.getHttpServer()).get('/api/v1/feed?range=all&reading=archived')
+      .set('x-user-id', 'user-a').expect(200)
+      .expect(({ body }) => expect(body.items.map((item: { contentKey: string }) => item.contentKey))
+        .toEqual(expect.arrayContaining([first.contentKey, second.contentKey])));
+
+    await request(app.getHttpServer())
+      .put(`/api/v1/saved-items/${encodeURIComponent(first.contentKey)}`)
+      .set('x-user-id', 'user-a').send({ state: 'saved' }).expect(200);
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ contentKeys: [first.contentKey, foreign.contentKey], state: 'archived' })
+      .expect(404);
+    await request(app.getHttpServer()).get('/api/v1/feed?range=all&reading=saved')
+      .set('x-user-id', 'user-a').expect(200)
+      .expect(({ body }) => expect(body.items).toEqual([
+        expect.objectContaining({ contentKey: first.contentKey, readingState: 'saved' }),
+      ]));
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({ contentKeys: [first.contentKey, first.contentKey], state: 'archived' })
+      .expect(400)
+      .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+    await request(app.getHttpServer()).put(path).set('x-user-id', 'user-a')
+      .send({
+        contentKeys: [first.contentKey, `${first.contentKey}?utm_source=batch-test`],
+        state: 'archived',
+      })
+      .expect(400)
+      .expect(({ body }) => expect(body.code).toBe('VALIDATION_ERROR'));
+  });
+
   it('records only owned Feed decision impressions and deduplicates the minute bucket', async () => {
     const own = store.seedRadarItem('user-a', 'quality');
     const other = store.seedRadarItem('user-b', 'quality');
@@ -1257,7 +1380,7 @@ describe('AI discovery API', () => {
       .get('/api/v1/feed?range=all')
       .set('x-user-id', 'user-a')
       .expect(200);
-    const decisionId = feed.body.find((item: { contentKey: string }) => (
+    const decisionId = feed.body.items.find((item: { contentKey: string }) => (
       item.contentKey === own.contentKey
     )).recommendation.decisionId;
 

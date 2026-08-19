@@ -2,9 +2,11 @@ import {
   creatorFeedItemSchema,
   creatorDegradedSourceSchema,
   contentFeedbackSchema,
+  savedContentSchema,
   creatorItemSchema,
   creatorSchema,
   discoveryItemSchema,
+  defaultFeedPageLimit,
   topicFeedItemSchema,
   trendFeedItemSchema,
   trendStatusSchema,
@@ -15,15 +17,18 @@ import {
   type CreatorFeedItem,
   type CreatorItem,
   type ContentFeedback,
+  type SavedContent,
   type DiscoveryCandidate,
   type DiscoveryItem,
   type DiscoveryKind,
+  type FeedPage,
   type FeedItem,
   type FeedImpressionInput,
   type FeedImpressionReceipt,
   type FeedRecommendation,
   type FeedbackValue,
   type FeedOrigin,
+  type ReadingState,
   type InterestEvent,
   type RunSummary,
   type RunStatus,
@@ -60,6 +65,17 @@ import {
   mapInterestEvent,
 } from './interest-events.js';
 import type { PersonalizationMemory, PersonalizedSlate } from './personalization-memory.js';
+import {
+  createFeedCursor,
+  resolveFeedPagination,
+  type FeedPaginationContext,
+} from './feed-pagination.js';
+import {
+  MemoryTopicDispatchOutbox,
+  NoopTopicDispatchOutbox,
+  PrismaTopicDispatchOutbox,
+  type TopicDispatchOutbox,
+} from './topic-dispatch-outbox.js';
 
 export class TopicAlreadyExistsError extends Error {
   constructor() {
@@ -75,7 +91,15 @@ export class CreatorAlreadyExistsError extends Error {
   }
 }
 
+class SavedContentBatchTargetNotFoundError extends Error {
+  constructor() {
+    super('Saved content batch target not found');
+    this.name = 'SavedContentBatchTargetNotFoundError';
+  }
+}
+
 export interface TopicStore {
+  readonly topicDispatchOutbox: TopicDispatchOutbox;
   createCreator(userId: string, input: CreatorCreateInput): Promise<Creator>;
   createCreators(userId: string, inputs: CreatorCreateInput[]): Promise<Creator[]>;
   listCreators(userId: string): Promise<Creator[]>;
@@ -97,7 +121,7 @@ export interface TopicStore {
   listFeed(
     userId: string,
     filter: FeedStoreFilter,
-  ): Promise<FeedItem[]>;
+  ): Promise<FeedPage>;
   recordFeedImpressions(
     userId: string,
     input: FeedImpressionInput,
@@ -107,6 +131,16 @@ export interface TopicStore {
     contentKey: string,
     value: FeedbackValue | null,
   ): Promise<ContentFeedback | null>;
+  setSavedContent(
+    userId: string,
+    contentKey: string,
+    state: ReadingState | null,
+  ): Promise<SavedContent | null>;
+  setSavedContentBatch(
+    userId: string,
+    contentKeys: string[],
+    state: 'archived',
+  ): Promise<SavedContent[] | null>;
   listInterestEvents(userId: string): Promise<InterestEvent[]>;
   findItem(userId: string, id: string): Promise<FeedItem | null>;
   getTrendStatus(userId: string, intervalHours: number, now?: Date): Promise<TrendStatus>;
@@ -153,6 +187,11 @@ export interface FeedStoreFilter {
   since: Date | null;
   origin: FeedOrigin;
   query?: string;
+  reading?: ReadingState;
+  limit?: number;
+  cursor?: string;
+  windowKey?: string;
+  snapshotAt?: Date;
 }
 
 export interface QueueRefreshResult {
@@ -298,6 +337,9 @@ function mapTrendStatus(monitor: TrendMonitorWithRuns): TrendStatus {
 
 const effectiveTimestamp = (item: FeedItem): string => item.publishedAt ?? item.discoveredAt;
 
+const FEED_SOURCE_CANDIDATE_LIMIT = 300;
+const LOCAL_FEED_CURSOR_SECRET = 'lettermate-local-feed-cursor-secret-v1';
+
 function sortFeed(items: FeedItem[]): FeedItem[] {
   return items.sort((left, right) => {
     const byTime = effectiveTimestamp(right).localeCompare(effectiveTimestamp(left));
@@ -305,20 +347,67 @@ function sortFeed(items: FeedItem[]): FeedItem[] {
   });
 }
 
+function paginationContext(
+  userId: string,
+  filter: FeedStoreFilter,
+  now: Date,
+  cursorSecret: string,
+): FeedPaginationContext {
+  const limit = filter.limit ?? defaultFeedPageLimit;
+  return resolveFeedPagination({
+    userId,
+    filter: {
+      origin: filter.origin,
+      topicId: filter.topicId ?? null,
+      kind: filter.kind ?? null,
+      query: filter.query ?? null,
+      reading: filter.reading ?? null,
+      windowKey: filter.windowKey ?? filter.since?.toISOString() ?? 'all',
+      limit,
+    },
+    since: filter.since,
+    now,
+    secret: cursorSecret,
+    ...(filter.cursor ? { cursor: filter.cursor } : {}),
+  });
+}
+
+function feedPage(
+  items: FeedItem[],
+  pagination: FeedPaginationContext,
+  truncated: boolean,
+  cursorSecret: string,
+): FeedPage {
+  const end = pagination.offset + pagination.limit;
+  return {
+    items: items.slice(pagination.offset, end),
+    nextCursor: end < items.length ? createFeedCursor(pagination, end, cursorSecret) : null,
+    truncated,
+  };
+}
+
 export class PrismaTopicStore implements TopicStore {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly personalization?: PersonalizationMemory,
+    private readonly cursorSecret = LOCAL_FEED_CURSOR_SECRET,
+    public readonly topicDispatchOutbox: TopicDispatchOutbox = 'topicDispatchOutbox' in prisma
+      ? new PrismaTopicDispatchOutbox(prisma)
+      : new NoopTopicDispatchOutbox(),
   ) {}
 
-  private async personalizeFeed(userId: string, items: FeedItem[]): Promise<FeedItem[]> {
+  private async personalizeFeed(
+    userId: string,
+    items: FeedItem[],
+    asOf: Date,
+  ): Promise<FeedItem[]> {
     if (!this.personalization || items.length === 0) return items;
     try {
       const selection = await this.personalization.select({
         userId,
         surface: 'feed',
         candidates: items,
-        asOf: new Date(),
+        asOf,
       });
       if (!selection.personalizationEnabled) return items;
       const itemByKey = new Map(items.map((item) => [item.contentKey, item]));
@@ -337,15 +426,44 @@ export class PrismaTopicStore implements TopicStore {
   private async attachFeedback(userId: string, items: FeedItem[]): Promise<FeedItem[]> {
     if (items.length === 0) return items;
     const contentKeys = [...new Set(items.map((item) => canonicalizeUrl(item.contentKey)))];
-    const rows = await this.prisma.contentFeedback.findMany({
-      where: { userId, contentKey: { in: contentKeys } },
-      select: { contentKey: true, value: true },
-    });
-    const feedbackByKey = new Map(rows.map((row) => [row.contentKey, row.value]));
+    const [feedbackRows, savedRows] = await Promise.all([
+      this.prisma.contentFeedback.findMany({
+        where: { userId, contentKey: { in: contentKeys } },
+        select: { contentKey: true, value: true },
+      }),
+      this.prisma.savedContent.findMany({
+        where: { userId, contentKey: { in: contentKeys }, removedAt: null },
+        select: { contentKey: true, state: true },
+      }),
+    ]);
+    const feedbackByKey = new Map(feedbackRows.map((row) => [row.contentKey, row.value]));
+    const readingStateByKey = new Map(savedRows.map((row) => [row.contentKey, row.state]));
     return items.map((item) => ({
       ...item,
       feedback: feedbackByKey.get(canonicalizeUrl(item.contentKey)) ?? null,
+      readingState: readingStateByKey.get(canonicalizeUrl(item.contentKey)) ?? null,
     }));
+  }
+
+  private async savedContentKeys(userId: string, state: ReadingState, snapshotAt: Date): Promise<{
+    keys: string[];
+    truncated: boolean;
+  }> {
+    const rows = await this.prisma.savedContent.findMany({
+      where: {
+        userId,
+        state,
+        savedAt: { lte: snapshotAt },
+        OR: [{ removedAt: null }, { removedAt: { gt: snapshotAt } }],
+      },
+      select: { contentKey: true },
+      orderBy: [{ savedAt: 'desc' }, { contentKey: 'desc' }],
+      take: FEED_SOURCE_CANDIDATE_LIMIT + 1,
+    });
+    return {
+      keys: rows.slice(0, FEED_SOURCE_CANDIDATE_LIMIT).map((row) => row.contentKey),
+      truncated: rows.length > FEED_SOURCE_CANDIDATE_LIMIT,
+    };
   }
 
   async createTopic(
@@ -374,6 +492,11 @@ export class PrismaTopicStore implements TopicStore {
           },
           include: latestRunInclude,
         });
+        await this.topicDispatchOutbox.register({
+          topicId: topic.id,
+          userId,
+          trigger: 'initial',
+        }, transaction);
         await appendInterestEvent(transaction, {
           userId,
           eventType: 'topic_state',
@@ -635,9 +758,96 @@ export class PrismaTopicStore implements TopicStore {
     return topic ? mapTopic(topic) : null;
   }
 
+  private async queueRefreshInTransaction(
+    transaction: Prisma.TransactionClient,
+    userId: string,
+    id: string,
+  ): Promise<QueueRefreshResult | null> {
+    let topic = await transaction.topic.findFirst({
+      where: { id, userId, deletedAt: null }, include: latestRunInclude,
+    });
+    if (!topic) return null;
+    if (topic.pausedAt) return { topic: mapTopic(topic), shouldEnqueue: false };
+
+    if (topic.runStatus === 'running') {
+      const pending = await transaction.topic.updateMany({
+        where: { id, userId, deletedAt: null, runStatus: 'running', manualRefreshPending: false },
+        data: { manualRefreshPending: true, lastError: Prisma.DbNull },
+      });
+      topic = await transaction.topic.findFirst({
+        where: { id, userId, deletedAt: null }, include: latestRunInclude,
+      });
+      if (!topic) return null;
+      if (pending.count === 1 || topic.runStatus === 'running' || topic.runStatus === 'queued') {
+        return { topic: mapTopic(topic), shouldEnqueue: false };
+      }
+    }
+
+    if (topic.runStatus === 'queued') {
+      if (topic.queuedTrigger === 'initial' || topic.queuedTrigger === 'scheduled') {
+        await transaction.topic.updateMany({
+          where: { id, userId, deletedAt: null, runStatus: 'queued', manualRefreshPending: false },
+          data: { manualRefreshPending: true, lastError: Prisma.DbNull },
+        });
+        topic = await transaction.topic.findFirst({
+          where: { id, userId, deletedAt: null }, include: latestRunInclude,
+        });
+        if (!topic) return null;
+      }
+      return { topic: mapTopic(topic), shouldEnqueue: false };
+    }
+
+    const queued = await transaction.topic.updateMany({
+      where: { id, userId, deletedAt: null, runStatus: { in: ['succeeded', 'failed'] } },
+      data: { runStatus: 'queued', queuedTrigger: 'manual', lastError: Prisma.DbNull },
+    });
+    topic = await transaction.topic.findFirst({
+      where: { id, userId, deletedAt: null }, include: latestRunInclude,
+    });
+    if (!topic) return null;
+    if (queued.count === 1) {
+      await this.topicDispatchOutbox.register({ topicId: id, userId, trigger: 'manual' }, transaction);
+    }
+    return { topic: mapTopic(topic), shouldEnqueue: queued.count === 1 };
+  }
+
   async updateTopic(userId: string, id: string, input: TopicUpdate): Promise<QueueRefreshResult | null> {
     try {
-      const updated = await this.prisma.$transaction(async (transaction) => {
+      const topicModel = this.prisma.topic as unknown as { findFirst?: unknown };
+      if (typeof topicModel.findFirst !== 'function') {
+        const updated = await this.prisma.$transaction(async (transaction) => {
+          const result = await transaction.topic.updateMany({
+            where: { id, userId, deletedAt: null },
+            data: {
+              keyword: input.keyword,
+              normalizedKeyword: input.normalizedKeyword,
+              expandedTerms: [],
+              keywordProfile: 'unknown',
+              variantsInitialized: false,
+              nextRunAt: null,
+              productiveRunStreak: 0,
+              emptyRunStreak: 0,
+            },
+          });
+          if (result.count !== 1) return false;
+          await appendInterestEvent(transaction, {
+            userId,
+            eventType: 'topic_state',
+            sourceRef: id,
+            payload: {
+              schemaVersion: 1,
+              state: 'active',
+              topicId: id,
+              keyword: input.keyword,
+              normalizedKeyword: input.normalizedKeyword,
+            },
+            occurredAt: new Date(),
+          });
+          return true;
+        });
+        return updated ? this.queueRefresh(userId, id) : null;
+      }
+      return await this.prisma.$transaction(async (transaction) => {
         const result = await transaction.topic.updateMany({
           where: { id, userId, deletedAt: null },
           data: {
@@ -651,7 +861,7 @@ export class PrismaTopicStore implements TopicStore {
             emptyRunStreak: 0,
           },
         });
-        if (result.count !== 1) return false;
+        if (result.count !== 1) return null;
         await appendInterestEvent(transaction, {
           userId,
           eventType: 'topic_state',
@@ -665,10 +875,8 @@ export class PrismaTopicStore implements TopicStore {
           },
           occurredAt: new Date(),
         });
-        return true;
+        return this.queueRefreshInTransaction(transaction, userId, id);
       });
-      if (!updated) return null;
-      return this.queueRefresh(userId, id);
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         throw new TopicAlreadyExistsError();
@@ -713,11 +921,11 @@ export class PrismaTopicStore implements TopicStore {
   }
 
   async resumeTopic(userId: string, id: string): Promise<QueueRefreshResult | null> {
-    const resumed = await this.prisma.$transaction(async (transaction) => {
+    return this.prisma.$transaction(async (transaction) => {
       const current = await transaction.topic.findFirst({
         where: { id, userId, deletedAt: null },
       });
-      if (!current) return false;
+      if (!current) return null;
       if (current.pausedAt) {
         await transaction.topic.update({ where: { id }, data: { pausedAt: null } });
       }
@@ -734,9 +942,8 @@ export class PrismaTopicStore implements TopicStore {
         },
         occurredAt: new Date(),
       });
-      return true;
+      return this.queueRefreshInTransaction(transaction, userId, id);
     });
-    return resumed ? this.queueRefresh(userId, id) : null;
   }
 
   async deleteTopic(userId: string, id: string): Promise<boolean> {
@@ -760,6 +967,7 @@ export class PrismaTopicStore implements TopicStore {
         });
         if (inactive.count !== 1) return false;
       }
+      await this.topicDispatchOutbox.cancelTopic(id, transaction);
       await appendInterestEvent(transaction, {
         userId,
         eventType: 'topic_state',
@@ -789,72 +997,48 @@ export class PrismaTopicStore implements TopicStore {
   }
 
   async queueRefresh(userId: string, id: string): Promise<QueueRefreshResult | null> {
-    return this.prisma.$transaction(async (transaction) => {
-      let topic = await transaction.topic.findFirst({
-        where: { id, userId, deletedAt: null }, include: latestRunInclude,
-      });
-      if (!topic) return null;
-      if (topic.pausedAt) return { topic: mapTopic(topic), shouldEnqueue: false };
-
-      if (topic.runStatus === 'running') {
-        const pending = await transaction.topic.updateMany({
-          where: { id, userId, deletedAt: null, runStatus: 'running', manualRefreshPending: false },
-          data: { manualRefreshPending: true, lastError: Prisma.DbNull },
-        });
-        topic = await transaction.topic.findFirst({
-          where: { id, userId, deletedAt: null }, include: latestRunInclude,
-        });
-        if (!topic) return null;
-        if (pending.count === 1) {
-          return { topic: mapTopic(topic), shouldEnqueue: false };
-        }
-        if (topic.runStatus === 'running' || topic.runStatus === 'queued') {
-          return { topic: mapTopic(topic), shouldEnqueue: false };
-        }
-      }
-
-      if (topic.runStatus === 'queued') {
-        if (topic.queuedTrigger === 'initial' || topic.queuedTrigger === 'scheduled') {
-          await transaction.topic.updateMany({
-            where: { id, userId, deletedAt: null, runStatus: 'queued', manualRefreshPending: false },
-            data: { manualRefreshPending: true, lastError: Prisma.DbNull },
-          });
-          topic = await transaction.topic.findFirst({
-          where: { id, userId, deletedAt: null }, include: latestRunInclude,
-          });
-          if (!topic) return null;
-          return { topic: mapTopic(topic), shouldEnqueue: false };
-        }
-        return { topic: mapTopic(topic), shouldEnqueue: false };
-      }
-
-      const queued = await transaction.topic.updateMany({
-        where: { id, userId, deletedAt: null, runStatus: { in: ['succeeded', 'failed'] } },
-        data: { runStatus: 'queued', queuedTrigger: 'manual', lastError: Prisma.DbNull },
-      });
-      topic = await transaction.topic.findFirst({
-        where: { id, userId, deletedAt: null }, include: latestRunInclude,
-      });
-      if (!topic) return null;
-      return { topic: mapTopic(topic), shouldEnqueue: queued.count === 1 };
-    });
+    return this.prisma.$transaction((transaction) => this.queueRefreshInTransaction(
+      transaction, userId, id,
+    ));
   }
 
   async listFeed(
     userId: string,
     filter: FeedStoreFilter,
-  ): Promise<FeedItem[]> {
+  ): Promise<FeedPage> {
+    const pagination = paginationContext(
+      userId, filter, filter.snapshotAt ?? new Date(), this.cursorSecret,
+    );
+    const savedContent = filter.reading
+      ? await this.savedContentKeys(userId, filter.reading, pagination.snapshotAt)
+      : null;
+    if (filter.reading && savedContent!.keys.length === 0) {
+      return feedPage([], pagination, savedContent!.truncated, this.cursorSecret);
+    }
+    const savedWhere = savedContent
+      ? { canonicalPrimaryUrl: { in: savedContent.keys } }
+      : {};
     const includeTopics = filter.origin === 'all' || filter.origin === 'topic';
     const includeTrends = !filter.topicId && (filter.origin === 'all' || filter.origin === 'trend');
     const includeCreators = !filter.topicId && (filter.origin === 'all' || filter.origin === 'creator');
-    const timeWhere = filter.since ? {
-      OR: [
-        { publishedAt: { gte: filter.since } },
-        { publishedAt: null, discoveredAt: { gte: filter.since } },
-      ],
-    } : {};
+    const timeWhere = {
+      discoveredAt: { lte: pagination.snapshotAt },
+      ...(pagination.since ? {
+        OR: [
+          { publishedAt: { gte: pagination.since } },
+          { publishedAt: null, discoveredAt: { gte: pagination.since } },
+        ],
+      } : {}),
+    };
     if (filter.query) {
-      const searchFilter = { ...filter, query: filter.query };
+      const searchFilter = {
+        ...filter,
+        since: pagination.since,
+        snapshotAt: pagination.snapshotAt,
+        limit: FEED_SOURCE_CANDIDATE_LIMIT,
+        query: filter.query,
+        ...(savedContent ? { contentKeys: savedContent.keys } : {}),
+      };
       const topicRankPromise = !includeTopics
         ? Promise.resolve([] as RankedId[])
         : this.prisma.$queryRaw<RankedId[]>(buildTopicRankQuery(userId, searchFilter));
@@ -866,11 +1050,14 @@ export class PrismaTopicStore implements TopicStore {
             where: {
               userId,
               feedEligible: true,
+              ...savedWhere,
               ...(filter.kind ? { kind: filter.kind } : {}),
               ...timeWhere,
               creator: { cancelledAt: null },
             },
             include: { creator: { select: { displayName: true } } },
+            orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
+            take: FEED_SOURCE_CANDIDATE_LIMIT,
           })
         : Promise.resolve([]);
       const [topicRanks, radarRanks, creatorItems] = await Promise.all([
@@ -886,6 +1073,7 @@ export class PrismaTopicStore implements TopicStore {
           : this.prisma.discoveryItem.findMany({
               where: {
                 id: { in: topicRanks.map(({ id }) => id) },
+                ...savedWhere,
                 ...(filter.kind ? { kind: filter.kind } : {}),
                 ...timeWhere,
                 topic: {
@@ -893,6 +1081,7 @@ export class PrismaTopicStore implements TopicStore {
                   ...(filter.topicId ? { id: filter.topicId } : {}),
                 },
               },
+              include: { topic: { select: { deletedAt: true, keyword: true } } },
             }),
         radarRanks.length === 0
           ? Promise.resolve([] as PrismaRadarItem[])
@@ -900,12 +1089,13 @@ export class PrismaTopicStore implements TopicStore {
               where: {
                 id: { in: radarRanks.map(({ id }) => id) },
                 userId,
+                ...savedWhere,
                 ...(filter.kind ? { kind: filter.kind } : {}),
                 ...timeWhere,
               },
             }),
       ]);
-      return this.attachFeedback(userId, mergeFeedItems(sortRankedFeed([
+      const feed = await this.attachFeedback(userId, mergeFeedItems(sortRankedFeed([
         ...topicItems.map((item) => ({
           item: mapTopicFeedItem(item),
           relevance: topicRankById.get(item.id) ?? 0,
@@ -920,11 +1110,17 @@ export class PrismaTopicStore implements TopicStore {
           return relevance === null ? [] : [{ item: feedItem, relevance }];
         }),
       ])));
+      return feedPage(feed, pagination, [
+        topicRanks.length,
+        radarRanks.length,
+        creatorItems.length,
+      ].some((count) => count === FEED_SOURCE_CANDIDATE_LIMIT) || savedContent?.truncated === true, this.cursorSecret);
     }
     const topicPromise = !includeTopics
       ? Promise.resolve([] as PrismaDiscoveryItem[])
       : this.prisma.discoveryItem.findMany({
           where: {
+            ...savedWhere,
             ...(filter.kind ? { kind: filter.kind } : {}),
             ...timeWhere,
             topic: {
@@ -934,16 +1130,19 @@ export class PrismaTopicStore implements TopicStore {
           },
           include: { topic: { select: { deletedAt: true, keyword: true } } },
           orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
+          take: FEED_SOURCE_CANDIDATE_LIMIT,
         });
     const radarPromise = !includeTrends
       ? Promise.resolve([] as PrismaRadarItem[])
       : this.prisma.radarItem.findMany({
           where: {
             userId,
+            ...savedWhere,
             ...(filter.kind ? { kind: filter.kind } : {}),
             ...timeWhere,
           },
           orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
+          take: FEED_SOURCE_CANDIDATE_LIMIT,
         });
     const creatorPromise = !includeCreators
       ? Promise.resolve([])
@@ -951,12 +1150,14 @@ export class PrismaTopicStore implements TopicStore {
           where: {
             userId,
             feedEligible: true,
+            ...savedWhere,
             ...(filter.kind ? { kind: filter.kind } : {}),
             ...timeWhere,
             creator: { cancelledAt: null },
           },
           include: { creator: { select: { displayName: true } } },
           orderBy: [{ publishedAt: 'desc' }, { discoveredAt: 'desc' }, { id: 'desc' }],
+          take: FEED_SOURCE_CANDIDATE_LIMIT,
         });
     const [topicItems, radarItems, creatorItems] = await Promise.all([
       topicPromise,
@@ -968,7 +1169,12 @@ export class PrismaTopicStore implements TopicStore {
       ...radarItems.map(mapRadarFeedItem),
       ...creatorItems.map(mapCreatorFeedItem),
     ])));
-    return this.personalizeFeed(userId, feed);
+    const personalized = await this.personalizeFeed(userId, feed, pagination.snapshotAt);
+    return feedPage(personalized, pagination, [
+      topicItems.length,
+      radarItems.length,
+      creatorItems.length,
+    ].some((count) => count === FEED_SOURCE_CANDIDATE_LIMIT) || savedContent?.truncated === true, this.cursorSecret);
   }
 
   async setFeedback(
@@ -1031,6 +1237,105 @@ export class PrismaTopicStore implements TopicStore {
       });
       return contentFeedbackSchema.parse({ contentKey: canonicalContentKey, value });
     });
+  }
+
+  private async setSavedContentInTransaction(
+    transaction: Prisma.TransactionClient,
+    userId: string,
+    canonicalContentKey: string,
+    state: ReadingState | null,
+    changedAt: Date,
+  ): Promise<SavedContent | null> {
+    const [topicItem, radarItem, creatorItem] = await Promise.all([
+      transaction.discoveryItem.findFirst({
+        where: { canonicalPrimaryUrl: canonicalContentKey, topic: { userId } },
+        select: { id: true },
+      }),
+      transaction.radarItem.findFirst({
+        where: { userId, canonicalPrimaryUrl: canonicalContentKey },
+        select: { id: true },
+      }),
+      transaction.creatorItem.findFirst({
+        where: {
+          userId,
+          canonicalPrimaryUrl: canonicalContentKey,
+          feedEligible: true,
+          creator: { cancelledAt: null },
+        },
+        select: { id: true },
+      }),
+    ]);
+    if (!topicItem && !radarItem && !creatorItem) return null;
+
+    const current = await transaction.savedContent.findFirst({
+      where: { userId, contentKey: canonicalContentKey, removedAt: null },
+      select: { state: true },
+    });
+    if (current?.state === state || (!current && state === null)) {
+      return savedContentSchema.parse({ contentKey: canonicalContentKey, state });
+    }
+
+    if (current) {
+      await transaction.savedContent.updateMany({
+        where: { userId, contentKey: canonicalContentKey, removedAt: null },
+        data: { removedAt: changedAt },
+      });
+    }
+    if (state !== null) {
+      await transaction.savedContent.create({
+        data: {
+          userId,
+          contentKey: canonicalContentKey,
+          state,
+          savedAt: changedAt,
+        },
+      });
+    }
+    return savedContentSchema.parse({ contentKey: canonicalContentKey, state });
+  }
+
+  async setSavedContent(
+    userId: string,
+    contentKey: string,
+    state: ReadingState | null,
+  ): Promise<SavedContent | null> {
+    const canonicalContentKey = canonicalizeUrl(contentKey);
+    return this.prisma.$transaction((transaction) => this.setSavedContentInTransaction(
+      transaction,
+      userId,
+      canonicalContentKey,
+      state,
+      new Date(),
+    ));
+  }
+
+  async setSavedContentBatch(
+    userId: string,
+    contentKeys: string[],
+    state: 'archived',
+  ): Promise<SavedContent[] | null> {
+    const canonicalContentKeys = contentKeys.map((contentKey) => canonicalizeUrl(contentKey));
+    try {
+      return await this.prisma.$transaction(async (transaction) => {
+        const changedAt = new Date();
+        const results: SavedContent[] = [];
+        for (const canonicalContentKey of canonicalContentKeys) {
+          const result = await this.setSavedContentInTransaction(
+            transaction,
+            userId,
+            canonicalContentKey,
+            state,
+            changedAt,
+          );
+          if (!result) throw new SavedContentBatchTargetNotFoundError();
+          results.push(result);
+        }
+        return results;
+      });
+    } catch (error) {
+      if (error instanceof SavedContentBatchTargetNotFoundError) return null;
+      throw error;
+    }
   }
 
   async recordFeedImpressions(
@@ -1286,6 +1591,13 @@ export class MemoryTopicStore implements TopicStore {
   private readonly items: Array<DiscoveryItem & { topicKeyword: string }> = [];
   private readonly radarItems: Array<TrendFeedItem & { userId: string }> = [];
   private readonly feedback = new Map<string, FeedbackValue>();
+  private readonly savedContent: Array<{
+    userId: string;
+    contentKey: string;
+    state: ReadingState;
+    savedAt: string;
+    removedAt: string | null;
+  }> = [];
   private readonly feedDecisions = new Map<string, Set<string>>();
   private readonly feedImpressions = new Set<string>();
   private readonly interestEvents: InterestEvent[] = [];
@@ -1299,16 +1611,32 @@ export class MemoryTopicStore implements TopicStore {
   constructor(
     private readonly now: () => Date = () => new Date(),
     private readonly personalization?: PersonalizationMemory,
-  ) {}
+    private readonly cursorSecret = LOCAL_FEED_CURSOR_SECRET,
+    topicDispatchOutbox?: TopicDispatchOutbox,
+  ) {
+    this.topicDispatchOutbox = topicDispatchOutbox ?? new MemoryTopicDispatchOutbox(
+      now,
+      (topicId) => {
+        const topic = this.topics.find((candidate) => candidate.id === topicId);
+        return topic?.deletedAt === null && topic.pausedAt === null;
+      },
+    );
+  }
 
-  private async personalizeFeed(userId: string, items: FeedItem[]): Promise<FeedItem[]> {
+  public readonly topicDispatchOutbox: TopicDispatchOutbox;
+
+  private async personalizeFeed(
+    userId: string,
+    items: FeedItem[],
+    asOf: Date,
+  ): Promise<FeedItem[]> {
     if (!this.personalization || items.length === 0) return items;
     try {
       const selection = await this.personalization.select({
         userId,
         surface: 'feed',
         candidates: items,
-        asOf: this.now(),
+        asOf,
       });
       if (!selection.personalizationEnabled) return items;
       this.rememberFeedDecision(userId, selection.decisionId, selection.ranked.map((item) => item.contentKey));
@@ -1333,7 +1661,31 @@ export class MemoryTopicStore implements TopicStore {
     return items.map((item) => ({
       ...item,
       feedback: this.feedback.get(this.feedbackKey(userId, item.contentKey)) ?? null,
+      readingState: this.savedContent.find((row) => (
+        row.userId === userId
+        && row.contentKey === canonicalizeUrl(item.contentKey)
+        && row.removedAt === null
+      ))?.state ?? null,
     }));
+  }
+
+  private savedContentKeys(
+    userId: string,
+    state: ReadingState,
+    snapshotAt: string,
+  ): { keys: Set<string>; truncated: boolean } {
+    const rows = this.savedContent
+      .filter((row) => (
+        row.userId === userId
+        && row.state === state
+        && row.savedAt <= snapshotAt
+        && (row.removedAt === null || row.removedAt > snapshotAt)
+      ))
+      .sort((left, right) => right.savedAt.localeCompare(left.savedAt) || right.contentKey.localeCompare(left.contentKey));
+    return {
+      keys: new Set(rows.slice(0, FEED_SOURCE_CANDIDATE_LIMIT).map((row) => row.contentKey)),
+      truncated: rows.length > FEED_SOURCE_CANDIDATE_LIMIT,
+    };
   }
 
   async createTopic(
@@ -1370,6 +1722,7 @@ export class MemoryTopicStore implements TopicStore {
       variantsInitialized: false,
     };
     this.topics.unshift(topic);
+    await this.topicDispatchOutbox.register({ topicId: topic.id, userId, trigger: 'initial' });
     appendMemoryInterestEvent(this.interestEvents, {
       userId,
       eventType: 'topic_state',
@@ -1675,6 +2028,7 @@ export class MemoryTopicStore implements TopicStore {
     topic.deletedAt = occurredAt.toISOString();
     topic.nextRunAt = null;
     if (topic.runStatus !== 'running') topic.runStatus = 'failed';
+    await this.topicDispatchOutbox.cancelTopic(id);
     appendMemoryInterestEvent(this.interestEvents, {
       userId,
       eventType: 'topic_state',
@@ -1724,13 +2078,27 @@ export class MemoryTopicStore implements TopicStore {
     }
     topic.runStatus = 'queued';
     topic.lastError = null;
+    await this.topicDispatchOutbox.register({ topicId: id, userId, trigger: 'manual' });
     return { topic: structuredClone(topic), shouldEnqueue: true };
   }
 
   async listFeed(
     userId: string,
     filter: FeedStoreFilter,
-  ): Promise<FeedItem[]> {
+  ): Promise<FeedPage> {
+    const pagination = paginationContext(
+      userId, filter, filter.snapshotAt ?? this.now(), this.cursorSecret,
+    );
+    const snapshotAt = pagination.snapshotAt.toISOString();
+    const savedContent = filter.reading
+      ? this.savedContentKeys(userId, filter.reading, snapshotAt)
+      : null;
+    if (filter.reading && savedContent!.keys.size === 0) {
+      return feedPage([], pagination, savedContent!.truncated, this.cursorSecret);
+    }
+    const retainSaved = <T extends FeedItem>(items: T[]): T[] => (
+      savedContent ? items.filter((item) => savedContent.keys.has(canonicalizeUrl(item.contentKey))) : items
+    );
     const topicIds = new Set(
       this.topics.filter((topic) => topic.userId === userId).map((topic) => topic.id),
     );
@@ -1740,7 +2108,8 @@ export class MemoryTopicStore implements TopicStore {
           topicIds.has(item.topicId) &&
           (!filter.topicId || item.topicId === filter.topicId) &&
           (!filter.kind || item.kind === filter.kind) &&
-          (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()),
+          item.discoveredAt <= snapshotAt &&
+          (!pagination.since || (item.publishedAt ?? item.discoveredAt) >= pagination.since.toISOString()),
       )
       .map((item) => {
         const topic = this.topics.find((candidate) => candidate.id === item.topicId);
@@ -1762,7 +2131,8 @@ export class MemoryTopicStore implements TopicStore {
       .filter((item) =>
         item.userId === userId &&
         (!filter.kind || item.kind === filter.kind) &&
-        (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()))
+        item.discoveredAt <= snapshotAt &&
+        (!pagination.since || (item.publishedAt ?? item.discoveredAt) >= pagination.since.toISOString()))
       .map(({ userId: _userId, ...item }) => trendFeedItemSchema.parse(item));
     const creatorItems = filter.origin === 'topic' || filter.origin === 'trend' || filter.topicId
       ? []
@@ -1771,7 +2141,8 @@ export class MemoryTopicStore implements TopicStore {
             item.userId === userId &&
             item.feedEligible &&
             (!filter.kind || item.kind === filter.kind) &&
-            (!filter.since || (item.publishedAt ?? item.discoveredAt) >= filter.since.toISOString()))
+            item.discoveredAt <= snapshotAt &&
+            (!pagination.since || (item.publishedAt ?? item.discoveredAt) >= pagination.since.toISOString()))
           .map(({ userId: _userId, creatorName, contentType,
             originalAuthorName: _originalAuthorName, originalAuthorHandle: _originalAuthorHandle,
             originalContentId: _originalContentId, originalContentUrl: _originalContentUrl,
@@ -1792,17 +2163,32 @@ export class MemoryTopicStore implements TopicStore {
               contentType,
             }],
           }));
+    const boundedTopicItems = sortFeed(retainSaved(topicItems)).slice(0, FEED_SOURCE_CANDIDATE_LIMIT);
+    const boundedRadarItems = sortFeed(retainSaved(radarItems)).slice(0, FEED_SOURCE_CANDIDATE_LIMIT);
+    const boundedCreatorItems = sortFeed(retainSaved(creatorItems)).slice(0, FEED_SOURCE_CANDIDATE_LIMIT);
+    const truncated = [topicItems.length, radarItems.length, creatorItems.length]
+      .some((count) => count >= FEED_SOURCE_CANDIDATE_LIMIT) || savedContent?.truncated === true;
     if (filter.query) {
-      return this.attachFeedback(userId, mergeFeedItems(sortRankedFeed([...topicItems, ...radarItems, ...creatorItems].flatMap((item) => {
+      const feed = this.attachFeedback(userId, mergeFeedItems(sortRankedFeed([
+        ...boundedTopicItems,
+        ...boundedRadarItems,
+        ...boundedCreatorItems,
+      ].flatMap((item) => {
         const relevance = memorySearchRelevance(item, filter.query!);
         return relevance === null ? [] : [{ item, relevance }];
       })))).map((item) => structuredClone(item));
+      return feedPage(feed, pagination, truncated, this.cursorSecret);
     }
     const feed = this.attachFeedback(
       userId,
-      mergeFeedItems(sortFeed([...topicItems, ...radarItems, ...creatorItems])),
+      mergeFeedItems(sortFeed([
+        ...boundedTopicItems,
+        ...boundedRadarItems,
+        ...boundedCreatorItems,
+      ])),
     ).map((item) => structuredClone(item));
-    return this.personalizeFeed(userId, feed);
+    const personalized = await this.personalizeFeed(userId, feed, pagination.snapshotAt);
+    return feedPage(personalized, pagination, truncated, this.cursorSecret);
   }
 
   private rememberFeedDecision(userId: string, decisionId: string, contentKeys: string[]): void {
@@ -1869,6 +2255,85 @@ export class MemoryTopicStore implements TopicStore {
       occurredAt: this.now(),
     });
     return contentFeedbackSchema.parse({ contentKey: canonicalContentKey, value });
+  }
+
+  async setSavedContent(
+    userId: string,
+    contentKey: string,
+    state: ReadingState | null,
+  ): Promise<SavedContent | null> {
+    const canonicalContentKey = canonicalizeUrl(contentKey);
+    const ownsTopicItem = this.items.some((item) => (
+      canonicalizeUrl(item.sourceUrls[0]!) === canonicalContentKey
+      && this.topics.some((topic) => topic.id === item.topicId && topic.userId === userId)
+    ));
+    const ownsRadarItem = this.radarItems.some((item) => (
+      item.userId === userId && canonicalizeUrl(item.contentKey) === canonicalContentKey
+    ));
+    const ownsCreatorItem = this.creatorItems.some((item) => (
+      item.userId === userId
+      && item.feedEligible
+      && canonicalizeUrl(item.sourceUrls[0]!) === canonicalContentKey
+      && this.creators.some((creator) => (
+        creator.id === item.creatorId && creator.userId === userId && creator.cancelledAt === null
+      ))
+    ));
+    if (!ownsTopicItem && !ownsRadarItem && !ownsCreatorItem) return null;
+
+    const current = this.savedContent.find((row) => (
+      row.userId === userId
+      && row.contentKey === canonicalContentKey
+      && row.removedAt === null
+    ));
+    if (current?.state === state || (!current && state === null)) {
+      return savedContentSchema.parse({ contentKey: canonicalContentKey, state });
+    }
+
+    const changedAt = this.now().toISOString();
+    if (current) current.removedAt = changedAt;
+    if (state !== null) {
+      this.savedContent.push({
+        userId,
+        contentKey: canonicalContentKey,
+        state,
+        savedAt: changedAt,
+        removedAt: null,
+      });
+    }
+    return savedContentSchema.parse({ contentKey: canonicalContentKey, state });
+  }
+
+  async setSavedContentBatch(
+    userId: string,
+    contentKeys: string[],
+    state: 'archived',
+  ): Promise<SavedContent[] | null> {
+    const canonicalContentKeys = contentKeys.map((contentKey) => canonicalizeUrl(contentKey));
+    const ownsContent = (canonicalContentKey: string) => (
+      this.items.some((item) => (
+        canonicalizeUrl(item.sourceUrls[0]!) === canonicalContentKey
+        && this.topics.some((topic) => topic.id === item.topicId && topic.userId === userId)
+      ))
+      || this.radarItems.some((item) => (
+        item.userId === userId && canonicalizeUrl(item.contentKey) === canonicalContentKey
+      ))
+      || this.creatorItems.some((item) => (
+        item.userId === userId
+        && item.feedEligible
+        && canonicalizeUrl(item.sourceUrls[0]!) === canonicalContentKey
+        && this.creators.some((creator) => (
+          creator.id === item.creatorId && creator.userId === userId && creator.cancelledAt === null
+        ))
+      ))
+    );
+    if (!canonicalContentKeys.every(ownsContent)) return null;
+    const results: SavedContent[] = [];
+    for (const canonicalContentKey of canonicalContentKeys) {
+      const result = await this.setSavedContent(userId, canonicalContentKey, state);
+      if (!result) return null;
+      results.push(result);
+    }
+    return results;
   }
 
   async listInterestEvents(userId: string): Promise<InterestEvent[]> {
@@ -2105,7 +2570,7 @@ export class MemoryTopicStore implements TopicStore {
       reason: kind === 'hot' ? '近期讨论集中' : '内容深入且可复现',
       sourceUrls: [`https://example.com/${id}`],
       publishedAt: timestamps.publishedAt ?? null,
-      discoveredAt: timestamps.discoveredAt ?? new Date().toISOString(),
+      discoveredAt: timestamps.discoveredAt ?? this.now().toISOString(),
       sourceType: 'web',
       platform: 'Web',
       authorName: null,

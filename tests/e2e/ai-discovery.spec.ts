@@ -205,6 +205,62 @@ test('creates a precise topic and exercises the unified discovery lifecycle', as
     url.searchParams.get('range') === '30d' && url.searchParams.get('origin') === 'all',
   )).toBe(true);
 
+  const readingCard = () => page.locator('.discovery-card').filter({
+    has: page.getByRole('heading', { name: 'gpt-5.7 Agent 工程实践指南', exact: true }),
+  });
+  const waitForReadingUpdate = () => page.waitForResponse((response) => (
+    response.request().method() === 'PUT'
+      && new URL(response.url()).pathname.startsWith('/api/v1/saved-items/')
+  ));
+  let readingUpdate = waitForReadingUpdate();
+  await readingCard().getByRole('button', { name: '保存到稍后读' }).click();
+  expect((await readingUpdate).ok()).toBe(true);
+  await expect(readingCard().getByRole('button', { name: '归档' })).toBeVisible();
+
+  readingUpdate = waitForReadingUpdate();
+  await readingCard().getByRole('button', { name: '归档' }).click();
+  expect((await readingUpdate).ok()).toBe(true);
+  const readingFilter = page.getByRole('group', { name: '阅读状态' });
+  const archivedFeed = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === '/api/v1/feed' && url.searchParams.get('reading') === 'archived';
+  });
+  await readingFilter.getByRole('button', { name: '已归档' }).click();
+  expect((await archivedFeed).ok()).toBe(true);
+  await expect(readingCard().getByRole('button', { name: '恢复到稍后读' })).toBeVisible();
+
+  readingUpdate = waitForReadingUpdate();
+  await readingCard().getByRole('button', { name: '恢复到稍后读' }).click();
+  expect((await readingUpdate).ok()).toBe(true);
+  await expect(page.getByText('暂无归档内容')).toBeVisible();
+  await readingFilter.getByRole('button', { name: '稍后读' }).click();
+  await expect(readingCard().getByRole('button', { name: '取消稍后读' })).toBeVisible();
+
+  const batchReadingUpdate = page.waitForResponse((response) => (
+    response.request().method() === 'PUT'
+      && new URL(response.url()).pathname === '/api/v1/saved-items'
+  ));
+  await page.getByRole('checkbox', { name: '选择当前页全部稍后读' }).check();
+  await page.getByRole('button', { name: '归档选中（1）' }).click();
+  expect((await batchReadingUpdate).ok()).toBe(true);
+  await expect(page.getByText('暂无稍后读内容')).toBeVisible();
+
+  await readingFilter.getByRole('button', { name: '已归档' }).click();
+  await expect(readingCard().getByRole('button', { name: '恢复到稍后读' })).toBeVisible();
+  readingUpdate = waitForReadingUpdate();
+  await readingCard().getByRole('button', { name: '恢复到稍后读' }).click();
+  expect((await readingUpdate).ok()).toBe(true);
+  await expect(page.getByText('暂无归档内容')).toBeVisible();
+  await readingFilter.getByRole('button', { name: '稍后读' }).click();
+  await expect(readingCard().getByRole('button', { name: '取消稍后读' })).toBeVisible();
+
+  readingUpdate = waitForReadingUpdate();
+  await readingCard().getByRole('button', { name: '取消稍后读' }).click();
+  expect((await readingUpdate).ok()).toBe(true);
+  await expect(page.getByText('暂无稍后读内容')).toBeVisible();
+  await readingFilter.getByRole('button', { name: '全部' }).click();
+  await expect(readingCard()).toBeVisible();
+
   const threeDayResponse = page.waitForResponse((response) => {
     const url = new URL(response.url());
     return url.pathname === '/api/v1/feed'

@@ -89,6 +89,8 @@ describe('persisted Feed search', () => {
       topicId: 'topic-1',
       kind: 'quality' as const,
       since: new Date('2026-08-01T00:00:00.000Z'),
+      snapshotAt: new Date('2026-08-16T00:00:00.000Z'),
+      limit: 300,
       query: '100%_\\',
     };
     const topicSql = buildTopicRankQuery('user-a', filter);
@@ -102,6 +104,9 @@ describe('persisted Feed search', () => {
     expect(topicText).toContain('item."topicId" =');
     expect(topicText).toContain('item."kind" =');
     expect(topicText).toContain('COALESCE(item."publishedAt", item."discoveredAt") >=');
+    expect(topicText).toContain('item."discoveredAt" <=');
+    expect(topicText).toContain('ORDER BY relevance DESC');
+    expect(topicText).toContain('LIMIT');
     expect(topicSql.values).toEqual(expect.arrayContaining([
       'user-a', 'topic-1', 'quality', filter.since, '100%_\\', '%100\\%\\_\\\\%',
     ]));

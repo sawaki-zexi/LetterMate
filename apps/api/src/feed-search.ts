@@ -10,7 +10,10 @@ export interface FeedSearchFilter {
   topicId?: string;
   kind?: DiscoveryKind;
   since: Date | null;
+  snapshotAt: Date;
+  limit: number;
   query: string;
+  contentKeys?: string[];
 }
 
 export interface RankedId {
@@ -66,6 +69,7 @@ export function buildTopicRankQuery(
   const pattern = `%${escapeLikePattern(filter.query)}%`;
   const conditions: Prisma.Sql[] = [
     Prisma.sql`topic."userId" = ${userId}`,
+    Prisma.sql`item."discoveredAt" <= ${filter.snapshotAt}`,
     searchCondition(pattern),
   ];
   if (filter.topicId) conditions.push(Prisma.sql`item."topicId" = ${filter.topicId}`);
@@ -77,12 +81,19 @@ export function buildTopicRankQuery(
       Prisma.sql`COALESCE(item."publishedAt", item."discoveredAt") >= ${filter.since}`,
     );
   }
+  if (filter.contentKeys) {
+    conditions.push(Prisma.sql`item."canonicalPrimaryUrl" IN (${Prisma.join(filter.contentKeys)})`);
+  }
 
   return Prisma.sql`
     SELECT item."id", ${relevanceExpression(filter.query, pattern)} AS relevance
     FROM "DiscoveryItem" item
     JOIN "Topic" topic ON topic."id" = item."topicId"
     WHERE ${Prisma.join(conditions, ' AND ')}
+    ORDER BY relevance DESC,
+      COALESCE(item."publishedAt", item."discoveredAt") DESC,
+      item."id" DESC
+    LIMIT ${filter.limit}
   `;
 }
 
@@ -93,6 +104,7 @@ export function buildTrendRankQuery(
   const pattern = `%${escapeLikePattern(filter.query)}%`;
   const conditions: Prisma.Sql[] = [
     Prisma.sql`item."userId" = ${userId}`,
+    Prisma.sql`item."discoveredAt" <= ${filter.snapshotAt}`,
     searchCondition(pattern),
   ];
   if (filter.kind) {
@@ -103,11 +115,18 @@ export function buildTrendRankQuery(
       Prisma.sql`COALESCE(item."publishedAt", item."discoveredAt") >= ${filter.since}`,
     );
   }
+  if (filter.contentKeys) {
+    conditions.push(Prisma.sql`item."canonicalPrimaryUrl" IN (${Prisma.join(filter.contentKeys)})`);
+  }
 
   return Prisma.sql`
     SELECT item."id", ${relevanceExpression(filter.query, pattern)} AS relevance
     FROM "RadarItem" item
     WHERE ${Prisma.join(conditions, ' AND ')}
+    ORDER BY relevance DESC,
+      COALESCE(item."publishedAt", item."discoveredAt") DESC,
+      item."id" DESC
+    LIMIT ${filter.limit}
   `;
 }
 

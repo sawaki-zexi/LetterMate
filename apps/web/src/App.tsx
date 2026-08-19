@@ -1,4 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type InfiniteData,
+} from '@tanstack/react-query';
 import type {
   Creator,
   CreatorItem,
@@ -11,10 +17,12 @@ import type {
   DigestRecentRun,
   DigestStatus,
   FeedItem,
+  FeedPage as FeedPageResult,
   FeedRange,
   FeedbackValue,
   InterestMemory,
   InterestMemoryTheme,
+  ReadingState,
   SourceType,
   Topic,
   TrendStatus,
@@ -26,6 +34,7 @@ import {
   Check,
   CheckCircle2,
   ChevronLeft,
+  ChevronDown,
   ChevronRight,
   CircleDashed,
   Clock3,
@@ -295,6 +304,8 @@ function FeedPage() {
   const [sourceSelection, setSourceSelection] = useState<FeedSourceSelection>('all');
   const [searchDraft, setSearchDraft] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+  const [readingFilter, setReadingFilter] = useState<'all' | ReadingState>('all');
+  const [selectedReadingKeys, setSelectedReadingKeys] = useState<Set<string>>(new Set());
   const { origin, topicId } = feedFilterForSource(sourceSelection);
   const filter = {
     range,
@@ -302,24 +313,71 @@ function FeedPage() {
     ...(topicId ? { topicId } : {}),
     ...(kind === 'all' ? {} : { kind }),
     ...(searchQuery ? { q: searchQuery } : {}),
+    ...(readingFilter === 'all' ? {} : { reading: readingFilter }),
   };
-  const feed = useQuery({
+  const feed = useInfiniteQuery({
     queryKey: ['feed', filter],
-    queryFn: () => api.feed(filter),
+    queryFn: ({ pageParam }) => api.feed({
+      ...filter,
+      ...(pageParam ? { cursor: pageParam } : {}),
+    }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.nextCursor ?? undefined,
   });
   const feedback = useMutation({
     mutationFn: ({ contentKey, value }: { contentKey: string; value: FeedbackValue | null }) => (
       api.setFeedback(contentKey, { value })
     ),
     onSuccess: (result) => {
-      client.setQueriesData<FeedItem[]>({ queryKey: ['feed'] }, (items) => items?.map((item) => (
-        item.contentKey === result.contentKey ? { ...item, feedback: result.value } : item
-      )));
+      client.setQueriesData<InfiniteData<FeedPageResult>>(
+        { queryKey: ['feed'] },
+        (data) => data ? {
+          ...data,
+          pages: data.pages.map((page) => ({
+            ...page,
+            items: page.items.map((item) => (
+              item.contentKey === result.contentKey
+                ? { ...item, feedback: result.value }
+                : item
+            )),
+          })),
+        } : data,
+      );
       client.setQueriesData<FeedItem>({ queryKey: ['item'] }, (item) => (
         item?.contentKey === result.contentKey ? { ...item, feedback: result.value } : item
       ));
       void client.invalidateQueries({ queryKey: ['feed'] });
       void client.invalidateQueries({ queryKey: ['interests'] });
+    },
+  });
+  const savedContent = useMutation({
+    mutationFn: ({ contentKey, state }: { contentKey: string; state: ReadingState | null }) => (
+      api.setSavedContent(contentKey, { state })
+    ),
+    onSuccess: (result) => {
+      client.setQueriesData<InfiniteData<FeedPageResult>>(
+        { queryKey: ['feed'] },
+        (data) => data ? {
+          ...data,
+          pages: data.pages.map((page) => ({
+            ...page,
+            items: page.items.map((item) => (
+              item.contentKey === result.contentKey ? { ...item, readingState: result.state } : item
+            )),
+          })),
+        } : data,
+      );
+      client.setQueriesData<FeedItem>({ queryKey: ['item'] }, (item) => (
+        item?.contentKey === result.contentKey ? { ...item, readingState: result.state } : item
+      ));
+      void client.invalidateQueries({ queryKey: ['feed'] });
+    },
+  });
+  const archiveBatch = useMutation({
+    mutationFn: (contentKeys: string[]) => api.archiveSavedContentBatch(contentKeys),
+    onSuccess: () => {
+      setSelectedReadingKeys(new Set());
+      void client.invalidateQueries({ queryKey: ['feed'] });
     },
   });
   const impressionQueue = useRef(new Map<string, Set<string>>());
@@ -392,7 +450,15 @@ function FeedPage() {
     refreshing: refreshActive || !refreshReady,
     onRefresh: async () => { await refresh.startRefresh(); },
   });
-  const groups = groupFeedItems(feed.data ?? []);
+  const feedItems = feed.data?.pages.flatMap((page) => page.items) ?? [];
+  const groups = groupFeedItems(feedItems);
+  const truncated = feed.data?.pages.some((page) => page.truncated) === true;
+  const allReadingItemsSelected = feedItems.length > 0
+    && feedItems.every((item) => selectedReadingKeys.has(item.contentKey));
+
+  useEffect(() => {
+    setSelectedReadingKeys(new Set());
+  }, [kind, range, sourceSelection, searchQuery, readingFilter]);
 
   useEffect(() => {
     if (topicId && topics.data && !hasSelectedTopic) setSourceSelection('all');
@@ -452,7 +518,9 @@ function FeedPage() {
           onChange={(event) => setSearchDraft(event.target.value)}
         />
         <button className="icon-button" type="submit" title="搜索文章" aria-label="搜索文章">
-          {feed.isFetching && searchQuery ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
+          {feed.isFetching && !feed.isFetchingNextPage && searchQuery
+            ? <RefreshCw className="spin" size={17} />
+            : <Search size={17} />}
         </button>
         {searchQuery && (
           <button className="icon-button" type="button" title="清除搜索" aria-label="清除搜索" onClick={clearSearch}>
@@ -466,6 +534,21 @@ function FeedPage() {
             {(['all', 'hot', 'quality'] as const).map((value) => (
               <button key={value} aria-pressed={kind === value} onClick={() => setKind(value)}>
                 {value === 'all' ? '全部' : discoveryKindLabels[value]}
+              </button>
+            ))}
+          </div>
+          <div className="segmented" role="group" aria-label="阅读状态">
+            {([
+              ['all', '全部'],
+              ['saved', '稍后读'],
+              ['archived', '已归档'],
+            ] as const).map(([value, label]) => (
+              <button
+                key={value}
+                aria-pressed={readingFilter === value}
+                onClick={() => setReadingFilter(value)}
+              >
+                {label}
               </button>
             ))}
           </div>
@@ -494,15 +577,52 @@ function FeedPage() {
         </div>
       </div>
       <TopicErrors topics={topics.data ?? []} />
-      {feedback.error && (
+      {(feedback.error || savedContent.error || archiveBatch.error) && (
         <div className="error-banner" role="alert">
-          <AlertCircle size={18} /><span>{feedback.error.message}</span>
+          <AlertCircle size={18} /><span>{feedback.error?.message ?? savedContent.error?.message ?? archiveBatch.error?.message}</span>
         </div>
       )}
       {!topics.data && <QueryState isLoading={topics.isLoading} error={topics.error} retry={() => void topics.refetch()} />}
       {!feed.data && <QueryState isLoading={feed.isLoading} error={feed.error} retry={() => void feed.refetch()} />}
-      {feed.data?.length === 0 && (
-        <div className="state"><Inbox />{searchQuery ? '未找到匹配文章' : '暂无发现内容'}</div>
+      {readingFilter === 'saved' && feedItems.length > 0 && (
+        <div className="feed-bulk-actions" role="group" aria-label="批量阅读操作">
+          <label className="bulk-select-all">
+            <input
+              type="checkbox"
+              aria-label="选择当前页全部稍后读"
+              checked={allReadingItemsSelected}
+              onChange={(event) => {
+                setSelectedReadingKeys((current) => {
+                  const next = new Set(current);
+                  for (const item of feedItems) {
+                    if (event.target.checked) next.add(item.contentKey);
+                    else next.delete(item.contentKey);
+                  }
+                  return next;
+                });
+              }}
+            />
+            <span>选择当前页</span>
+          </label>
+          <button
+            className="button button--secondary"
+            type="button"
+            disabled={selectedReadingKeys.size === 0 || archiveBatch.isPending}
+            onClick={() => archiveBatch.mutate([...selectedReadingKeys])}
+          >
+            {archiveBatch.isPending && <RefreshCw className="spin" size={16} />}
+            归档选中{selectedReadingKeys.size > 0 ? `（${selectedReadingKeys.size}）` : ''}
+          </button>
+        </div>
+      )}
+      {feed.data && feedItems.length === 0 && (
+        <div className="state"><Inbox />{
+          readingFilter === 'saved'
+            ? '暂无稍后读内容'
+            : readingFilter === 'archived'
+              ? '暂无归档内容'
+              : searchQuery ? '未找到匹配文章' : '暂无发现内容'
+        }</div>
       )}
       <div className="feed-groups">
         {groups.map((group) => (
@@ -516,8 +636,19 @@ function FeedPage() {
                     item={item}
                     detailHref={`/items/${item.id}`}
                     headingLevel={3}
+                    selected={selectedReadingKeys.has(item.contentKey)}
+                    {...(readingFilter === 'saved' ? {
+                      onSelectedChange: (selected: boolean) => setSelectedReadingKeys((current) => {
+                        const next = new Set(current);
+                        if (selected) next.add(item.contentKey);
+                        else next.delete(item.contentKey);
+                        return next;
+                      }),
+                    } : {})}
                     feedbackPending={feedback.isPending && feedback.variables?.contentKey === item.contentKey}
                     onFeedback={(value) => feedback.mutate({ contentKey: item.contentKey, value })}
+                    readingStatePending={savedContent.isPending && savedContent.variables?.contentKey === item.contentKey}
+                    onReadingState={(state) => savedContent.mutate({ contentKey: item.contentKey, state })}
                     onImpression={() => queueImpression(item)}
                   />
                 );
@@ -526,6 +657,24 @@ function FeedPage() {
           </section>
         ))}
       </div>
+      {feed.hasNextPage && (
+        <div className="feed-pagination">
+          <button
+            className="button button--secondary"
+            type="button"
+            disabled={feed.isFetchingNextPage}
+            onClick={() => void feed.fetchNextPage()}
+          >
+            {feed.isFetchingNextPage
+              ? <RefreshCw className="spin" size={16} />
+              : <ChevronDown size={16} />}
+            {feed.isFetchingNextPage ? '加载中' : '加载更多'}
+          </button>
+        </div>
+      )}
+      {!feed.hasNextPage && feedItems.length > 0 && truncated && (
+        <p className="feed-limit-note">结果较多，已显示当前可处理范围内的内容。</p>
+      )}
     </Page>
   );
 }

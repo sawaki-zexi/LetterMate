@@ -2,10 +2,16 @@ import type {
   FeedItem,
   FeedbackValue,
   FeedOriginDetail,
+  ReadingState,
   SourceType,
 } from '@lettermate/contracts';
 import {
+  Archive,
+  ArchiveRestore,
   Clock3,
+  Bookmark,
+  BookmarkCheck,
+  BookmarkX,
   Code2,
   ExternalLink,
   FileText,
@@ -55,15 +61,23 @@ export function DiscoveryCard({
   item,
   detailHref,
   headingLevel = 2,
+  selected = false,
+  onSelectedChange,
   feedbackPending = false,
+  readingStatePending = false,
   onFeedback,
+  onReadingState,
   onImpression,
 }: {
   item: FeedItem;
   detailHref?: string;
   headingLevel?: 2 | 3;
+  selected?: boolean;
+  onSelectedChange?: (selected: boolean) => void;
   feedbackPending?: boolean;
+  readingStatePending?: boolean;
   onFeedback?: (value: FeedbackValue | null) => void;
+  onReadingState?: (state: ReadingState | null) => void;
   onImpression?: () => void;
 }) {
   const cardRef = useRef<HTMLElement | null>(null);
@@ -98,6 +112,16 @@ export function DiscoveryCard({
   return (
     <article className="discovery-card" ref={cardRef}>
       <div className="discovery-card__topline">
+        {onSelectedChange && (
+          <label className="discovery-select">
+            <input
+              type="checkbox"
+              aria-label={`选择 ${item.title}`}
+              checked={selected}
+              onChange={(event) => onSelectedChange(event.target.checked)}
+            />
+          </label>
+        )}
         <span className={`classification classification--${item.kind}`}>
           <ClassificationIcon size={15} />{classification}
         </span>
@@ -134,26 +158,86 @@ export function DiscoveryCard({
             </a>
           ))}
         </div>
-        {onFeedback && (
+        {(onFeedback || onReadingState) && (
           <div className="feedback-actions" aria-label="内容反馈">
-            <button
-              className="feedback-button"
-              type="button"
-              aria-pressed={item.feedback === 'interested'}
-              disabled={feedbackPending}
-              onClick={() => onFeedback(item.feedback === 'interested' ? null : 'interested')}
-            >
-              <ThumbsUp size={15} />感兴趣
-            </button>
-            <button
-              className="feedback-button"
-              type="button"
-              aria-pressed={item.feedback === 'less'}
-              disabled={feedbackPending}
-              onClick={() => onFeedback(item.feedback === 'less' ? null : 'less')}
-            >
-              <ThumbsDown size={15} />减少推荐
-            </button>
+            {onFeedback && <>
+              <button
+                className="feedback-button"
+                type="button"
+                aria-pressed={item.feedback === 'interested'}
+                disabled={feedbackPending}
+                onClick={() => onFeedback(item.feedback === 'interested' ? null : 'interested')}
+              >
+                <ThumbsUp size={15} />感兴趣
+              </button>
+              <button
+                className="feedback-button"
+                type="button"
+                aria-pressed={item.feedback === 'less'}
+                disabled={feedbackPending}
+                onClick={() => onFeedback(item.feedback === 'less' ? null : 'less')}
+              >
+                <ThumbsDown size={15} />减少推荐
+              </button>
+            </>}
+            {onReadingState && item.readingState === 'saved' && <>
+              <button
+                className="icon-button"
+                type="button"
+                title="取消稍后读"
+                aria-label="取消稍后读"
+                aria-pressed="true"
+                disabled={readingStatePending}
+                onClick={() => onReadingState(null)}
+              >
+                <BookmarkCheck size={16} />
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                title="归档"
+                aria-label="归档"
+                disabled={readingStatePending}
+                onClick={() => onReadingState('archived')}
+              >
+                <Archive size={16} />
+              </button>
+            </>}
+            {onReadingState && item.readingState === 'archived' && <>
+              <button
+                className="icon-button"
+                type="button"
+                title="恢复到稍后读"
+                aria-label="恢复到稍后读"
+                disabled={readingStatePending}
+                onClick={() => onReadingState('saved')}
+              >
+                <ArchiveRestore size={16} />
+              </button>
+              <button
+                className="icon-button"
+                type="button"
+                title="从阅读列表移除"
+                aria-label="从阅读列表移除"
+                disabled={readingStatePending}
+                onClick={() => onReadingState(null)}
+              >
+                <BookmarkX size={16} />
+              </button>
+            </>}
+            {onReadingState && !item.readingState && (
+              <button
+                className="icon-button"
+                type="button"
+                title="保存到稍后读"
+                aria-label="保存到稍后读"
+                aria-pressed="false"
+                disabled={readingStatePending}
+                onClick={() => onReadingState('saved')}
+              >
+                <Bookmark size={16} />
+              </button>
+            )}
           </div>
         )}
       </div>

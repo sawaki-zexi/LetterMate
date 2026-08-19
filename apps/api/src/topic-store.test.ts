@@ -5,6 +5,7 @@ import {
   runSummarySchema,
   trendStatusSchema,
 } from '@lettermate/contracts';
+import type { MemoryTopicDispatchOutbox } from './topic-dispatch-outbox.js';
 import { MemoryTopicStore, PrismaTopicStore } from './topic-store.js';
 
 const candidate = (
@@ -81,9 +82,15 @@ describe('topic store multi-source mappings', () => {
 
     expect(await store.deleteTopic('user-2', original.id)).toBe(false);
     expect(await store.deleteTopic('user-1', original.id)).toBe(true);
+    expect((store.topicDispatchOutbox as MemoryTopicDispatchOutbox).snapshot()).toEqual([
+      expect.objectContaining({
+        data: { topicId: original.id, userId: 'user-1', trigger: 'initial' },
+        lastErrorCode: 'TOPIC_CANCELLED',
+      }),
+    ]);
     expect(await store.listTopics('user-1')).toEqual([]);
     expect(await store.queueRefresh('user-1', original.id)).toBeNull();
-    expect(await store.listFeed('user-1', { origin: 'topic', since: null })).toEqual([
+    expect((await store.listFeed('user-1', { origin: 'topic', since: null })).items).toEqual([
       expect.objectContaining({
         id: historicItem.id,
         topicKeyword: 'GPT-5.7',
@@ -199,13 +206,14 @@ describe('topic store multi-source mappings', () => {
       radarItem: { findMany: vi.fn().mockResolvedValue([]) },
       creatorItem: { findMany: vi.fn().mockResolvedValue([]) },
       contentFeedback: { findMany: vi.fn().mockResolvedValue([]) },
+      savedContent: { findMany: vi.fn().mockResolvedValue([]) },
     } as unknown as PrismaClient;
 
     const items = await new PrismaTopicStore(prisma).listFeed('user-1', {
       origin: 'all', since: null,
     });
 
-    expect(items[0]).toMatchObject({
+    expect(items.items[0]).toMatchObject({
       sourceType: 'social',
       platform: 'X',
       authorName: 'Project Team',
@@ -253,6 +261,111 @@ describe('topic store multi-source mappings', () => {
       value: null,
     });
     expect(deleteMany).toHaveBeenCalledWith({ where: { userId: 'user-1', contentKey } });
+  });
+
+  it('persists user-owned saved content without changing interest state', async () => {
+    const store = new MemoryTopicStore(() => new Date('2026-08-08T08:00:00.000Z'));
+    const own = store.seedRadarItem('user-1', 'quality');
+    const other = store.seedRadarItem('user-2', 'quality');
+
+    await expect(store.setSavedContent('user-1', own.contentKey, 'saved')).resolves.toEqual({
+      contentKey: own.contentKey,
+      state: 'saved',
+    });
+    await expect(store.setSavedContent('user-1', own.contentKey, 'saved')).resolves.toEqual({
+      contentKey: own.contentKey,
+      state: 'saved',
+    });
+    expect((await store.listFeed('user-1', { origin: 'all', since: null })).items[0])
+      .toMatchObject({ contentKey: own.contentKey, readingState: 'saved' });
+    expect((await store.listFeed('user-1', { origin: 'all', since: null, reading: 'saved' })).items)
+      .toEqual([expect.objectContaining({ contentKey: own.contentKey, readingState: 'saved' })]);
+    await expect(store.setSavedContent('user-1', own.contentKey, 'archived')).resolves.toEqual({
+      contentKey: own.contentKey,
+      state: 'archived',
+    });
+    expect((await store.listFeed('user-1', { origin: 'all', since: null, reading: 'saved' })).items).toEqual([]);
+    expect((await store.listFeed('user-1', { origin: 'all', since: null, reading: 'archived' })).items)
+      .toEqual([expect.objectContaining({ contentKey: own.contentKey, readingState: 'archived' })]);
+    await expect(store.setSavedContent('user-1', own.contentKey, 'saved')).resolves.toEqual({
+      contentKey: own.contentKey,
+      state: 'saved',
+    });
+    expect(await store.setSavedContent('user-1', other.contentKey, 'saved')).toBeNull();
+    expect((await store.listInterestEvents('user-1')).filter((event) => (
+      event.eventType === 'feedback_state'
+    ))).toEqual([]);
+
+    await expect(store.setSavedContent('user-1', own.contentKey, null)).resolves.toEqual({
+      contentKey: own.contentKey,
+      state: null,
+    });
+    expect((await store.listFeed('user-1', { origin: 'all', since: null, reading: 'saved' })).items)
+      .toEqual([]);
+  });
+
+  it('archives an owned batch atomically in the memory store', async () => {
+    const store = new MemoryTopicStore();
+    const first = store.seedRadarItem('user-1', 'quality');
+    const second = store.seedRadarItem('user-1', 'quality');
+    const foreign = store.seedRadarItem('user-2', 'quality');
+    await store.setSavedContent('user-1', first.contentKey, 'saved');
+    await store.setSavedContent('user-1', second.contentKey, 'saved');
+
+    await expect(store.setSavedContentBatch('user-1', [first.contentKey, second.contentKey], 'archived'))
+      .resolves.toEqual([
+        { contentKey: first.contentKey, state: 'archived' },
+        { contentKey: second.contentKey, state: 'archived' },
+      ]);
+    expect((await store.listFeed('user-1', { origin: 'all', since: null, reading: 'archived' })).items)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ contentKey: first.contentKey, readingState: 'archived' }),
+        expect.objectContaining({ contentKey: second.contentKey, readingState: 'archived' }),
+      ]));
+    await store.setSavedContent('user-1', first.contentKey, 'saved');
+    await expect(store.setSavedContentBatch('user-1', [first.contentKey, foreign.contentKey], 'archived'))
+      .resolves.toBeNull();
+    expect((await store.listFeed('user-1', { origin: 'all', since: null, reading: 'saved' })).items)
+      .toEqual([expect.objectContaining({
+        contentKey: first.contentKey,
+        readingState: 'saved',
+      })]);
+  });
+
+  it('keeps reading-list membership stable across a paginated snapshot', async () => {
+    let clock = new Date('2026-08-08T08:00:00.000Z');
+    const store = new MemoryTopicStore(() => clock, undefined, 'reading-snapshot-test-secret-at-least-32-bytes');
+    const older = store.seedRadarItem('user-1', 'quality', {
+      discoveredAt: '2026-08-08T06:00:00.000Z',
+      sourceUrl: 'https://example.com/reading/older',
+    });
+    const newer = store.seedRadarItem('user-1', 'quality', {
+      discoveredAt: '2026-08-08T07:00:00.000Z',
+      sourceUrl: 'https://example.com/reading/newer',
+    });
+    await store.setSavedContent('user-1', older.contentKey, 'saved');
+    await store.setSavedContent('user-1', newer.contentKey, 'saved');
+
+    clock = new Date('2026-08-08T09:00:00.000Z');
+    const first = await store.listFeed('user-1', {
+      origin: 'all', since: null, reading: 'saved', limit: 1, windowKey: 'all',
+    });
+    expect(first.items).toEqual([expect.objectContaining({ contentKey: newer.contentKey })]);
+    expect(first.nextCursor).toEqual(expect.any(String));
+
+    clock = new Date('2026-08-08T10:00:00.000Z');
+    await store.setSavedContent('user-1', older.contentKey, 'archived');
+    const second = await store.listFeed('user-1', {
+      origin: 'all', since: null, reading: 'saved', limit: 1, windowKey: 'all',
+      cursor: first.nextCursor!,
+    });
+    expect(second.items).toEqual([expect.objectContaining({ contentKey: older.contentKey })]);
+    expect((await store.listFeed('user-1', {
+      origin: 'all', since: null, reading: 'saved', windowKey: 'all',
+    })).items.map((item) => item.contentKey)).not.toContain(older.contentKey);
+    expect((await store.listFeed('user-1', {
+      origin: 'all', since: null, reading: 'archived', windowKey: 'all',
+    })).items).toEqual([expect.objectContaining({ contentKey: older.contentKey })]);
   });
 
   it('records idempotent Topic and Creator lifecycle events with exact identifiers', async () => {
@@ -324,7 +437,7 @@ describe('topic store multi-source mappings', () => {
     });
     const item = store.seedCreatorItem('user-1', creator.id, 'quality');
 
-    expect(await store.listFeed('user-1', { origin: 'creator', since: null })).toEqual([
+    expect((await store.listFeed('user-1', { origin: 'creator', since: null })).items).toEqual([
       expect.objectContaining({
         id: item.id,
         origin: 'creator',
@@ -333,7 +446,7 @@ describe('topic store multi-source mappings', () => {
         feedEligible: true,
       }),
     ]);
-    expect(await store.listFeed('user-2', { origin: 'all', since: null })).toEqual([]);
+    expect((await store.listFeed('user-2', { origin: 'all', since: null })).items).toEqual([]);
     expect(await store.findItem('user-2', item.id)).toBeNull();
   });
 
@@ -417,17 +530,17 @@ describe('topic store multi-source mappings', () => {
     const all = await store.listFeed('user-1', {
       origin: 'all', since: new Date('2026-07-28T08:00:00.000Z'),
     });
-    expect(all.map(({ id }) => id)).toEqual([newerRadar.id, topicItem.id, olderRadar.id].sort((a, b) => {
+    expect(all.items.map(({ id }) => id)).toEqual([newerRadar.id, topicItem.id, olderRadar.id].sort((a, b) => {
       if (a === olderRadar.id) return 1;
       if (b === olderRadar.id) return -1;
       return b.localeCompare(a);
     }));
-    expect(all).toEqual(expect.arrayContaining([
+    expect(all.items).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: topicItem.id, origin: 'topic', topicId: topic.id }),
       expect.objectContaining({ id: newerRadar.id, origin: 'trend', topicId: null }),
     ]));
-    expect(await store.listFeed('user-1', { origin: 'topic', since: null })).toHaveLength(1);
-    expect(await store.listFeed('user-1', { origin: 'trend', since: null })).toHaveLength(2);
+    expect((await store.listFeed('user-1', { origin: 'topic', since: null })).items).toHaveLength(1);
+    expect((await store.listFeed('user-1', { origin: 'trend', since: null })).items).toHaveLength(2);
   });
 
   it('merges one original across Topic, Trend, and Creator while retaining every origin', async () => {
@@ -457,15 +570,15 @@ describe('topic store multi-source mappings', () => {
 
     const feed = await store.listFeed('user-1', { origin: 'all', since: null });
 
-    expect(feed).toHaveLength(1);
-    expect(feed[0]).toMatchObject({ origin: 'topic', topicKeyword: 'Project release' });
-    expect(feed[0]?.origins).toEqual(expect.arrayContaining([
+    expect(feed.items).toHaveLength(1);
+    expect(feed.items[0]).toMatchObject({ origin: 'topic', topicKeyword: 'Project release' });
+    expect(feed.items[0]?.origins).toEqual(expect.arrayContaining([
       expect.objectContaining({ origin: 'topic', topicId: topic.id }),
       { origin: 'trend' },
       expect.objectContaining({ origin: 'creator', creatorId: creator.id }),
     ]));
-    expect(feed[0]?.origins).toHaveLength(3);
-    expect(await store.listFeed('user-1', { origin: 'creator', since: null })).toHaveLength(1);
+    expect(feed.items[0]?.origins).toHaveLength(3);
+    expect((await store.listFeed('user-1', { origin: 'creator', since: null })).items).toHaveLength(1);
   });
 
   it('persists one idempotent feedback state for merged content and isolates users', async () => {
@@ -480,7 +593,7 @@ describe('topic store multi-source mappings', () => {
     store.seedRadarItem('user-1', 'quality', {
       sourceUrl: 'https://x.com/project/status/42',
     });
-    const [merged] = await store.listFeed('user-1', { origin: 'all', since: null });
+    const [merged] = (await store.listFeed('user-1', { origin: 'all', since: null })).items;
     expect(merged?.feedback).toBeNull();
 
     await expect(store.setFeedback('user-1', merged!.contentKey, 'interested')).resolves.toEqual({
@@ -491,14 +604,14 @@ describe('topic store multi-source mappings', () => {
       contentKey: merged!.contentKey,
       value: 'interested',
     });
-    expect((await store.listFeed('user-1', { origin: 'all', since: null }))[0]?.feedback)
+    expect((await store.listFeed('user-1', { origin: 'all', since: null })).items[0]?.feedback)
       .toBe('interested');
 
     await store.setFeedback('user-1', merged!.contentKey, 'less');
-    expect((await store.listFeed('user-1', { origin: 'trend', since: null }))[0]?.feedback)
+    expect((await store.listFeed('user-1', { origin: 'trend', since: null })).items[0]?.feedback)
       .toBe('less');
     await store.setFeedback('user-1', merged!.contentKey, null);
-    expect((await store.listFeed('user-1', { origin: 'all', since: null }))[0]?.feedback)
+    expect((await store.listFeed('user-1', { origin: 'all', since: null })).items[0]?.feedback)
       .toBeNull();
     await store.setFeedback('user-1', merged!.contentKey, null);
     const feedbackEvents = (await store.listInterestEvents('user-1'))
@@ -538,12 +651,12 @@ describe('topic store multi-source mappings', () => {
     });
 
     const feed = await store.listFeed('user-1', { origin: 'all', since: null });
-    expect(feed.map((item) => item.id)).toEqual([older.id, newer.id]);
-    expect(feed[0]?.recommendation).toEqual({
+    expect(feed.items.map((item) => item.id)).toEqual([older.id, newer.id]);
+    expect(feed.items[0]?.recommendation).toEqual({
       lane: 'exploration', reason: 'exploration', isExploration: true,
       decisionId: 'decision-1',
     });
-    expect(feed[1]?.recommendation).toEqual({
+    expect(feed.items[1]?.recommendation).toEqual({
       lane: 'subscription', reason: 'followed_topic', isExploration: false,
       decisionId: 'decision-1',
     });
@@ -574,8 +687,41 @@ describe('topic store multi-source mappings', () => {
     });
 
     const feed = await store.listFeed('user-1', { origin: 'all', since: null });
-    expect(feed.map((item) => item.id)).toEqual([newer.id, older.id]);
-    expect(feed.every((item) => item.recommendation === undefined)).toBe(true);
+    expect(feed.items.map((item) => item.id)).toEqual([newer.id, older.id]);
+    expect(feed.items.every((item) => item.recommendation === undefined)).toBe(true);
+  });
+
+  it('paginates one stable snapshot without duplicates or newer inserts', async () => {
+    let clock = new Date('2026-08-08T08:00:00.000Z');
+    const store = new MemoryTopicStore(() => clock);
+    const topic = store.seedTopic('user-1', 'Pagination');
+    const seeded = [5, 4, 3, 2, 1].map((hour) => store.seedItem(topic.id, 'quality', {
+      publishedAt: `2026-08-08T0${hour}:00:00.000Z`,
+      discoveredAt: `2026-08-08T0${hour}:30:00.000Z`,
+    }));
+
+    const first = await store.listFeed('user-1', {
+      origin: 'all', since: null, limit: 2, windowKey: 'all',
+    });
+    expect(first.items.map((item) => item.id)).toEqual([seeded[0]!.id, seeded[1]!.id]);
+    expect(first.nextCursor).not.toBeNull();
+
+    clock = new Date('2026-08-08T09:00:00.000Z');
+    const inserted = store.seedItem(topic.id, 'quality', {
+      publishedAt: '2026-08-08T08:30:00.000Z',
+    });
+    const second = await store.listFeed('user-1', {
+      origin: 'all', since: null, limit: 2, windowKey: 'all', cursor: first.nextCursor!,
+    });
+    const third = await store.listFeed('user-1', {
+      origin: 'all', since: null, limit: 2, windowKey: 'all', cursor: second.nextCursor!,
+    });
+    const ids = [...first.items, ...second.items, ...third.items].map((item) => item.id);
+
+    expect(ids).toEqual(seeded.map((item) => item.id));
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).not.toContain(inserted.id);
+    expect(third.nextCursor).toBeNull();
   });
 
   it('searches owner articles and ranks title, summary, then recommendation reason', async () => {
@@ -600,7 +746,7 @@ describe('topic store multi-source mappings', () => {
       origin: 'all', since: null, query: '智能体工程',
     });
 
-    expect(items.map((item) => item.title)).toEqual([
+    expect(items.items.map((item) => item.title)).toEqual([
       '智能体工程实践', '摘要匹配文章', '理由匹配文章',
     ]);
   });
@@ -633,7 +779,7 @@ describe('topic store multi-source mappings', () => {
       query: '工程',
     });
 
-    expect(items.map((item) => item.title)).toEqual(['工程新文章']);
+    expect(items.items.map((item) => item.title)).toEqual(['工程新文章']);
   });
 
   it('returns only the owner Radar detail and safe trend status', async () => {
@@ -671,6 +817,7 @@ describe('topic store multi-source mappings', () => {
       },
       creatorItem: { findFirst: vi.fn().mockResolvedValue(null) },
       contentFeedback: { findMany: vi.fn().mockResolvedValue([]) },
+      savedContent: { findMany: vi.fn().mockResolvedValue([]) },
     } as unknown as PrismaClient;
     const store = new PrismaTopicStore(prisma);
 

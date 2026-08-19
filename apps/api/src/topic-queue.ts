@@ -7,7 +7,7 @@ import { Redis } from 'ioredis';
 import { randomUUID } from 'node:crypto';
 
 export interface TopicQueue {
-  enqueue(data: DiscoveryJobData): Promise<void>;
+  enqueue(data: DiscoveryJobData, deliveryId?: string): Promise<void>;
   close(): Promise<void>;
   healthCheck?(): Promise<void>;
 }
@@ -20,9 +20,11 @@ export class BullTopicQueue implements TopicQueue {
     private readonly redis: RedisConnection,
   ) {}
 
-  async enqueue(data: DiscoveryJobData): Promise<void> {
+  async enqueue(data: DiscoveryJobData, deliveryId?: string): Promise<void> {
     await this.queue.add('refresh', data, {
-      jobId: data.trigger === 'manual'
+      jobId: deliveryId
+        ? `topic-dispatch-${deliveryId}`
+        : data.trigger === 'manual'
         ? `manual-${data.topicId}-${randomUUID()}`
         : `${data.trigger}-${data.topicId}`,
       attempts: 3,

@@ -22,10 +22,15 @@ import {
   digestUnsubscribeResultSchema,
   discoverySourceStatusSchema,
   contentFeedbackSchema,
+  savedContentBatchInputSchema,
+  savedContentBatchSchema,
+  savedContentInputSchema,
+  savedContentSchema,
   feedImpressionInputSchema,
   feedImpressionReceiptSchema,
   feedbackInputSchema,
   feedItemSchema,
+  feedPageSchema,
   feedQuerySchema,
   interestMemorySchema,
   interestMemorySettingsInputSchema,
@@ -36,6 +41,7 @@ import {
   type FeedQueryInput,
   type FeedImpressionInput,
   type FeedbackInput,
+  type SavedContentInput,
   type CreatorInput,
   type CreatorConfirmationInput,
   type CreatorResolutionInput,
@@ -214,14 +220,30 @@ export const api = {
       range: parsed.range,
       origin: parsed.origin,
       q: parsed.q,
+      reading: parsed.reading,
+      limit: String(parsed.limit),
+      cursor: parsed.cursor,
     }));
     const suffix = query.size ? `?${query.toString()}` : '';
-    return apiRequest(`/feed${suffix}`, z.array(feedItemSchema));
+    return apiRequest(`/feed${suffix}`, feedPageSchema);
   },
   setFeedback: (contentKey: string, input: FeedbackInput) => apiRequest(
     `/feedback/${encodeURIComponent(contentKey)}`,
     contentFeedbackSchema,
     { method: 'PUT', body: JSON.stringify(feedbackInputSchema.parse(input)) },
+  ),
+  setSavedContent: (contentKey: string, input: SavedContentInput) => apiRequest(
+    `/saved-items/${encodeURIComponent(contentKey)}`,
+    savedContentSchema,
+    { method: 'PUT', body: JSON.stringify(savedContentInputSchema.parse(input)) },
+  ),
+  archiveSavedContentBatch: (contentKeys: string[]) => apiRequest(
+    '/saved-items',
+    savedContentBatchSchema,
+    {
+      method: 'PUT',
+      body: JSON.stringify(savedContentBatchInputSchema.parse({ contentKeys, state: 'archived' })),
+    },
   ),
   recordFeedImpressions: (input: FeedImpressionInput) => apiRequest(
     '/impressions',

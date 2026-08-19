@@ -8,7 +8,7 @@ export default defineConfig({
   workers: 1,
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
-    baseURL: 'http://127.0.0.1:5410',
+    baseURL: 'http://127.0.0.1:4173',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
@@ -22,7 +22,7 @@ export default defineConfig({
     },
     {
       command: 'npm run preview:e2e -w @lettermate/web',
-      url: 'http://127.0.0.1:5410',
+      url: 'http://127.0.0.1:4173',
       env: { VITE_API_PROXY: 'http://127.0.0.1:3011' },
       reuseExistingServer: false,
       timeout: 120_000,

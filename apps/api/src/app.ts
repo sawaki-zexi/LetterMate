@@ -20,6 +20,9 @@ import {
   feedImpressionInputSchema,
   feedImpressionReceiptSchema,
   feedbackInputSchema,
+  savedContentBatchInputSchema,
+  savedContentBatchSchema,
+  savedContentInputSchema,
   creatorInputSchema,
   creatorUpdateInputSchema,
   feedQuerySchema,
@@ -65,6 +68,7 @@ import type { z } from 'zod';
 import { checkApiReadiness, type ApiHealthChecks, type HealthProbe } from './health.js';
 import { configuredDiscoverySources } from './discovery-sources.js';
 import { ApiMetrics } from './metrics.js';
+import { InvalidFeedCursorError } from './feed-pagination.js';
 import {
   MemoryTopicStore,
   PrismaTopicStore,
@@ -77,6 +81,7 @@ import {
   createBullTopicQueue,
   type TopicQueue,
 } from './topic-queue.js';
+import { TopicDispatchRelay } from './topic-dispatch-outbox.js';
 import {
   createBullTrendQueue,
   type TrendQueue,
@@ -186,6 +191,7 @@ const AUTH_SERVICE = Symbol('AuthService');
 const ALLOW_DEV_IDENTITY = Symbol('AllowDevIdentity');
 const SECURE_COOKIES = Symbol('SecureCookies');
 const API_METRICS = Symbol('ApiMetrics');
+const TOPIC_DISPATCH_RELAY = Symbol('TopicDispatchRelay');
 
 function errorBody(code: string, message: string) {
   return { code, message, traceId: currentTraceId() };
@@ -221,7 +227,7 @@ const feedRangeMilliseconds = {
 class ApiController {
   constructor(
     @Inject(STORE) private readonly store: TopicStore,
-    @Inject(QUEUE) private readonly queue: TopicQueue,
+    @Inject(TOPIC_DISPATCH_RELAY) private readonly topicDispatchRelay: TopicDispatchRelay,
     @Inject(TREND_QUEUE) private readonly trendQueue: TrendQueue,
     @Inject(CREATOR_QUEUE) private readonly creatorQueue: CreatorQueue,
     @Inject(CREATOR_RESOLUTION) private readonly creatorResolution: CreatorResolutionGateway,
@@ -358,12 +364,7 @@ class ApiController {
         input.keyword,
         normalizeKeyword(input.keyword),
       );
-      try {
-        await this.queue.enqueue({ topicId: topic.id, userId, trigger: 'initial' });
-      } catch (error) {
-        await this.store.compensateTopicRefresh(userId, topic.id);
-        throw error;
-      }
+      await this.topicDispatchRelay.kick();
       return topic;
     } catch (error) {
       if (error instanceof TopicAlreadyExistsError) {
@@ -396,12 +397,7 @@ class ApiController {
       });
       if (!updated) throw new NotFoundException(errorBody('TOPIC_NOT_FOUND', '关键词不存在'));
       if (updated.shouldEnqueue) {
-        try {
-          await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
-        } catch (error) {
-          await this.store.compensateTopicRefresh(userId, id);
-          throw error;
-        }
+        await this.topicDispatchRelay.kick();
       }
       return updated.topic;
     } catch (error) {
@@ -434,12 +430,7 @@ class ApiController {
     const resumed = await this.store.resumeTopic(userId, id);
     if (!resumed) throw new NotFoundException(errorBody('TOPIC_NOT_FOUND', '关键词不存在'));
     if (resumed.shouldEnqueue) {
-      try {
-        await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
-      } catch (error) {
-        await this.store.compensateTopicRefresh(userId, id);
-        throw error;
-      }
+      await this.topicDispatchRelay.kick();
     }
     return resumed.topic;
   }
@@ -601,7 +592,7 @@ class ApiController {
       throw new ConflictException(errorBody('TOPIC_PAUSED', '关键词监控已暂停'));
     }
     if (refresh.shouldEnqueue) {
-      await this.queue.enqueue({ topicId: id, userId, trigger: 'manual' });
+      await this.topicDispatchRelay.kick();
     }
     return refresh.topic;
   }
@@ -620,13 +611,25 @@ class ApiController {
     const since = filter.range === 'all'
       ? null
       : new Date(now.getTime() - feedRangeMilliseconds[filter.range]);
-    return this.store.listFeed(userId, {
-      origin: filter.origin,
-      since,
-      ...(filter.topicId ? { topicId: filter.topicId } : {}),
-      ...(filter.kind ? { kind: filter.kind } : {}),
-      ...(filter.q ? { query: filter.q } : {}),
-    });
+    try {
+      return await this.store.listFeed(userId, {
+        origin: filter.origin,
+        since,
+        limit: filter.limit,
+        windowKey: filter.range,
+        snapshotAt: now,
+        ...(filter.cursor ? { cursor: filter.cursor } : {}),
+        ...(filter.topicId ? { topicId: filter.topicId } : {}),
+        ...(filter.kind ? { kind: filter.kind } : {}),
+        ...(filter.q ? { query: filter.q } : {}),
+        ...(filter.reading ? { reading: filter.reading } : {}),
+      });
+    } catch (error) {
+      if (error instanceof InvalidFeedCursorError) {
+        throw new BadRequestException(errorBody('INVALID_CURSOR', '分页游标无效'));
+      }
+      throw error;
+    }
   }
 
   @Get('trends/status')
@@ -849,6 +852,45 @@ class ApiController {
     return feedback;
   }
 
+  @Put('saved-items')
+  async setSavedContentBatch(
+    @Headers('x-user-id') header: string | undefined,
+    @Body() body: unknown,
+  ) {
+    const input = parseOrThrow(savedContentBatchInputSchema, body, '批量归档内容无效');
+    const contentKeys = input.contentKeys.map((contentKey) => canonicalizeUrl(contentKey));
+    if (new Set(contentKeys).size !== contentKeys.length) {
+      throw new BadRequestException(errorBody('VALIDATION_ERROR', '批量归档内容不能重复'));
+    }
+    const result = await this.store.setSavedContentBatch(
+      authenticatedUser(header), contentKeys, input.state,
+    );
+    if (!result) {
+      throw new NotFoundException(errorBody('NOT_FOUND', '发现内容不存在'));
+    }
+    return savedContentBatchSchema.parse({ items: result });
+  }
+
+  @Put('saved-items/:contentKey')
+  async setSavedContent(
+    @Headers('x-user-id') header: string | undefined,
+    @Param('contentKey') contentKeyParam: string,
+    @Body() body: unknown,
+  ) {
+    const userId = authenticatedUser(header);
+    const contentKey = canonicalizeUrl(parseOrThrow(
+      httpUrlSchema,
+      contentKeyParam,
+      '内容标识无效',
+    ));
+    const input = parseOrThrow(savedContentInputSchema, body, '保存内容无效');
+    const result = await this.store.setSavedContent(userId, contentKey, input.state);
+    if (!result) {
+      throw new NotFoundException(errorBody('NOT_FOUND', '发现内容不存在'));
+    }
+    return result;
+  }
+
   @Post('impressions')
   @HttpCode(202)
   async recordImpressions(
@@ -987,6 +1029,7 @@ function toCreatorCreateInput(identity: ResolvedCreatorIdentity): CreatorCreateI
 class ResourceCloser implements OnModuleDestroy {
   constructor(
     @Inject(STORE) private readonly store: TopicStore,
+    @Inject(TOPIC_DISPATCH_RELAY) private readonly topicDispatchRelay: TopicDispatchRelay,
     @Inject(QUEUE) private readonly queue: TopicQueue,
     @Inject(TREND_QUEUE) private readonly trendQueue: TrendQueue,
     @Inject(CREATOR_QUEUE) private readonly creatorQueue: CreatorQueue,
@@ -995,6 +1038,7 @@ class ResourceCloser implements OnModuleDestroy {
   ) {}
 
   async onModuleDestroy() {
+    await this.topicDispatchRelay.close();
     await this.queue.close();
     await this.trendQueue.close();
     await this.creatorQueue.close();
@@ -1011,6 +1055,7 @@ class AppModule implements NestModule {
   static register(
     store: TopicStore,
     queue: TopicQueue,
+    topicDispatchRelay: TopicDispatchRelay,
     trendQueue: TrendQueue,
     creatorQueue: CreatorQueue,
     digestVerificationQueue: DigestVerificationQueue,
@@ -1038,6 +1083,7 @@ class AppModule implements NestModule {
       providers: [
         { provide: STORE, useValue: store },
         { provide: QUEUE, useValue: queue },
+        { provide: TOPIC_DISPATCH_RELAY, useValue: topicDispatchRelay },
         { provide: TREND_QUEUE, useValue: trendQueue },
         { provide: CREATOR_QUEUE, useValue: creatorQueue },
         { provide: DIGEST_VERIFICATION_QUEUE, useValue: digestVerificationQueue },
@@ -1067,6 +1113,7 @@ class AppModule implements NestModule {
 export interface CreateApiAppOptions {
   store?: TopicStore;
   queue?: TopicQueue;
+  topicDispatchRelay?: TopicDispatchRelay;
   trendQueue?: TrendQueue;
   creatorQueue?: CreatorQueue;
   digestVerificationQueue?: DigestVerificationQueue;
@@ -1096,6 +1143,7 @@ export async function createApiApp(
   options: CreateApiAppOptions = {},
 ): Promise<INestApplication> {
   const config = parseConfig(process.env);
+  const sessionSecret = config.SESSION_SECRET ?? randomBytes(32).toString('base64url');
   const memoryFacts: MemoryPersonalizationFacts = {
     events: [], tags: [], creatorContent: [], settings: {}, forgottenTagIds: {},
   };
@@ -1107,7 +1155,7 @@ export async function createApiApp(
     prisma = new PrismaClient();
     personalization ??= new PrismaPersonalizationMemory(prisma);
     digestPreferences = new PrismaDigestPreferenceStore(prisma);
-    return new PrismaTopicStore(prisma, personalization);
+    return new PrismaTopicStore(prisma, personalization, sessionSecret);
   })();
   personalization ??= new MemoryPersonalizationMemory(() => memoryFacts, options.now);
   digestPreferences ??= new MemoryDigestPreferenceStore(() => memoryDigestFacts);
@@ -1115,7 +1163,7 @@ export async function createApiApp(
   const secureCookies = config.NODE_ENV === 'production';
   const auth = options.authService ?? new AuthService(
     prisma ? new PrismaAuthStore(prisma) : new MemoryAuthStore(),
-    config.SESSION_SECRET ?? randomBytes(32).toString('base64url'),
+    sessionSecret,
     config.CSRF_SECRET ?? randomBytes(32).toString('base64url'),
     options.now,
   );
@@ -1167,6 +1215,11 @@ export async function createApiApp(
       : new MemoryEmailDeliveryEventRepository(),
   );
   const queue = options.queue ?? createBullTopicQueue(config.REDIS_URL);
+  const topicDispatchRelay = options.topicDispatchRelay ?? new TopicDispatchRelay(
+    store.topicDispatchOutbox,
+    queue,
+    { ...(options.now ? { now: options.now } : {}) },
+  );
   const trendQueue = options.trendQueue ?? createBullTrendQueue(config.REDIS_URL);
   const creatorQueue = options.creatorQueue ?? createBullCreatorQueue(config.REDIS_URL);
   const creatorResolution = options.creatorResolution ?? new CreatorResolutionService(
@@ -1177,7 +1230,7 @@ export async function createApiApp(
       new YouTubeCreatorIdentityResolver(config.YOUTUBE_API_KEY),
       new BlueskyCreatorIdentityResolver(),
     ],
-    config.SESSION_SECRET ?? randomBytes(32).toString('base64url'),
+    sessionSecret,
     options.now ?? (() => new Date()),
   );
   const aiConfigured = options.aiConfigured ?? Boolean(config.AI_API_KEY);
@@ -1201,6 +1254,7 @@ export async function createApiApp(
     AppModule.register(
       store,
       queue,
+      topicDispatchRelay,
       trendQueue,
       creatorQueue,
       digestVerificationQueue,
@@ -1239,6 +1293,8 @@ export async function createApiApp(
   app.use(createRequestTracingMiddleware(requestLogger, options.now, metrics));
   app.use(createAuthMiddleware(auth, { allowDevIdentity, secureCookies }));
   await app.init();
+  topicDispatchRelay.start();
+  void topicDispatchRelay.kick();
   return app;
 }
 

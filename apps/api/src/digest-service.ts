@@ -265,7 +265,14 @@ export class DefaultDigestService implements DigestService {
   async preview(userId: string): Promise<DigestPreview> {
     const generatedAt = this.now();
     const boundary = await this.preferences.lastCompletedBoundary(userId);
-    const feed = await this.store.listFeed(userId, { origin: 'all', since: boundary });
+    const feedPage = await this.store.listFeed(userId, {
+      origin: 'all',
+      since: boundary,
+      limit: 50,
+      snapshotAt: generatedAt,
+      windowKey: boundary?.toISOString() ?? 'all',
+    });
+    const feed = feedPage.items;
     const candidates = boundary
       ? feed.filter((item) => effectiveTime(item) > boundary)
       : feed;
